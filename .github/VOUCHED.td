@@ -82,6 +82,7 @@ faukah
 filip7
 flou
 francescarpi
+fru1tworld
 gagbo
 ghokun
 gmile
@@ -102,6 +103,7 @@ icodesign
 j0hnm4r5
 jacobsandlund
 jake-stewart
+jamylak
 jarred-sumner
 jcollie
 jesusvazquez
@@ -115,8 +117,10 @@ juniqlim
 justonia
 karesansui-u
 kawarimidoll
+kayleung
 kenvandine
 khipp
+kierancanter
 kirwiisp
 kjvdven
 kloneets
@@ -149,11 +153,13 @@ mischief
 mitchellh
 miupa
 molechowski
+moonmao42
 mrconnorkenway
 mrmage
 mtak
 natesmyth
 neo773
+neurosnap
 nicholas-ochoa
 nicosuave
 nmggithub
@@ -189,6 +195,7 @@ seruman
 silveirapf
 slsrepo
 sunshine-syz
+tbrundige
 tdgroot
 tdslot
 ticclick
