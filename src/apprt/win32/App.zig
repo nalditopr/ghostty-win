@@ -1903,7 +1903,11 @@ fn surfaceWndProc(
             return 0;
         },
         w32.WM_RBUTTONUP => { surface.handleMouseButton(.right, .release, lparam); return 0; },
-        w32.WM_MBUTTONDOWN => { surface.handleMouseButton(.middle, .press, lparam); return 0; },
+        w32.WM_MBUTTONDOWN => {
+            _ = w32.SetFocus(hwnd);
+            surface.handleMouseButton(.middle, .press, lparam);
+            return 0;
+        },
         w32.WM_MBUTTONUP => { surface.handleMouseButton(.middle, .release, lparam); return 0; },
 
         w32.WM_MOUSEMOVE => {
