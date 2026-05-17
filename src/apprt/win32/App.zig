@@ -289,6 +289,48 @@ pub fn run(self: *App) !void {
                     }
                 }
             }
+
+            // Bubble global keybindings from popup edit controls (tab
+            // rename, command palette, search) up to the surface so that
+            // e.g. `Ctrl+Shift+P` while renaming actually toggles the
+            // palette instead of being eaten by the Edit. Excludes
+            // Ctrl-only A/C/V/X/Y/Z so standard text-edit shortcuts keep
+            // working inside the popup.
+            const ctrl_held = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+            const shift_held = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+            const route_key = ctrl_held and (shift_held or !isEditShortcutVk(vk));
+            if (route_key) {
+                const target_surface: ?*Surface = blk: {
+                    // Tab rename edit lives on the Window, not a surface.
+                    // Commit (not cancel) — matches standard Win32 inline
+                    // rename convention (Explorer, Edge): any action that
+                    // takes focus away saves the typed title.
+                    for (self.windows.items) |win| {
+                        if (win.rename_edit != null and win.rename_edit.? == msg.hwnd) {
+                            win.finishTabRename();
+                            break :blk win.getActiveSurface();
+                        }
+                    }
+                    // Palette/search edits are children of a surface HWND.
+                    const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
+                    const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
+                    if (ud == 0) break :blk null;
+                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
+                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                        surface.setCommandPaletteActive(false);
+                        break :blk surface;
+                    }
+                    if (surface.search_active and surface.search_edit == msg.hwnd) {
+                        surface.setSearchActive(false, &[_:0]u8{});
+                        break :blk surface;
+                    }
+                    break :blk null;
+                };
+                if (target_surface) |s| {
+                    s.handleKeyEvent(msg.wParam, msg.lParam, .press);
+                    continue :loop;
+                }
+            }
         }
 
         // Skip TranslateMessage for keyboard events on terminal surface
@@ -1196,6 +1238,16 @@ pub fn performAction(
 
         // All 65 apprt actions are now handled above.
     }
+}
+
+/// Ctrl-modified VKs that should remain with the focused Edit control
+/// rather than bubbling to the surface as a keybinding. Select-all,
+/// copy, paste, cut, redo, undo.
+fn isEditShortcutVk(vk: u16) bool {
+    return switch (vk) {
+        'A', 'C', 'V', 'X', 'Y', 'Z' => true,
+        else => false,
+    };
 }
 
 /// Register a system-wide hotkey for toggle_quick_terminal.
