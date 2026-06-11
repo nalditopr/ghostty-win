@@ -66,6 +66,12 @@ high_surrogate: u16 = 0,
 /// (replacing capture) and the next button-up would release prematurely.
 mouse_button_mask: u3 = 0,
 
+/// Set when a right-button press was not consumed by the core (the
+/// terminal application is not mouse-reporting it, or shift overrode
+/// the report). The context menu is then shown on the matching
+/// release, after our mouse capture has been released.
+context_menu_pending: bool = false,
+
 /// Whether an IME composition session is active. When true, handleKeyEvent
 /// skips VK_PROCESSKEY events (the IME is intercepting keys), and composed
 /// text is extracted from WM_IME_COMPOSITION instead.
@@ -1737,8 +1743,83 @@ pub fn handleMouseButton(
         log.err("cursor pos callback error: {}", .{err});
     };
 
-    _ = self.core_surface.mouseButtonCallback(action, button, mods) catch |err| {
+    const consumed = self.core_surface.mouseButtonCallback(action, button, mods) catch |err| consumed: {
         log.err("mouse button callback error: {}", .{err});
+        break :consumed false;
+    };
+
+    // GTK parity: an unconsumed right press means the core did not
+    // report it to the terminal application (mouse reporting is off,
+    // or shift overrode it) and right-click-action is context-menu.
+    // Decide on the press, but open the menu on the release — the
+    // Win32 convention — by which point capture has been released so
+    // TrackPopupMenu can take it.
+    if (button == .right) {
+        if (action == .press) {
+            self.context_menu_pending = !consumed;
+        } else if (self.context_menu_pending) {
+            self.context_menu_pending = false;
+            self.showContextMenu();
+        }
+    }
+}
+
+// Terminal context menu command IDs (tab bar context menu uses 9001+).
+const CTX_COPY: usize = 9101;
+const CTX_PASTE: usize = 9102;
+const CTX_SELECT_ALL: usize = 9103;
+const CTX_SPLIT_RIGHT: usize = 9104;
+const CTX_SPLIT_DOWN: usize = 9105;
+const CTX_NEW_TAB: usize = 9106;
+
+/// Show the terminal context menu at the screen cursor and run the
+/// chosen command through the core binding-action path (the same
+/// mechanism the command palette uses).
+fn showContextMenu(self: *Surface) void {
+    if (self.parent_window.closing) return;
+    const hwnd = self.hwnd orelse return;
+
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const copy_flags: u32 = if (self.core_surface.hasSelection()) w32.MF_STRING else w32.MF_GRAYED;
+    _ = w32.AppendMenuW(menu, copy_flags, CTX_COPY, L("Copy"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_PASTE, L("Paste"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SELECT_ALL, L("Select All"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, L("Split Right"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, L("Split Down"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_NEW_TAB, L("New Tab"));
+
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0) return;
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        hwnd,
+        null,
+    );
+
+    // The menu ran a modal message loop; the window may have started
+    // closing (or the surface shutting down) while it was up.
+    if (self.parent_window.closing or !self.core_surface_ready) return;
+
+    const ba: input.Binding.Action = switch (@as(usize, @intCast(cmd))) {
+        CTX_COPY => .{ .copy_to_clipboard = .mixed },
+        CTX_PASTE => .paste_from_clipboard,
+        CTX_SELECT_ALL => .select_all,
+        CTX_SPLIT_RIGHT => .{ .new_split = .right },
+        CTX_SPLIT_DOWN => .{ .new_split = .down },
+        CTX_NEW_TAB => .new_tab,
+        else => return,
+    };
+    _ = self.core_surface.performBindingAction(ba) catch |err| {
+        log.err("context menu action error: {}", .{err});
     };
 }
 

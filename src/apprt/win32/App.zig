@@ -92,6 +92,18 @@ desktop_notifs: [NOTIF_DESKTOP_SLOTS]?DesktopNotif = @splat(null),
 /// Next desktop-notification slot to use (rotates through the range).
 desktop_notif_next: usize = 0,
 
+/// Ring buffer of recent notifications listed in the sidebar's
+/// notifications panel, newest at notif_log_next-1. Slots are nulled
+/// when their window is destroyed or the log is cleared.
+notif_log: [NOTIF_LOG_CAP]?NotifEntry = @splat(null),
+
+/// Next notification log ring slot to overwrite.
+notif_log_next: usize = 0,
+
+/// Notifications pushed since the last markNotifsRead(). Drawn as the
+/// badge on the sidebar footer's bell icon.
+notif_unread: usize = 0,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -522,12 +534,24 @@ pub fn performAction(
                     // Mark the tab in the sidebar unless the bell rang
                     // in the active tab of the foreground window, where
                     // the user already sees it.
-                    const active = if (parent_window.findTabIndex(rt_surface)) |idx|
+                    const tab_idx = parent_window.findTabIndex(rt_surface);
+                    const active = if (tab_idx) |idx|
                         idx == parent_window.active_tab
                     else
                         false;
                     if (!active or !foreground) {
                         parent_window.setTabStatusForSurface(rt_surface, .bell);
+                        const title: []const u16 = if (tab_idx) |idx|
+                            parent_window.tab_titles[idx][0..parent_window.tab_title_lens[idx]]
+                        else
+                            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+                        self.pushNotif(
+                            .bell,
+                            parent_window,
+                            rt_surface,
+                            title,
+                            std.unicode.utf8ToUtf16LeStringLiteral("Bell"),
+                        );
                     }
                 },
             }
@@ -608,29 +632,7 @@ pub fn performAction(
         },
 
         .open_config => {
-            // Open the config file in the default editor.
-            const config_path = configpkg.preferredDefaultFilePath(
-                self.core_app.alloc,
-            ) catch |err| {
-                log.err("failed to get config path: {}", .{err});
-                return true;
-            };
-            defer self.core_app.alloc.free(config_path);
-
-            // Convert to wide string for ShellExecuteW.
-            var wbuf: [512]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, config_path) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
-            }
+            self.openConfigFile();
             return true;
         },
 
@@ -833,10 +835,22 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     const rt_surface = core_surface.rt_surface;
+                    const parent_window = rt_surface.parent_window;
                     // Mark the tab in the sidebar even when it's the
                     // active tab; the user may be looking elsewhere
                     // when the shell exits.
-                    rt_surface.parent_window.setTabStatusForSurface(rt_surface, .exited);
+                    parent_window.setTabStatusForSurface(rt_surface, .exited);
+                    const title: []const u16 = if (parent_window.findTabIndex(rt_surface)) |idx|
+                        parent_window.tab_titles[idx][0..parent_window.tab_title_lens[idx]]
+                    else
+                        std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+                    self.pushNotif(
+                        .exited,
+                        parent_window,
+                        rt_surface,
+                        title,
+                        std.unicode.utf8ToUtf16LeStringLiteral("Process exited"),
+                    );
                     const exit_code = value.exit_code;
                     if (exit_code != 0) {
                         // Show a message box including the actual exit code.
@@ -1268,6 +1282,121 @@ pub fn performAction(
     }
 }
 
+/// Template written when the config file is missing at open time so the
+/// editor has something to show. Config.load writes a fuller template at
+/// startup; this covers a file deleted while the app is running.
+const CONFIG_TEMPLATE =
+    "# Ghostty config — see https://ghostty.org/docs/config\n" ++
+    "# window-show-sidebar = true\n" ++
+    "# window-sidebar-width = 220\n";
+
+/// Resolve the user config file path the same way config loading does
+/// (XDG shim: %LOCALAPPDATA%\ghostty\config.ghostty unless overridden),
+/// creating parent directories and a commented template when the file
+/// is missing. The returned path is owned by the caller.
+fn resolveConfigFile(self: *App) ?[]const u8 {
+    const path = configpkg.preferredDefaultFilePath(
+        self.core_app.alloc,
+    ) catch |err| {
+        log.err("failed to get config path: {}", .{err});
+        return null;
+    };
+    if (std.fs.accessAbsolute(path, .{})) |_| {} else |_| {
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.cwd().makePath(dir) catch |err| {
+                log.warn("failed to create config dir={s} err={}", .{ dir, err });
+            };
+        }
+        if (std.fs.createFileAbsolute(path, .{ .exclusive = true })) |file| {
+            defer file.close();
+            file.writeAll(CONFIG_TEMPLATE) catch |err| {
+                log.warn("failed to write config template err={}", .{err});
+            };
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => log.warn("failed to create config file={s} err={}", .{ path, err }),
+        }
+    }
+    return path;
+}
+
+/// Open the user config file in its default editor, falling back to
+/// notepad.exe when nothing is associated with the file (extensionless
+/// legacy `config` paths commonly have no "open" verb).
+pub fn openConfigFile(self: *App) void {
+    const path = self.resolveConfigFile() orelse return;
+    defer self.core_app.alloc.free(path);
+
+    var wbuf: [512]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return;
+    if (wlen >= wbuf.len) return;
+    wbuf[wlen] = 0;
+
+    // ShellExecuteW returns > 32 on success; <= 32 is an SE_ERR_* code.
+    const result = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        @ptrCast(&wbuf),
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+    if (result > 32) return;
+    log.warn("ShellExecuteW open config failed code={d}, falling back to notepad", .{result});
+
+    // CreateProcessW may modify the command line, so build it in a
+    // mutable buffer. Quoting is safe: Windows paths cannot contain '"'.
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("notepad.exe \"");
+    var cmd_buf: [prefix.len + wbuf.len + 2]u16 = undefined;
+    @memcpy(cmd_buf[0..prefix.len], prefix);
+    @memcpy(cmd_buf[prefix.len .. prefix.len + wlen], wbuf[0..wlen]);
+    cmd_buf[prefix.len + wlen] = '"';
+    cmd_buf[prefix.len + wlen + 1] = 0;
+
+    var si = std.mem.zeroes(w32.STARTUPINFOW);
+    si.cb = @sizeOf(w32.STARTUPINFOW);
+    var pi = std.mem.zeroes(w32.PROCESS_INFORMATION);
+    if (w32.CreateProcessW(
+        null,
+        @ptrCast(&cmd_buf),
+        null,
+        null,
+        0,
+        0,
+        null,
+        null,
+        &si,
+        &pi,
+    ) != 0) {
+        if (pi.hProcess) |h| _ = w32.CloseHandle(h);
+        if (pi.hThread) |h| _ = w32.CloseHandle(h);
+    } else {
+        log.err("notepad fallback failed for config path={s}", .{path});
+    }
+}
+
+/// Open the folder containing the user config file in Explorer.
+/// resolveConfigFile created the directory, so the open cannot race a
+/// missing folder.
+pub fn openConfigFolder(self: *App) void {
+    const path = self.resolveConfigFile() orelse return;
+    defer self.core_app.alloc.free(path);
+    const dir = std.fs.path.dirname(path) orelse return;
+
+    var wbuf: [512]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, dir) catch return;
+    if (wlen >= wbuf.len) return;
+    wbuf[wlen] = 0;
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        @ptrCast(&wbuf),
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+}
+
 /// Ctrl-modified VKs that should remain with the focused Edit control
 /// rather than bubbling to the surface as a keybinding. Select-all,
 /// copy, paste, cut, redo, undo.
@@ -1411,6 +1540,25 @@ const NOTIF_DESKTOP_TIMER_BASE: usize = 100;
 const DesktopNotif = struct {
     window: *Window,
     surface: *Surface,
+};
+
+/// Capacity of the sidebar notification log ring buffer.
+pub const NOTIF_LOG_CAP: usize = 64;
+
+/// One sidebar notification log entry. Title/body are stored inline
+/// (UTF-16, truncated) so painting never dereferences the window or
+/// surface pointers; those are only used to jump and are validated by
+/// address first (jumpToSurface), like DesktopNotif.
+pub const NotifEntry = struct {
+    pub const Kind = enum { osc, bell, exited };
+
+    kind: Kind,
+    window: *Window,
+    surface: *Surface,
+    title: [128]u16,
+    title_len: usize,
+    body: [128]u16,
+    body_len: usize,
 };
 
 /// Minimum interval between update checks, in seconds. The check
@@ -1705,6 +1853,19 @@ fn showDesktopNotification(
     if (body_len >= nid.szInfo.len) body_len = nid.szInfo.len - 1;
     nid.szInfo[body_len] = 0;
 
+    // Mirror the balloon into the sidebar notification log, reusing
+    // the UTF-16 conversions above.
+    switch (target) {
+        .app => {},
+        .surface => |core_surface| self.pushNotif(
+            .osc,
+            core_surface.rt_surface.parent_window,
+            core_surface.rt_surface,
+            nid.szInfoTitle[0..title_len],
+            nid.szInfo[0..body_len],
+        ),
+    }
+
     // Tooltip
     const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
     @memcpy(nid.szTip[0..tip.len], tip);
@@ -1726,23 +1887,101 @@ fn onDesktopNotifClick(self: *App, slot: usize) void {
     self.clearDesktopNotif(slot);
 
     const target = notif orelse return;
-    // The pointers were captured when the balloon was shown and the
-    // window/tab may have closed since. Re-find both by address in the
-    // live lists before dereferencing (mirrors .present_terminal).
-    const win = for (self.windows.items) |w| {
-        if (w == target.window) break w;
-    } else return;
-    if (win.closing) return;
-    const idx = win.findTabIndex(target.surface) orelse return;
+    _ = self.jumpToSurface(target.window, target.surface);
+}
 
-    const win_hwnd = win.hwnd orelse return;
+/// Validate a captured (window, surface) pair by address against the
+/// live window/tab lists, then raise the window, select the surface's
+/// tab, and focus it. Returns false when either has closed since the
+/// pointers were recorded. Shared by desktop-notification balloon
+/// clicks and sidebar notification panel entries.
+pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
+    // Re-find both by address before dereferencing (mirrors
+    // .present_terminal): the pointers may dangle.
+    const win = for (self.windows.items) |w| {
+        if (w == window) break w;
+    } else return false;
+    if (win.closing) return false;
+    const idx = win.findTabIndex(surface) orelse return false;
+
+    const win_hwnd = win.hwnd orelse return false;
     _ = w32.ShowWindow(win_hwnd, w32.SW_RESTORE);
-    // The click landed on the shell's tray, not on one of our windows,
-    // so Windows treats us as a background process; a plain
-    // SetForegroundWindow would only flash the taskbar button.
+    // The click may land outside the target window (shell tray, another
+    // window's sidebar), where Windows treats us as a background
+    // process; a plain SetForegroundWindow would only flash the
+    // taskbar button.
     forceForegroundWindow(win_hwnd);
     if (idx != win.active_tab) win.selectTabIndex(idx);
-    if (target.surface.hwnd) |sh| _ = w32.SetFocus(sh);
+    if (surface.hwnd) |sh| _ = w32.SetFocus(sh);
+    return true;
+}
+
+/// Append an entry to the sidebar notification log, bump the unread
+/// badge, and repaint every sidebar. Title/body are UTF-16 and
+/// truncated to the entry's inline buffers.
+pub fn pushNotif(
+    self: *App,
+    kind: NotifEntry.Kind,
+    window: *Window,
+    surface: *Surface,
+    title: []const u16,
+    body: []const u16,
+) void {
+    var entry: NotifEntry = .{
+        .kind = kind,
+        .window = window,
+        .surface = surface,
+        .title = undefined,
+        .title_len = @min(title.len, 128),
+        .body = undefined,
+        .body_len = @min(body.len, 128),
+    };
+    @memcpy(entry.title[0..entry.title_len], title[0..entry.title_len]);
+    @memcpy(entry.body[0..entry.body_len], body[0..entry.body_len]);
+    self.notif_log[self.notif_log_next] = entry;
+    self.notif_log_next = (self.notif_log_next + 1) % NOTIF_LOG_CAP;
+    self.notif_unread += 1;
+    for (self.windows.items) |w| w.invalidateSidebar();
+}
+
+/// Reset the unread badge (the sidebar bell was clicked).
+pub fn markNotifsRead(self: *App) void {
+    if (self.notif_unread == 0) return;
+    self.notif_unread = 0;
+    for (self.windows.items) |w| w.invalidateSidebar();
+}
+
+/// Drop every notification log entry and the unread badge.
+pub fn clearNotifs(self: *App) void {
+    self.notif_log = @splat(null);
+    self.notif_log_next = 0;
+    self.notif_unread = 0;
+    for (self.windows.items) |w| w.invalidateSidebar();
+}
+
+/// Number of live entries in the notification log.
+pub fn notifCount(self: *const App) usize {
+    var n: usize = 0;
+    for (self.notif_log) |slot| {
+        if (slot != null) n += 1;
+    }
+    return n;
+}
+
+/// The display_idx-th newest live notification (0 = newest), or null
+/// past the end. Nulled slots are skipped so display indices stay
+/// contiguous; paint and hit-test resolve entries through this same
+/// mapping.
+pub fn notifAt(self: *const App, display_idx: usize) ?*const NotifEntry {
+    var seen: usize = 0;
+    for (0..NOTIF_LOG_CAP) |offset| {
+        const idx = (self.notif_log_next + NOTIF_LOG_CAP - 1 - offset) % NOTIF_LOG_CAP;
+        if (self.notif_log[idx]) |*entry| {
+            if (seen == display_idx) return entry;
+            seen += 1;
+        }
+    }
+    return null;
 }
 
 /// Remove a desktop notification's tray icon, kill its cleanup timer,
@@ -1767,6 +2006,13 @@ pub fn dropDesktopNotifsForWindow(self: *App, window: *Window) void {
     for (&self.desktop_notifs) |*slot| {
         if (slot.*) |n| {
             if (n.window == window) slot.* = null;
+        }
+    }
+    // Same invalidation for the sidebar notification log. Slots are
+    // nulled in place (not compacted) — notifAt skips holes.
+    for (&self.notif_log) |*slot| {
+        if (slot.*) |*entry| {
+            if (entry.window == window) slot.* = null;
         }
     }
 }
@@ -2034,10 +2280,17 @@ fn surfaceWndProc(
         w32.WM_LBUTTONUP => { surface.handleMouseButton(.left, .release, lparam); return 0; },
         w32.WM_RBUTTONDOWN => {
             _ = w32.SetFocus(hwnd);
-            surface.handleMouseButton(.right, .press, lparam);
+            // Only the terminal surface forwards right-clicks to the
+            // core: popup-local coords would corrupt the core mouse
+            // state and could open the terminal context menu from a
+            // search/palette popup.
+            if (is_surface_window) surface.handleMouseButton(.right, .press, lparam);
             return 0;
         },
-        w32.WM_RBUTTONUP => { surface.handleMouseButton(.right, .release, lparam); return 0; },
+        w32.WM_RBUTTONUP => {
+            if (is_surface_window) surface.handleMouseButton(.right, .release, lparam);
+            return 0;
+        },
         w32.WM_MBUTTONDOWN => {
             _ = w32.SetFocus(hwnd);
             surface.handleMouseButton(.middle, .press, lparam);

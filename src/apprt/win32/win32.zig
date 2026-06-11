@@ -160,6 +160,7 @@ pub const WM_MBUTTONDOWN: u32 = 0x0207;
 pub const WM_MBUTTONUP: u32 = 0x0208;
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_MOUSEHWHEEL: u32 = 0x020E;
+pub const WM_CAPTURECHANGED: u32 = 0x0215;
 pub const WM_SETCURSOR: u32 = 0x0020;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 
@@ -643,6 +644,47 @@ pub extern "shell32" fn ShellExecuteW(
     nShowCmd: i32,
 ) callconv(.winapi) isize;
 
+pub const STARTUPINFOW = extern struct {
+    cb: u32,
+    lpReserved: ?[*:0]u16,
+    lpDesktop: ?[*:0]u16,
+    lpTitle: ?[*:0]u16,
+    dwX: u32,
+    dwY: u32,
+    dwXSize: u32,
+    dwYSize: u32,
+    dwXCountChars: u32,
+    dwYCountChars: u32,
+    dwFillAttribute: u32,
+    dwFlags: u32,
+    wShowWindow: u16,
+    cbReserved2: u16,
+    lpReserved2: ?*u8,
+    hStdInput: ?HANDLE,
+    hStdOutput: ?HANDLE,
+    hStdError: ?HANDLE,
+};
+
+pub const PROCESS_INFORMATION = extern struct {
+    hProcess: ?HANDLE,
+    hThread: ?HANDLE,
+    dwProcessId: u32,
+    dwThreadId: u32,
+};
+
+pub extern "kernel32" fn CreateProcessW(
+    lpApplicationName: ?[*:0]const u16,
+    lpCommandLine: ?[*:0]u16,
+    lpProcessAttributes: ?*anyopaque,
+    lpThreadAttributes: ?*anyopaque,
+    bInheritHandles: i32,
+    dwCreationFlags: u32,
+    lpEnvironment: ?*anyopaque,
+    lpCurrentDirectory: ?[*:0]const u16,
+    lpStartupInfo: *STARTUPINFOW,
+    lpProcessInformation: *PROCESS_INFORMATION,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn SetLayeredWindowAttributes(
     hwnd: HWND,
     crKey: u32,
@@ -1074,6 +1116,8 @@ pub const PAINTSTRUCT = extern struct {
 pub const SRCCOPY: u32 = 0x00CC0020;
 pub const TRANSPARENT: i32 = 1;
 pub const DT_LEFT: u32 = 0;
+pub const DT_CENTER: u32 = 1;
+pub const DT_RIGHT: u32 = 2;
 pub const DT_VCENTER: u32 = 4;
 pub const DT_SINGLELINE: u32 = 32;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;

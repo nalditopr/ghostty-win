@@ -85,6 +85,10 @@ tab_status: [MAX_TABS]TabStatus = [_]TabStatus{.normal} ** MAX_TABS,
 /// Current sidebar hover target.
 sidebar_hover: Sidebar.HitTarget = .none,
 
+/// Whether the sidebar notifications panel (toggled by the footer
+/// bell icon) is open.
+notif_panel_open: bool = false,
+
 /// Whether the window is currently in fullscreen mode.
 is_fullscreen: bool = false,
 
@@ -108,6 +112,12 @@ dragging_split: bool = false,
 drag_split_handle: SplitTree(Surface).Node.Handle = .root,
 drag_split_layout: SplitTree(Surface).Split.Layout = .horizontal,
 drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
+/// Sidebar edge drag-resize state. The width override is in unscaled
+/// pixels and wins over `window-sidebar-width` until the next config
+/// reload (onConfigChange resets it so the config value re-applies).
+sidebar_width_override: ?u32 = null,
+dragging_sidebar: bool = false,
 
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
@@ -162,7 +172,9 @@ pub fn onConfigChange(self: *Window) void {
         applyChromeTheme(hwnd, self.app.config.background);
     }
     // window-show-sidebar / window-sidebar-width may have changed:
-    // recompute chrome layout and repaint.
+    // drop any drag-resize override so the config value re-applies,
+    // then recompute chrome layout and repaint.
+    self.sidebar_width_override = null;
     self.updateTabBarVisibility();
     self.handleResize();
     self.invalidateSidebar();
@@ -311,7 +323,8 @@ pub fn tabBarHeight(self: *const Window) i32 {
 pub fn sidebarWidth(self: *const Window) i32 {
     if (self.closing or self.is_quick_terminal) return 0;
     if (!self.app.config.@"window-show-sidebar") return 0;
-    const width = std.math.clamp(self.app.config.@"window-sidebar-width", 120, 400);
+    const unscaled = self.sidebar_width_override orelse self.app.config.@"window-sidebar-width";
+    const width = std.math.clamp(unscaled, Sidebar.MIN_WIDTH, Sidebar.MAX_WIDTH);
     return @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
 }
 
@@ -769,6 +782,40 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
 fn endDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
+    _ = w32.ReleaseCapture();
+}
+
+/// True when x is inside the drag-resize grab band along the sidebar's
+/// right edge. A hidden sidebar has no band.
+fn hitTestSidebarEdge(self: *const Window, x: i32) bool {
+    return Sidebar.hitTestEdge(x, self.sidebarWidth(), Sidebar.edgeBandWidth(self.scale));
+}
+
+fn startSidebarDrag(self: *Window) void {
+    if (self.closing) return;
+    self.dragging_sidebar = true;
+    if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
+}
+
+fn updateSidebarDrag(self: *Window, x: i32) void {
+    if (!self.dragging_sidebar or self.closing) return;
+    const unscaled = std.math.clamp(
+        @round(@as(f32, @floatFromInt(x)) / self.scale),
+        @as(f32, @floatFromInt(Sidebar.MIN_WIDTH)),
+        @as(f32, @floatFromInt(Sidebar.MAX_WIDTH)),
+    );
+    const new_width: u32 = @intFromFloat(unscaled);
+    if (self.sidebar_width_override) |cur| if (cur == new_width) return;
+    self.sidebar_width_override = new_width;
+    // Same live relayout as the divider drag: move the surfaces and
+    // repaint the chrome strips immediately.
+    self.handleResize();
+    if (self.hwnd) |h| _ = w32.UpdateWindow(h);
+}
+
+fn endSidebarDrag(self: *Window) void {
+    if (!self.dragging_sidebar) return;
+    self.dragging_sidebar = false;
     _ = w32.ReleaseCapture();
 }
 
@@ -1476,6 +1523,11 @@ const TAB_CTX_CLOSE_OTHERS: usize = 9002;
 const TAB_CTX_CLOSE_RIGHT: usize = 9003;
 const TAB_CTX_NEW_TAB: usize = 9004;
 
+// Sidebar gear (settings) context menu command IDs.
+const GEAR_CTX_OPEN_CONFIG: usize = 9201;
+const GEAR_CTX_OPEN_FOLDER: usize = 9202;
+const GEAR_CTX_RELOAD: usize = 9203;
+
 /// Handle a right-button click in the tab bar region.
 /// Shows a context menu for the clicked tab.
 fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
@@ -1569,11 +1621,28 @@ fn handleTabBarMouseLeave(self: *Window) void {
     }
 }
 
+/// Hit-test a client point against the sidebar with this window's
+/// current geometry and notification state.
+fn sidebarHitTest(self: *Window, x: i32, y: i32) Sidebar.HitTarget {
+    const hwnd = self.hwnd orelse return .none;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return .none;
+    return Sidebar.hitTest(x, y, .{
+        .item_h = Sidebar.itemHeight(self.scale),
+        .tab_count = self.tab_count,
+        .client_h = rect.bottom - rect.top,
+        .width = self.sidebarWidth(),
+        .scale = self.scale,
+        .panel_open = self.notif_panel_open,
+        .notif_count = self.app.notifCount(),
+    });
+}
+
 /// Handle a left-button click in the sidebar region.
 /// Selects the clicked session row or creates a new tab.
-fn handleSidebarClick(self: *Window, y: i32) void {
+fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
     if (self.closing) return;
-    switch (Sidebar.hitTest(y, Sidebar.itemHeight(self.scale), self.tab_count)) {
+    switch (self.sidebarHitTest(x, y)) {
         .none => {},
         .item => |i| self.selectTabIndex(i),
         .new_session => {
@@ -1582,23 +1651,83 @@ fn handleSidebarClick(self: *Window, y: i32) void {
                 return;
             };
         },
+        .bell_icon => {
+            self.notif_panel_open = !self.notif_panel_open;
+            self.app.markNotifsRead();
+            self.invalidateSidebar();
+        },
+        .gear_icon => self.app.openConfigFile(),
+        .notif_entry => |i| {
+            if (self.app.notifAt(i)) |entry| {
+                _ = self.app.jumpToSurface(entry.window, entry.surface);
+            }
+        },
+        .notif_clear => {
+            self.app.clearNotifs();
+            self.invalidateSidebar();
+        },
     }
 }
 
 /// Handle a right-button click in the sidebar region: show the same
-/// tab context menu as the tab bar for the clicked session row.
+/// tab context menu as the tab bar for the clicked session row, or the
+/// settings menu for the gear icon.
 fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
     if (self.closing) return;
-    const clicked_tab: ?usize = switch (Sidebar.hitTest(y, Sidebar.itemHeight(self.scale), self.tab_count)) {
+    const clicked_tab: ?usize = switch (self.sidebarHitTest(x, y)) {
         .item => |i| i,
+        .gear_icon => {
+            self.showGearContextMenu(x, y);
+            return;
+        },
         else => null,
     };
     self.showTabContextMenu(clicked_tab, x, y);
 }
 
+/// Show the settings (gear) context menu at client coordinates (x, y).
+fn showGearContextMenu(self: *Window, x: i32, y: i32) void {
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_OPEN_CONFIG, std.unicode.utf8ToUtf16LeStringLiteral("Open config"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_OPEN_FOLDER, std.unicode.utf8ToUtf16LeStringLiteral("Open config folder"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_RELOAD, std.unicode.utf8ToUtf16LeStringLiteral("Reload config"));
+
+    // Convert client coords to screen coords for the popup.
+    var pt = w32.POINT{ .x = x, .y = y };
+    if (self.hwnd) |h| _ = w32.ClientToScreen(h, &pt);
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        self.hwnd.?,
+        null,
+    );
+
+    // The modal menu loop dispatches arbitrary messages; re-check
+    // before acting.
+    if (self.closing) return;
+    switch (@as(usize, @intCast(cmd))) {
+        GEAR_CTX_OPEN_CONFIG => self.app.openConfigFile(),
+        GEAR_CTX_OPEN_FOLDER => self.app.openConfigFolder(),
+        // Same path as the reload_config keybind: core performAction
+        // forwards to the apprt's .reload_config handler.
+        GEAR_CTX_RELOAD => self.app.core_app.performAction(
+            self.app,
+            .reload_config,
+        ) catch |err| {
+            log.err("failed to reload config: {}", .{err});
+        },
+        else => {},
+    }
+}
+
 /// Handle mouse movement over the sidebar for hover effects.
 /// Registers TrackMouseEvent on first move so we get WM_MOUSELEAVE.
-fn handleSidebarMouseMove(self: *Window, y: i32) void {
+fn handleSidebarMouseMove(self: *Window, x: i32, y: i32) void {
     if (self.closing) return;
 
     // Register for WM_MOUSELEAVE if not already tracking.
@@ -1613,7 +1742,7 @@ fn handleSidebarMouseMove(self: *Window, y: i32) void {
         self.tracking_mouse = true;
     }
 
-    const new_hover = Sidebar.hitTest(y, Sidebar.itemHeight(self.scale), self.tab_count);
+    const new_hover = self.sidebarHitTest(x, y);
     if (!std.meta.eql(new_hover, self.sidebar_hover)) {
         self.sidebar_hover = new_hover;
         self.invalidateSidebar();
@@ -1954,8 +2083,12 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            if (window.hitTestSidebarEdge(x)) {
+                window.startSidebarDrag();
+                return 0;
+            }
             if (x < window.sidebarWidth()) {
-                window.handleSidebarClick(y);
+                window.handleSidebarClick(x, y);
                 return 0;
             }
             if (window.hitTestDivider(x, y)) |hit| {
@@ -1970,6 +2103,10 @@ pub fn windowWndProc(
         w32.WM_LBUTTONUP => {
             if (window.dragging_split) {
                 window.endDividerDrag();
+                return 0;
+            }
+            if (window.dragging_sidebar) {
+                window.endSidebarDrag();
                 return 0;
             }
             if (window.drag_tab >= 0) {
@@ -2021,6 +2158,10 @@ pub fn windowWndProc(
                 window.updateDividerDrag(x, y);
                 return 0;
             }
+            if (window.dragging_sidebar) {
+                window.updateSidebarDrag(x);
+                return 0;
+            }
             // Handle tab drag reorder
             if (window.drag_tab >= 0) {
                 const xi16: i16 = @truncate(x);
@@ -2052,8 +2193,14 @@ pub fn windowWndProc(
                 }
                 return 0;
             }
+            if (window.hitTestSidebarEdge(x)) {
+                // Over the resize band: suppress row hover so the
+                // band reads as a grab edge, not a row.
+                window.clearSidebarHover();
+                return 0;
+            }
             if (x < window.sidebarWidth()) {
-                window.handleSidebarMouseMove(y);
+                window.handleSidebarMouseMove(x, y);
                 return 0;
             }
             window.clearSidebarHover();
@@ -2063,9 +2210,23 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_SETCURSOR => {
+            // While dragging the sidebar edge the cursor can leave the
+            // band (the width is clamped), so don't re-hit-test.
+            if (window.dragging_sidebar) {
+                if (w32.LoadCursorW(null, w32.IDC_SIZEWE)) |cursor| {
+                    _ = w32.SetCursor(cursor);
+                }
+                return 1;
+            }
             var pt: w32.POINT = undefined;
             if (w32.GetCursorPos_(&pt) != 0) {
                 if (window.hwnd) |h| _ = w32.ScreenToClient(h, &pt);
+                if (window.hitTestSidebarEdge(pt.x)) {
+                    if (w32.LoadCursorW(null, w32.IDC_SIZEWE)) |cursor| {
+                        _ = w32.SetCursor(cursor);
+                    }
+                    return 1;
+                }
                 if (window.hitTestDivider(pt.x, pt.y)) |hit| {
                     const cursor_id: usize = if (hit.layout == .horizontal) w32.IDC_SIZEWE else w32.IDC_SIZENS;
                     if (w32.LoadCursorW(null, cursor_id)) |cursor| {
@@ -2079,6 +2240,14 @@ pub fn windowWndProc(
         w32.WM_MOUSELEAVE => {
             window.handleTabBarMouseLeave();
             window.clearSidebarHover();
+            return 0;
+        },
+        w32.WM_CAPTURECHANGED => {
+            // Capture stolen (e.g. a menu or modal opened mid-drag):
+            // end the sidebar edge drag so the override stops tracking
+            // the mouse. Re-entry from our own ReleaseCapture is a
+            // no-op via the dragging_sidebar guard.
+            window.endSidebarDrag();
             return 0;
         },
         w32.WM_ACTIVATE => {
