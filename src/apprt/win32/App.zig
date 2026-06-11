@@ -83,6 +83,15 @@ quick_terminal: ?*QuickTerminal = null,
 /// Whether a global hotkey has been registered.
 global_hotkey_registered: bool = false,
 
+/// In-flight desktop-notification click targets, indexed by slot. A
+/// balloon click jumps to its slot's surface after validation. Entries
+/// are nulled on timer expiry, on click, and when the referenced
+/// window is destroyed.
+desktop_notifs: [NOTIF_DESKTOP_SLOTS]?DesktopNotif = @splat(null),
+
+/// Next desktop-notification slot to use (rotates through the range).
+desktop_notif_next: usize = 0,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -1379,11 +1388,30 @@ const RELEASES_URL = "https://github.com/InsipidPoint/ghostty-windows/releases/l
 
 /// Tray icon and timer IDs for notifications. Distinct IDs mean the
 /// desktop and update balloons can coexist without one's auto-cleanup
-/// removing the other's icon.
-const NOTIF_DESKTOP_UID: u32 = 1;
-const NOTIF_DESKTOP_TIMER_ID: usize = 2;
+/// removing the other's icon. Timer IDs share the msg_hwnd WM_TIMER
+/// namespace with QUIT_TIMER_ID=1 and QuickTerminal.ANIM_TIMER_ID=3 and
+/// must stay unique across all of them (the update timer was 3, which
+/// the anim-timer check shadowed whenever a quick terminal existed,
+/// leaving the update tray icon undeleted).
 const NOTIF_UPDATE_UID: u32 = 2;
-const NOTIF_UPDATE_TIMER_ID: usize = 3;
+const NOTIF_UPDATE_TIMER_ID: usize = 4;
+
+/// Desktop notifications rotate through a small range of slots so that
+/// several balloons can be in flight at once, each with its own tray
+/// uID, cleanup timer, and recorded click target. Slot `i` uses uID
+/// NOTIF_DESKTOP_UID_BASE+i and timer NOTIF_DESKTOP_TIMER_BASE+i.
+const NOTIF_DESKTOP_SLOTS: usize = 8;
+const NOTIF_DESKTOP_UID_BASE: u32 = 100;
+const NOTIF_DESKTOP_TIMER_BASE: usize = 100;
+
+/// Click target recorded for an in-flight desktop notification. The
+/// pointers may dangle by the time the balloon is clicked (tab or
+/// window closed since), so they are compared by address against the
+/// live window/tab lists before being dereferenced.
+const DesktopNotif = struct {
+    window: *Window,
+    surface: *Surface,
+};
 
 /// Minimum interval between update checks, in seconds. The check
 /// timestamp is persisted in %LOCALAPPDATA%/ghostty/update_check_at.
@@ -1637,14 +1665,30 @@ fn showDesktopNotification(
     target: apprt.Target,
     value: apprt.Action.Value(.desktop_notification),
 ) void {
-    _ = target;
     const hwnd = self.msg_hwnd orelse return;
+
+    // Record which surface notified so a click on the balloon can jump
+    // back to it. Slots rotate; if all are in flight the oldest balloon
+    // is replaced (NIM_ADD fails silently, NIM_MODIFY updates in place,
+    // SetTimer with the same id restarts the old timer).
+    const slot = self.desktop_notif_next;
+    self.desktop_notif_next = (slot + 1) % NOTIF_DESKTOP_SLOTS;
+    self.desktop_notifs[slot] = switch (target) {
+        .app => null,
+        .surface => |core_surface| .{
+            .window = core_surface.rt_surface.parent_window,
+            .surface = core_surface.rt_surface,
+        },
+    };
 
     var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
     nid.hWnd = hwnd;
-    nid.uID = NOTIF_DESKTOP_UID;
-    nid.uFlags = w32.NIF_INFO | w32.NIF_ICON | w32.NIF_TIP;
+    nid.uID = NOTIF_DESKTOP_UID_BASE + @as(u32, @intCast(slot));
+    // NIF_MESSAGE registers our callback so a click on the balloon is
+    // delivered as WM_APP_TRAY → jump to the notifying surface.
+    nid.uFlags = w32.NIF_INFO | w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
+    nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = w32.LoadIconW(self.hinstance, w32.IDI_GHOSTTY) orelse w32.LoadIconW(null, w32.IDI_APPLICATION);
     nid.dwInfoFlags = w32.NIIF_INFO;
     nid.uVersion_or_uTimeout = 5000; // 5 second timeout
@@ -1672,7 +1716,79 @@ fn showDesktopNotification(
 
     // Schedule icon removal via a timer (distinct from the update
     // notification's timer so the two don't trample each other).
-    _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
+    _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_BASE + slot, 6000, null);
+}
+
+/// A desktop-notification balloon was clicked: jump to the surface that
+/// produced it, then tear down the balloon's icon, timer, and slot.
+fn onDesktopNotifClick(self: *App, slot: usize) void {
+    const notif = self.desktop_notifs[slot];
+    self.clearDesktopNotif(slot);
+
+    const target = notif orelse return;
+    // The pointers were captured when the balloon was shown and the
+    // window/tab may have closed since. Re-find both by address in the
+    // live lists before dereferencing (mirrors .present_terminal).
+    const win = for (self.windows.items) |w| {
+        if (w == target.window) break w;
+    } else return;
+    if (win.closing) return;
+    const idx = win.findTabIndex(target.surface) orelse return;
+
+    const win_hwnd = win.hwnd orelse return;
+    _ = w32.ShowWindow(win_hwnd, w32.SW_RESTORE);
+    // The click landed on the shell's tray, not on one of our windows,
+    // so Windows treats us as a background process; a plain
+    // SetForegroundWindow would only flash the taskbar button.
+    forceForegroundWindow(win_hwnd);
+    if (idx != win.active_tab) win.selectTabIndex(idx);
+    if (target.surface.hwnd) |sh| _ = w32.SetFocus(sh);
+}
+
+/// Remove a desktop notification's tray icon, kill its cleanup timer,
+/// and free the slot.
+fn clearDesktopNotif(self: *App, slot: usize) void {
+    self.desktop_notifs[slot] = null;
+    const hwnd = self.msg_hwnd orelse return;
+    _ = w32.KillTimer(hwnd, NOTIF_DESKTOP_TIMER_BASE + slot);
+    var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
+    nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
+    nid.hWnd = hwnd;
+    nid.uID = NOTIF_DESKTOP_UID_BASE + @as(u32, @intCast(slot));
+    _ = w32.Shell_NotifyIconW(w32.NIM_DELETE, &nid);
+}
+
+/// Null any desktop-notification slots that reference a window being
+/// destroyed so a later balloon click can't touch freed memory (or a
+/// recycled allocation at the same address). The icon and timer are
+/// left for the normal timeout path; a click on the orphaned balloon
+/// is a validated no-op.
+pub fn dropDesktopNotifsForWindow(self: *App, window: *Window) void {
+    for (&self.desktop_notifs) |*slot| {
+        if (slot.*) |n| {
+            if (n.window == window) slot.* = null;
+        }
+    }
+}
+
+/// Force a window to the foreground even when Ghostty is a background
+/// process. Uses AttachThreadInput to work around the Win32
+/// SetForegroundWindow restriction.
+pub fn forceForegroundWindow(hwnd: w32.HWND) void {
+    const fg = w32.GetForegroundWindow();
+    if (fg) |fg_hwnd| {
+        const fg_tid = w32.GetWindowThreadProcessId(fg_hwnd, null);
+        const our_tid = w32.GetCurrentThreadId();
+        if (fg_tid != our_tid) {
+            _ = w32.AttachThreadInput(our_tid, fg_tid, 1);
+            _ = w32.SetForegroundWindow(hwnd);
+            _ = w32.AttachThreadInput(our_tid, fg_tid, 0);
+        } else {
+            _ = w32.SetForegroundWindow(hwnd);
+        }
+    } else {
+        _ = w32.SetForegroundWindow(hwnd);
+    }
 }
 
 /// Notify the core app of a tick.
@@ -2060,11 +2176,12 @@ fn msgWndProc(
     }
 
     if (msg == WM_APP_TRAY) {
-        // wparam = uID, lparam = NIN_* event. We only act on
-        // NIN_BALLOONUSERCLICK on the update notification, opening the
-        // GitHub releases page in the user's default browser.
+        // wparam = uID, lparam = NIN_* event. A click on the update
+        // notification opens the GitHub releases page; a click on a
+        // desktop notification jumps to the surface that produced it.
         const event: u32 = @intCast(lparam & 0xFFFF);
-        if (wparam == NOTIF_UPDATE_UID and event == w32.NIN_BALLOONUSERCLICK) {
+        if (event != w32.NIN_BALLOONUSERCLICK) return 0;
+        if (wparam == NOTIF_UPDATE_UID) {
             var url_buf: [256]u16 = undefined;
             const url_len = std.unicode.utf8ToUtf16Le(&url_buf, RELEASES_URL) catch return 0;
             url_buf[url_len] = 0;
@@ -2076,6 +2193,10 @@ fn msgWndProc(
                 null,
                 w32.SW_SHOW,
             );
+        } else if (wparam >= NOTIF_DESKTOP_UID_BASE and
+            wparam < NOTIF_DESKTOP_UID_BASE + NOTIF_DESKTOP_SLOTS)
+        {
+            app.onDesktopNotifClick(wparam - NOTIF_DESKTOP_UID_BASE);
         }
         return 0;
     }
@@ -2097,19 +2218,21 @@ fn msgWndProc(
     // Notification icon cleanup timers. Each notification kind has its
     // own (uID, timer-id) pair so an in-flight balloon isn't removed by
     // an unrelated timeout.
-    if (msg == w32.WM_TIMER and
-        (wparam == NOTIF_DESKTOP_TIMER_ID or wparam == NOTIF_UPDATE_TIMER_ID))
-    {
-        const uid: u32 = if (wparam == NOTIF_DESKTOP_TIMER_ID)
-            NOTIF_DESKTOP_UID
-        else
-            NOTIF_UPDATE_UID;
+    if (msg == w32.WM_TIMER and wparam == NOTIF_UPDATE_TIMER_ID) {
         _ = w32.KillTimer(hwnd, wparam);
         var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
         nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
         nid.hWnd = hwnd;
-        nid.uID = uid;
+        nid.uID = NOTIF_UPDATE_UID;
         _ = w32.Shell_NotifyIconW(w32.NIM_DELETE, &nid);
+        return 0;
+    }
+
+    if (msg == w32.WM_TIMER and
+        wparam >= NOTIF_DESKTOP_TIMER_BASE and
+        wparam < NOTIF_DESKTOP_TIMER_BASE + NOTIF_DESKTOP_SLOTS)
+    {
+        app.clearDesktopNotif(wparam - NOTIF_DESKTOP_TIMER_BASE);
         return 0;
     }
 

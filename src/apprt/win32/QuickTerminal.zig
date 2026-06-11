@@ -13,7 +13,9 @@ const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_quick_terminal);
 
-/// Animation timer ID (must not collide with QUIT_TIMER_ID=1 or notification=2).
+/// Animation timer ID. Runs on app.msg_hwnd, so it must stay unique
+/// against App's QUIT_TIMER_ID=1, NOTIF_UPDATE_TIMER_ID=4, and the
+/// NOTIF_DESKTOP_TIMER_BASE=100 range.
 pub const ANIM_TIMER_ID: usize = 3;
 
 /// Animation tick interval in milliseconds (~60fps).
@@ -321,24 +323,10 @@ fn getMonitor(self: *QuickTerminal) ?w32.HMONITOR {
 // -----------------------------------------------------------------------
 
 /// Force the quick terminal to the foreground, even when Ghostty is a
-/// background process. Uses AttachThreadInput to work around the Win32
-/// SetForegroundWindow restriction.
+/// background process.
 fn forceForeground(self: *QuickTerminal) void {
     const hwnd = self.window.hwnd orelse return;
-    const fg = w32.GetForegroundWindow();
-    if (fg) |fg_hwnd| {
-        const fg_tid = w32.GetWindowThreadProcessId(fg_hwnd, null);
-        const our_tid = w32.GetCurrentThreadId();
-        if (fg_tid != our_tid) {
-            _ = w32.AttachThreadInput(our_tid, fg_tid, 1);
-            _ = w32.SetForegroundWindow(hwnd);
-            _ = w32.AttachThreadInput(our_tid, fg_tid, 0);
-        } else {
-            _ = w32.SetForegroundWindow(hwnd);
-        }
-    } else {
-        _ = w32.SetForegroundWindow(hwnd);
-    }
+    App.forceForegroundWindow(hwnd);
     // Focus the terminal surface inside the window.
     if (self.window.getActiveSurface()) |s| {
         if (s.hwnd) |sh| _ = w32.SetFocus(sh);

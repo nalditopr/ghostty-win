@@ -1774,6 +1774,10 @@ fn cleanupAllSurfaces(self: *Window) void {
 fn onDestroy(self: *Window) void {
     const app = self.app;
 
+    // Invalidate any in-flight desktop-notification click targets that
+    // point at this window before its memory is freed.
+    app.dropDesktopNotifsForWindow(self);
+
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
     if (self.is_quick_terminal) {
         if (self.tab_font) |font| {
