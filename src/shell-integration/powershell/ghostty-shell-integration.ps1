@@ -43,11 +43,29 @@ function prompt {
         [Console]::Write("`e[5 q")
     }
 
-    # OSC 7 — report current working directory.
-    $cwd = (Get-Location).Path -replace '\\', '/'
-    # File URI: file://hostname/path
-    $hostname = [System.Net.Dns]::GetHostName()
-    [Console]::Write("`e]7;file://$hostname/$cwd`a")
+    # OSC 7 — report current working directory as a file:// URI.
+    #
+    # The host component is $env:COMPUTERNAME (the same value Ghostty's
+    # local-hostname validation compares against, via GetComputerName).
+    # Each path segment is percent-encoded with [uri]::EscapeDataString
+    # so spaces and non-ASCII characters survive URI parsing; backslashes
+    # become '/' separators. UNC paths (\\server\share) are emitted as
+    # file://server/share, which Ghostty converts back to a UNC path.
+    $loc = Get-Location
+    if ($loc.Provider.Name -eq 'FileSystem') {
+        $segments = ($loc.ProviderPath -replace '\\', '/') -split '/'
+        $escaped = ($segments | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+        if ($escaped.StartsWith('//')) {
+            # UNC path: //server/share/... -> file://server/share/...
+            [Console]::Write("`e]7;file:$escaped`a")
+        } else {
+            [Console]::Write("`e]7;file://$env:COMPUTERNAME/$escaped`a")
+        }
+    } else {
+        # Non-filesystem provider (registry, cert store, ...): report an
+        # empty pwd so the terminal resets any stale value.
+        [Console]::Write("`e]7;`a")
+    }
 
     # OSC 2 — window title (current directory).
     if ($GhosttyFeatures -contains 'title') {
@@ -86,6 +104,24 @@ if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     }
 }
+
+# TODO(ssh): port the upstream `ghostty +ssh` integration once the CLI
+# lands in this fork. Upstream replaced the per-shell ssh wrapper
+# functions (the ssh-env/ssh-terminfo logic still present in our
+# bash/zsh scripts, which talk to `ghostty +ssh-cache`) with a single
+# `ghostty +ssh` CLI action (upstream src/cli/ssh.zig) that handles
+# TERM fallback, env propagation, and terminfo installation itself.
+# That CLI does not exist at this fork's base commit, so there is
+# nothing to invoke yet. When it lands, gate on
+# $env:GHOSTTY_SHELL_FEATURES containing 'ssh-env'/'ssh-terminfo' and
+# define an ssh function that delegates, mirroring the bash/zsh
+# pattern, e.g.:
+#
+#   if ($GhosttyFeatures -match 'ssh-') {
+#       function ssh { & (Join-Path $env:GHOSTTY_BIN_DIR 'ghostty.exe') +ssh @args }
+#   }
+#
+# Do not vendor the old wrapper logic; wait for the CLI.
 
 # Clean up the integration env vars (don't leak to child processes).
 Remove-Item Env:GHOSTTY_SHELL_INTEGRATION_XDG_DIR -ErrorAction SilentlyContinue
