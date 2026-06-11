@@ -8,6 +8,7 @@
 #   - Current working directory reporting (OSC 7)
 #   - Window title updates (OSC 2)
 #   - Cursor shape changes at prompt
+#   - ssh wrapper that delegates to `ghostty +ssh` (ssh-env/ssh-terminfo)
 
 if (-not $env:GHOSTTY_SHELL_FEATURES) { return }
 
@@ -105,23 +106,28 @@ if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
     }
 }
 
-# TODO(ssh): port the upstream `ghostty +ssh` integration once the CLI
-# lands in this fork. Upstream replaced the per-shell ssh wrapper
-# functions (the ssh-env/ssh-terminfo logic still present in our
-# bash/zsh scripts, which talk to `ghostty +ssh-cache`) with a single
-# `ghostty +ssh` CLI action (upstream src/cli/ssh.zig) that handles
-# TERM fallback, env propagation, and terminfo installation itself.
-# That CLI does not exist at this fork's base commit, so there is
-# nothing to invoke yet. When it lands, gate on
-# $env:GHOSTTY_SHELL_FEATURES containing 'ssh-env'/'ssh-terminfo' and
-# define an ssh function that delegates, mirroring the bash/zsh
-# pattern, e.g.:
+# SSH Integration
 #
-#   if ($GhosttyFeatures -match 'ssh-') {
-#       function ssh { & (Join-Path $env:GHOSTTY_BIN_DIR 'ghostty.exe') +ssh @args }
-#   }
-#
-# Do not vendor the old wrapper logic; wait for the CLI.
+# Wrap `ssh` with `ghostty +ssh` (src/cli/ssh.zig) and translate the
+# shell-integration feature flags into command options, mirroring the
+# bash/zsh wrappers. Only define the wrapper when an actual ssh client
+# is available on PATH (on Windows this is the OpenSSH client) and
+# Ghostty exported its binary directory (Exec.zig sets GHOSTTY_BIN_DIR).
+if (($GhosttyFeatures -match '^ssh-') -and
+    $env:GHOSTTY_BIN_DIR -and
+    (Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue)) {
+    function ssh {
+        $features = $env:GHOSTTY_SHELL_FEATURES -split ','
+        $ghosttyArgs = @('+ssh')
+        if ($features -notcontains 'ssh-env') { $ghosttyArgs += '--forward-env=false' }
+        if ($features -notcontains 'ssh-terminfo') { $ghosttyArgs += '--terminfo=false' }
+        # '--' must be passed via splatting; as a bare token PowerShell's
+        # parser would consume it instead of handing it to the executable.
+        $ghosttyArgs = $ghosttyArgs + '--' + $args
+        $exe = if ($env:OS -eq 'Windows_NT') { 'ghostty.exe' } else { 'ghostty' }
+        & (Join-Path $env:GHOSTTY_BIN_DIR $exe) @ghosttyArgs
+    }
+}
 
 # Clean up the integration env vars (don't leak to child processes).
 Remove-Item Env:GHOSTTY_SHELL_INTEGRATION_XDG_DIR -ErrorAction SilentlyContinue
