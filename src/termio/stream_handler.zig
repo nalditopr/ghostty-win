@@ -1131,8 +1131,60 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
+        if (comptime builtin.os.tag == .windows) {
+            // OSC 7 delivers a file:// URI. On Windows this is either a
+            // drive letter path (file://host/C:/Users/foo, possibly with
+            // an empty host) or a UNC path (file://server/share/path).
+            // We convert the URI to a Windows path and then run the same
+            // setPwd flow as the POSIX implementation below.
+            //
+            // Mirroring the POSIX branch, the URI hostname is validated
+            // against the local machine name (see windowsPathFromOsc7).
+            // We fetch the computer name the same way
+            // internal_os.hostname.isLocal does on Windows.
+            var name_buf: [256:0]u8 = undefined;
+            const local_hostname: []const u8 = hostname: {
+                var name_len: internal_os.windows.DWORD = name_buf.len;
+                if (internal_os.windows.exp.kernel32.GetComputerNameA(
+                    &name_buf,
+                    &name_len,
+                ) == 0) break :hostname "";
+                break :hostname name_buf[0..name_len];
+            };
+
+            const path = windowsPathFromOsc7(
+                self.alloc,
+                url,
+                local_hostname,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidUri,
+                error.UnsupportedScheme,
+                error.InvalidPath,
+                => {
+                    log.warn("invalid OSC 7 on windows, ignoring err={} url={s}", .{ err, url });
+                    return;
+                },
+            };
+            defer self.alloc.free(path);
+
+            log.debug("terminal pwd: {s}", .{path});
+            try self.terminal.setPwd(path);
+
+            // Report it to the surface. If creating our write request
+            // fails then we just ignore it.
+            if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
+                self.surfaceMessageWriter(.{ .pwd_change = req });
+            } else |err| {
+                log.warn("error notifying surface of pwd change err={}", .{err});
+            }
+
+            // If we haven't seen a title, use our pwd as the title.
+            if (!self.seen_title) {
+                try self.windowTitle(path);
+                self.seen_title = false;
+            }
+
             return;
         }
 
@@ -1555,3 +1607,379 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+/// Errors for windowsPathFromOsc7.
+const WindowsOsc7Error = Allocator.Error || error{
+    /// The URL failed to parse as a URI at all.
+    InvalidUri,
+
+    /// The URI scheme is not file:// (or kitty-shell-cwd://).
+    UnsupportedScheme,
+
+    /// The URI path can't be mapped to an absolute Windows path.
+    InvalidPath,
+};
+
+/// Converts an OSC 7 file URI into an absolute Windows path.
+///
+/// This is the Windows analogue of the POSIX logic in reportPwd: the URI
+/// is parsed with the same options, non-file schemes are rejected the same
+/// way, and the hostname is validated against the local machine name.
+///
+/// Accepted forms and their conversions:
+///
+///   - file:///C:/Users/foo          -> C:\Users\foo  (empty host = local)
+///   - file://localhost/C:/Users/foo -> C:\Users\foo
+///   - file://HOSTNAME/C:/Users/foo  -> C:\Users\foo  (host matches
+///     local_hostname, ASCII case-insensitive since Windows computer
+///     names are case-insensitive)
+///   - file://server/share/path      -> \\server\share\path (a non-local
+///     host maps to a UNC path, the same mapping Windows itself uses for
+///     remote file URIs per RFC 8089 / PathCreateFromUrl)
+///
+/// Percent-encoded URIs are decoded ("%20" -> space, "%C3%B3" -> ó, etc.)
+/// and a trailing path separator is stripped unless the result is a drive
+/// root ("C:\").
+///
+/// This is a pure function: `local_hostname` is injected so it is
+/// testable. The caller (reportPwd) supplies the real computer name.
+/// The returned path is allocated with `alloc` and owned by the caller.
+fn windowsPathFromOsc7(
+    alloc: Allocator,
+    url: []const u8,
+    local_hostname: []const u8,
+) WindowsOsc7Error![]u8 {
+    // Attempt to parse this file-style URI using the same options the
+    // POSIX implementation uses (mac_address is comptime-true on any
+    // non-macOS platform there, so it is hardcoded true here).
+    const uri: std.Uri = internal_os.uri.parse(url, .{
+        .mac_address = true,
+        .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
+    }) catch return error.InvalidUri;
+
+    if (!std.mem.eql(u8, "file", uri.scheme) and
+        !std.mem.eql(u8, "kitty-shell-cwd", uri.scheme))
+    {
+        return error.UnsupportedScheme;
+    }
+
+    // A missing authority is normalized to an empty host. std.Uri leaves
+    // .host null both for "file:/C:/foo" (no authority) and
+    // "file:///C:/foo" (empty authority); RFC 8089 defines both as
+    // referring to the local machine.
+    var host_buffer: [std.Uri.host_name_max]u8 = undefined;
+    const host: []const u8 = uri.getHost(&host_buffer) catch |err| switch (err) {
+        error.UriMissingHost => "",
+        error.UriHostTooLong => return error.InvalidUri,
+    };
+
+    // We need the raw (percent-decoded) path. Temporary decode memory
+    // lives in this arena; the final result is allocated with `alloc`.
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const path = try uri.path.toRawMaybeAlloc(arena_state.allocator());
+
+    // A URI host refers to the local machine when it is empty (RFC 8089
+    // empty authority), "localhost", or our own computer name. This
+    // mirrors internal_os.hostname.isLocal except the hostname compare
+    // is ASCII case-insensitive (NetBIOS/DNS names on Windows are
+    // case-insensitive and emitters disagree about casing).
+    const host_is_local = host.len == 0 or
+        std.mem.eql(u8, "localhost", host) or
+        std.ascii.eqlIgnoreCase(host, local_hostname);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+
+    if (host_is_local) {
+        // Local: expect a drive letter path "/C:" or "/C:/...".
+        if (path.len < 3 or path[0] != '/') return error.InvalidPath;
+        const rest = path[1..];
+        if (!std.ascii.isAlphabetic(rest[0]) or rest[1] != ':') return error.InvalidPath;
+        if (rest.len > 2 and rest[2] != '/') return error.InvalidPath;
+
+        try out.appendSlice(alloc, rest[0..2]);
+        if (rest.len <= 3) {
+            // "C:" or "C:/" is the drive root, which keeps its
+            // trailing separator: "C:\".
+            try out.append(alloc, '\\');
+        } else {
+            for (rest[2..]) |c| try out.append(
+                alloc,
+                if (c == '/') '\\' else c,
+            );
+
+            // Strip trailing separators, but never below the drive
+            // root ("C:\").
+            while (out.items.len > 3 and
+                out.items[out.items.len - 1] == '\\')
+            {
+                _ = out.pop();
+            }
+        }
+    } else {
+        // Non-local: UNC path. We require at least one non-empty path
+        // segment (the share name); "file://server" or "file://server/"
+        // can't map to a usable working directory.
+        if (std.mem.indexOfNone(u8, path, "/") == null) return error.InvalidPath;
+
+        try out.appendSlice(alloc, "\\\\");
+        try out.appendSlice(alloc, host);
+
+        // The URI path always begins with '/' when an authority is
+        // present, which becomes the separator after the host.
+        for (path) |c| try out.append(
+            alloc,
+            if (c == '/') '\\' else c,
+        );
+
+        // Strip trailing separators, but never the separator following
+        // the host itself.
+        while (out.items.len > "\\\\".len + host.len + 1 and
+            out.items[out.items.len - 1] == '\\')
+        {
+            _ = out.pop();
+        }
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "win-pwd: drive letter path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://MYPC/C:/Users/foo",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("C:\\Users\\foo", path);
+}
+
+test "win-pwd: empty host is local" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file:///C:/Users/foo",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("C:\\Users\\foo", path);
+}
+
+test "win-pwd: localhost host is local" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://localhost/D:/data",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("D:\\data", path);
+}
+
+test "win-pwd: hostname match is ASCII case-insensitive" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://mypc/C:/Users/foo",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("C:\\Users\\foo", path);
+}
+
+test "win-pwd: percent-encoded space and unicode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // "Rey Colón" percent-encoded the way the PowerShell integration
+    // script ([uri]::EscapeDataString) emits it. EscapeDataString also
+    // escapes the drive colon as %3A.
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://MYPC/C%3A/Users/Rey%20Col%C3%B3n/My%20Docs",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("C:\\Users\\Rey Colón\\My Docs", path);
+}
+
+test "win-pwd: trailing slash is stripped" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://MYPC/C:/Users/foo/",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("C:\\Users\\foo", path);
+}
+
+test "win-pwd: drive root keeps separator" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // With trailing slash.
+    {
+        const path = try windowsPathFromOsc7(alloc, "file://MYPC/C:/", "MYPC");
+        defer alloc.free(path);
+        try testing.expectEqualStrings("C:\\", path);
+    }
+
+    // Without trailing slash.
+    {
+        const path = try windowsPathFromOsc7(alloc, "file://MYPC/C:", "MYPC");
+        defer alloc.free(path);
+        try testing.expectEqualStrings("C:\\", path);
+    }
+}
+
+test "win-pwd: UNC path from non-local host" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://fileserver/share/sub%20dir",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("\\\\fileserver\\share\\sub dir", path);
+}
+
+test "win-pwd: UNC trailing slash is stripped" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file://fileserver/share/",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("\\\\fileserver\\share", path);
+}
+
+test "win-pwd: UNC requires a share component" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectError(
+        error.InvalidPath,
+        windowsPathFromOsc7(alloc, "file://fileserver", "MYPC"),
+    );
+    try testing.expectError(
+        error.InvalidPath,
+        windowsPathFromOsc7(alloc, "file://fileserver/", "MYPC"),
+    );
+}
+
+test "win-pwd: empty path rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectError(
+        error.InvalidPath,
+        windowsPathFromOsc7(alloc, "file://MYPC", "MYPC"),
+    );
+    try testing.expectError(
+        error.InvalidPath,
+        windowsPathFromOsc7(alloc, "file://MYPC/", "MYPC"),
+    );
+}
+
+test "win-pwd: local path without drive letter rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectError(
+        error.InvalidPath,
+        windowsPathFromOsc7(alloc, "file://MYPC/Users/foo", "MYPC"),
+    );
+}
+
+test "win-pwd: non-file scheme rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectError(
+        error.UnsupportedScheme,
+        windowsPathFromOsc7(alloc, "http://MYPC/C:/Users/foo", "MYPC"),
+    );
+    try testing.expectError(
+        error.UnsupportedScheme,
+        windowsPathFromOsc7(alloc, "ftp://MYPC/C:/Users/foo", "MYPC"),
+    );
+}
+
+test "win-pwd: missing authority treated as local" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // RFC 8089 minimal representation: file:/path (no authority).
+    const path = try windowsPathFromOsc7(
+        alloc,
+        "file:/C:/Users/foo",
+        "MYPC",
+    );
+    defer alloc.free(path);
+    try testing.expectEqualStrings("C:\\Users\\foo", path);
+}
+
+test "win-pwd: invalid uri rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectError(
+        error.InvalidUri,
+        windowsPathFromOsc7(alloc, "not a uri at all", "MYPC"),
+    );
+}
+
+test "win-pwd: powershell integration script emission" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // These mirror exactly what our PowerShell shell integration script
+    // (src/shell-integration/powershell/ghostty-shell-integration.ps1)
+    // emits from its prompt function: each path segment is passed
+    // through [uri]::EscapeDataString and joined with '/', prefixed
+    // with file://$env:COMPUTERNAME/ for local drive paths, or file:
+    // for UNC paths (//server/... becomes file://server/...).
+
+    // Local drive path with a space and a non-ASCII character.
+    {
+        const path = try windowsPathFromOsc7(
+            alloc,
+            "file://DESKTOP-AB12CD/C%3A/Users/Rey%20Col%C3%B3nValero/claude",
+            "DESKTOP-AB12CD",
+        );
+        defer alloc.free(path);
+        try testing.expectEqualStrings(
+            "C:\\Users\\Rey ColónValero\\claude",
+            path,
+        );
+    }
+
+    // UNC path: the script emits file://server/share/dir.
+    {
+        const path = try windowsPathFromOsc7(
+            alloc,
+            "file://nas/backups/2026%20Q2",
+            "DESKTOP-AB12CD",
+        );
+        defer alloc.free(path);
+        try testing.expectEqualStrings("\\\\nas\\backups\\2026 Q2", path);
+    }
+}
