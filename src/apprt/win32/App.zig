@@ -494,8 +494,12 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
-                        if (w32.GetForegroundWindow() != win_hwnd) {
+                    const rt_surface = core_surface.rt_surface;
+                    const parent_window = rt_surface.parent_window;
+                    var foreground = false;
+                    if (parent_window.hwnd) |win_hwnd| {
+                        foreground = w32.GetForegroundWindow() == win_hwnd;
+                        if (!foreground) {
                             var fwi: w32.FLASHWINFO = .{
                                 .cbSize = @sizeOf(w32.FLASHWINFO),
                                 .hwnd = win_hwnd,
@@ -505,6 +509,16 @@ pub fn performAction(
                             };
                             _ = w32.FlashWindowEx(&fwi);
                         }
+                    }
+                    // Mark the tab in the sidebar unless the bell rang
+                    // in the active tab of the foreground window, where
+                    // the user already sees it.
+                    const active = if (parent_window.findTabIndex(rt_surface)) |idx|
+                        idx == parent_window.active_tab
+                    else
+                        false;
+                    if (!active or !foreground) {
+                        parent_window.setTabStatusForSurface(rt_surface, .bell);
                     }
                 },
             }
@@ -809,10 +823,15 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
+                    const rt_surface = core_surface.rt_surface;
+                    // Mark the tab in the sidebar even when it's the
+                    // active tab; the user may be looking elsewhere
+                    // when the shell exits.
+                    rt_surface.parent_window.setTabStatusForSurface(rt_surface, .exited);
                     const exit_code = value.exit_code;
                     if (exit_code != 0) {
                         // Show a message box including the actual exit code.
-                        const hwnd_val = core_surface.rt_surface.parent_window.hwnd;
+                        const hwnd_val = rt_surface.parent_window.hwnd;
                         var utf8_buf: [128]u8 = undefined;
                         const msg_utf8 = std.fmt.bufPrint(
                             &utf8_buf,

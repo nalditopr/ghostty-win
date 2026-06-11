@@ -2264,6 +2264,26 @@ keybind: Keybinds = .{},
 /// Currently only supported on Linux (GTK).
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
+/// Whether to show a vertical session sidebar on the left side of the
+/// window (cmux-style). When enabled, the sidebar lists the tabs in the
+/// window and the top tab bar is hidden.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"window-show-sidebar": bool = false,
+
+/// The width of the session sidebar in pixels. This is the unscaled
+/// width; the actual width is scaled by the display's DPI. The value
+/// is clamped to the range 120 to 400.
+///
+/// This only takes effect if `window-show-sidebar` is enabled.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"window-sidebar-width": u32 = 220,
+
 /// Background color for the window titlebar. This only takes effect if
 /// window-theme is set to ghostty. Currently only supported in the GTK app
 /// runtime.

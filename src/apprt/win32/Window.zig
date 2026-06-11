@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 
 const App = @import("App.zig");
+const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
@@ -16,6 +17,9 @@ const log = std.log.scoped(.win32);
 
 /// Maximum number of tabs per window.
 const MAX_TABS: usize = 64;
+
+/// Per-tab status indicator shown in the session sidebar.
+pub const TabStatus = enum { normal, bell, exited };
 
 /// The parent App.
 app: *App,
@@ -74,6 +78,12 @@ tab_titles: [64][256]u16 = undefined,
 
 /// Length of each tab title in UTF-16 code units.
 tab_title_lens: [64]u16 = undefined,
+
+/// Per-tab sidebar status. Cleared to .normal when the tab is selected.
+tab_status: [MAX_TABS]TabStatus = [_]TabStatus{.normal} ** MAX_TABS,
+
+/// Current sidebar hover target.
+sidebar_hover: Sidebar.HitTarget = .none,
 
 /// Whether the window is currently in fullscreen mode.
 is_fullscreen: bool = false,
@@ -151,6 +161,11 @@ pub fn onConfigChange(self: *Window) void {
     if (self.hwnd) |hwnd| {
         applyChromeTheme(hwnd, self.app.config.background);
     }
+    // window-show-sidebar / window-sidebar-width may have changed:
+    // recompute chrome layout and repaint.
+    self.updateTabBarVisibility();
+    self.handleResize();
+    self.invalidateSidebar();
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -290,8 +305,19 @@ pub fn tabBarHeight(self: *const Window) i32 {
     return @intFromFloat(@round(32.0 * self.scale));
 }
 
+/// Returns the sidebar width in pixels, accounting for DPI scale.
+/// Returns 0 when the sidebar is disabled, for quick terminals, or
+/// once the window is closing.
+pub fn sidebarWidth(self: *const Window) i32 {
+    if (self.closing or self.is_quick_terminal) return 0;
+    if (!self.app.config.@"window-show-sidebar") return 0;
+    const width = std.math.clamp(self.app.config.@"window-sidebar-width", 120, 400);
+    return @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
+}
+
 /// Returns the client rect available for the active surface, which is
-/// the full client area minus the tab bar height from the top.
+/// the full client area minus the tab bar height from the top and the
+/// sidebar width from the left.
 pub fn surfaceRect(self: *const Window) w32.RECT {
     const hwnd = self.hwnd orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     var rect: w32.RECT = undefined;
@@ -299,6 +325,7 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
         return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     }
     rect.top += self.tabBarHeight();
+    rect.left += self.sidebarWidth();
     return rect;
 }
 
@@ -364,9 +391,11 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_active_surface[i] = self.tab_active_surface[i - 1];
         self.tab_titles[i] = self.tab_titles[i - 1];
         self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+        self.tab_status[i] = self.tab_status[i - 1];
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
+    self.tab_status[pos] = .normal;
     self.tab_count += 1;
 
     // Set default title.
@@ -393,6 +422,7 @@ pub fn addTab(self: *Window) !*Surface {
         self.selectTabIndex(pos);
     }
     self.updateTabBarVisibility();
+    self.invalidateSidebar();
     return surface;
 }
 
@@ -416,6 +446,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_active_surface[i] = self.tab_active_surface[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
         self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+        self.tab_status[i] = self.tab_status[i + 1];
     }
     self.tab_count -= 1;
     if (self.tab_count == 0) {
@@ -531,10 +562,12 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
         }
     }
     self.active_tab = idx;
+    self.tab_status[idx] = .normal;
     const surface = self.tab_active_surface[idx];
     self.layoutSplits();
     if (surface.hwnd) |h| _ = w32.SetFocus(h);
     self.updateWindowTitle();
+    self.invalidateSidebar();
 }
 
 /// Layout split panes for the active tab.
@@ -914,8 +947,10 @@ pub fn moveTab(self: *Window, amount: isize) void {
     std.mem.swap(*Surface, &self.tab_active_surface[self.active_tab], &self.tab_active_surface[new_index]);
     std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
     std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
+    std.mem.swap(TabStatus, &self.tab_status[self.active_tab], &self.tab_status[new_index]);
     self.active_tab = new_index;
     self.invalidateTabBar();
+    self.invalidateSidebar();
 }
 
 /// Update the top-level window title to match the active tab's title.
@@ -940,6 +975,16 @@ pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) 
     self.tab_title_lens[tab_idx] = len;
     if (tab_idx == self.active_tab) self.updateWindowTitle();
     self.invalidateTabBar();
+    self.invalidateSidebar();
+}
+
+/// Set the sidebar status indicator for the tab containing a surface.
+/// No-op if the surface is not in any tab of this window.
+pub fn setTabStatusForSurface(self: *Window, surface: *Surface, status: TabStatus) void {
+    const idx = self.findTabIndex(surface) orelse return;
+    if (self.tab_status[idx] == status) return;
+    self.tab_status[idx] = status;
+    self.invalidateSidebar();
 }
 
 /// Update tab bar visibility based on config and tab count.
@@ -949,7 +994,8 @@ fn updateTabBarVisibility(self: *Window) void {
         return;
     }
     const show_config = self.app.config.@"window-show-tab-bar";
-    const should_show = switch (show_config) {
+    // The sidebar replaces the tab bar entirely when enabled.
+    const should_show = if (self.sidebarWidth() > 0) false else switch (show_config) {
         .always => true,
         .auto => self.tab_count > 1,
         .never => false,
@@ -972,16 +1018,37 @@ pub fn invalidateTabBar(self: *Window) void {
     _ = w32.InvalidateRect(hwnd, &rect, 0);
 }
 
-/// Paint the tab bar using double-buffered GDI painting.
-/// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
-fn paintTabBar(self: *Window) void {
+/// Invalidate the sidebar region so it gets repainted.
+pub fn invalidateSidebar(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var rect = w32.RECT{
+        .left = 0,
+        .top = 0,
+        .right = self.sidebarWidth(),
+        .bottom = 32767,
+    };
+    _ = w32.InvalidateRect(hwnd, &rect, 0);
+}
+
+/// Handle WM_PAINT: paint the window chrome (tab bar and sidebar)
+/// with a single BeginPaint/EndPaint pair.
+fn paintChrome(self: *Window) void {
     const hwnd = self.hwnd orelse return;
 
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
-    // If the tab bar is not visible, just validate the region and return.
+    self.paintTabBar(hdc_screen);
+    if (self.sidebarWidth() > 0) Sidebar.paint(self, hdc_screen);
+}
+
+/// Paint the tab bar using double-buffered GDI painting.
+/// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
+fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
+    const hwnd = self.hwnd orelse return;
+
+    // If the tab bar is not visible, there is nothing to paint.
     if (!self.tab_bar_visible) return;
 
     const bar_h = self.tabBarHeight();
@@ -1257,10 +1324,12 @@ pub fn toggleWindowDecorations(self: *Window) void {
         w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED | w32.SWP_NOMOVE | w32.SWP_NOSIZE);
 }
 
-/// Handle WM_SIZE: re-layout the active tab's split panes and repaint tab bar.
+/// Handle WM_SIZE: re-layout the active tab's split panes and repaint
+/// the tab bar and sidebar.
 fn handleResize(self: *Window) void {
     self.layoutSplits();
     self.invalidateTabBar();
+    self.invalidateSidebar();
 }
 
 /// Handle a left-button click in the tab bar region.
@@ -1316,6 +1385,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_surface = self.tab_active_surface[from];
     const saved_title = self.tab_titles[from];
     const saved_title_len = self.tab_title_lens[from];
+    const saved_status = self.tab_status[from];
 
     if (from < to) {
         // Shift left: move [from+1..to+1] to [from..to]
@@ -1325,6 +1395,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i + 1];
             self.tab_titles[i] = self.tab_titles[i + 1];
             self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+            self.tab_status[i] = self.tab_status[i + 1];
         }
     } else {
         // Shift right: move [to..from] to [to+1..from+1]
@@ -1334,6 +1405,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i - 1];
             self.tab_titles[i] = self.tab_titles[i - 1];
             self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+            self.tab_status[i] = self.tab_status[i - 1];
         }
     }
 
@@ -1342,9 +1414,11 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_active_surface[to] = saved_surface;
     self.tab_titles[to] = saved_title;
     self.tab_title_lens[to] = saved_title_len;
+    self.tab_status[to] = saved_status;
 
     self.active_tab = to;
     self.invalidateTabBar();
+    self.invalidateSidebar();
 }
 
 /// Handle mouse movement over the tab bar for hover effects.
@@ -1418,7 +1492,13 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
         }
     }
 
-    // If clicked on empty area (not a tab), only show "New Tab".
+    self.showTabContextMenu(clicked_tab, x, y);
+}
+
+/// Show the tab context menu at client coordinates (x, y). Shared by
+/// the tab bar and the sidebar. If clicked_tab is null (empty area),
+/// only "New Tab" is shown.
+fn showTabContextMenu(self: *Window, clicked_tab: ?usize, x: i32, y: i32) void {
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
 
@@ -1431,7 +1511,7 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
     _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("New Tab"));
 
     // Convert client coords to screen coords for the popup.
-    var pt = w32.POINT{ .x = @intCast(x), .y = @intCast(y) };
+    var pt = w32.POINT{ .x = x, .y = y };
     if (self.hwnd) |h| _ = w32.ClientToScreen(h, &pt);
 
     const cmd = w32.TrackPopupMenuEx(
@@ -1486,6 +1566,65 @@ fn handleTabBarMouseLeave(self: *Window) void {
         self.hover_close = false;
         self.hover_new_tab = false;
         self.invalidateTabBar();
+    }
+}
+
+/// Handle a left-button click in the sidebar region.
+/// Selects the clicked session row or creates a new tab.
+fn handleSidebarClick(self: *Window, y: i32) void {
+    if (self.closing) return;
+    switch (Sidebar.hitTest(y, Sidebar.itemHeight(self.scale), self.tab_count)) {
+        .none => {},
+        .item => |i| self.selectTabIndex(i),
+        .new_session => {
+            _ = self.addTab() catch |err| {
+                log.err("failed to create new tab: {}", .{err});
+                return;
+            };
+        },
+    }
+}
+
+/// Handle a right-button click in the sidebar region: show the same
+/// tab context menu as the tab bar for the clicked session row.
+fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
+    if (self.closing) return;
+    const clicked_tab: ?usize = switch (Sidebar.hitTest(y, Sidebar.itemHeight(self.scale), self.tab_count)) {
+        .item => |i| i,
+        else => null,
+    };
+    self.showTabContextMenu(clicked_tab, x, y);
+}
+
+/// Handle mouse movement over the sidebar for hover effects.
+/// Registers TrackMouseEvent on first move so we get WM_MOUSELEAVE.
+fn handleSidebarMouseMove(self: *Window, y: i32) void {
+    if (self.closing) return;
+
+    // Register for WM_MOUSELEAVE if not already tracking.
+    if (!self.tracking_mouse) {
+        var tme = w32.TRACKMOUSEEVENT{
+            .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+            .dwFlags = w32.TME_LEAVE,
+            .hwndTrack = self.hwnd.?,
+            .dwHoverTime = 0,
+        };
+        _ = w32.TrackMouseEvent(&tme);
+        self.tracking_mouse = true;
+    }
+
+    const new_hover = Sidebar.hitTest(y, Sidebar.itemHeight(self.scale), self.tab_count);
+    if (!std.meta.eql(new_hover, self.sidebar_hover)) {
+        self.sidebar_hover = new_hover;
+        self.invalidateSidebar();
+    }
+}
+
+/// Reset sidebar hover state when the mouse leaves the sidebar.
+fn clearSidebarHover(self: *Window) void {
+    if (self.sidebar_hover != .none) {
+        self.sidebar_hover = .none;
+        self.invalidateSidebar();
     }
 }
 
@@ -1581,6 +1720,7 @@ pub fn finishTabRename(self: *Window) void {
     _ = w32.DestroyWindow(edit);
     if (self.rename_font) |f| { _ = w32.DeleteObject(f); self.rename_font = null; }
     self.invalidateTabBar();
+    self.invalidateSidebar();
 
     // Return focus to the active surface
     if (self.getActiveSurface()) |s| {
@@ -1781,7 +1921,7 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_PAINT => {
-            window.paintTabBar();
+            window.paintChrome();
             return 0;
         },
         w32.WM_COMMAND => {
@@ -1810,6 +1950,10 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            if (x < window.sidebarWidth()) {
+                window.handleSidebarClick(y);
+                return 0;
+            }
             if (window.hitTestDivider(x, y)) |hit| {
                 window.startDividerDrag(hit.handle, hit.layout);
                 return 0;
@@ -1856,6 +2000,10 @@ pub fn windowWndProc(
         w32.WM_RBUTTONUP => {
             const x: i16 = @truncate(lparam & 0xFFFF);
             const y: i16 = @truncate((lparam >> 16) & 0xFFFF);
+            if (x < window.sidebarWidth()) {
+                window.handleSidebarRightClick(x, y);
+                return 0;
+            }
             if (y < window.tabBarHeight()) {
                 window.handleTabBarRightClick(x, y);
                 return 0;
@@ -1900,6 +2048,11 @@ pub fn windowWndProc(
                 }
                 return 0;
             }
+            if (x < window.sidebarWidth()) {
+                window.handleSidebarMouseMove(y);
+                return 0;
+            }
+            window.clearSidebarHover();
             if (y < window.tabBarHeight()) {
                 window.handleTabBarMouseMove(@truncate(x), @truncate(y));
             }
@@ -1921,6 +2074,7 @@ pub fn windowWndProc(
         },
         w32.WM_MOUSELEAVE => {
             window.handleTabBarMouseLeave();
+            window.clearSidebarHover();
             return 0;
         },
         w32.WM_ACTIVATE => {
