@@ -46,6 +46,12 @@ app: *App,
 /// The Window containing this pane's tab.
 parent_window: *Window,
 
+/// Stable id handed out over the agent IPC (`ghostty +browser`) so
+/// later navigate/eval commands can target this exact pane. Assigned
+/// from App.next_browser_id in create(); 0 only in the impossible
+/// window before create() finishes initializing the struct.
+ipc_id: u32 = 0,
+
 /// The Pane wrapping this browser in its tab's SplitTree. Set by
 /// Pane.createBrowser immediately after create(); valid until the
 /// pane unrefs to zero (which destroys us). Null in the window
@@ -95,7 +101,9 @@ pub fn create(alloc: Allocator, app: *App, parent: *Window) !*BrowserPane {
     self.* = .{
         .app = app,
         .parent_window = parent,
+        .ipc_id = app.next_browser_id,
     };
+    app.next_browser_id += 1;
 
     const blank = L("about:blank");
     @memcpy(self.pending_url[0..blank.len], blank);
@@ -428,6 +436,456 @@ pub fn navigateFromAddressBar(self: *BrowserPane) void {
     // Not ready yet: replace the pending URL.
     const n = @min(url_len, URL_MAX);
     @memcpy(self.pending_url[0..n], url_buf[0..n]);
+    self.pending_url_len = n;
+}
+
+/// Heap context carried through one async ExecuteScript so its
+/// completion can answer the originating IPC request. WebView2 delivers
+/// the completion on this same UI thread, so no locking is needed; the
+/// struct is freed in the completion (the one and only callback).
+const IpcEval = struct {
+    app: *App,
+    ipc_id: u64,
+};
+
+const IpcEvalHandler = wv2.ExecuteScriptCompletedHandler(IpcEval);
+
+/// Run `js` for an agent IPC `eval` request and answer that request
+/// (id `ipc_id`) when the async result arrives. The webview's
+/// ExecuteScript result is already JSON, so it's forwarded verbatim as
+/// the response `data`. Errors (no webview, OOM, ExecuteScript refusal)
+/// are answered synchronously here. `js_w` must be NUL-terminated.
+pub fn evalForIpc(self: *BrowserPane, ipc_id: u64, js_w: [*:0]const u16) void {
+    const server = self.app.ipc_server orelse return;
+    const alloc = self.app.core_app.alloc;
+
+    if (self.state != .ready or self.webview == null) {
+        server.sendError(ipc_id, "browser pane is not ready") catch {};
+        return;
+    }
+    const webview = self.webview.?;
+
+    const ctx = alloc.create(IpcEval) catch {
+        server.sendError(ipc_id, "out of memory") catch {};
+        return;
+    };
+    ctx.* = .{ .app = self.app, .ipc_id = ipc_id };
+
+    const handler = IpcEvalHandler.create(alloc, ctx, onIpcEvalCompleted) catch {
+        alloc.destroy(ctx);
+        server.sendError(ipc_id, "out of memory") catch {};
+        return;
+    };
+    defer handler.unref();
+
+    webview.executeScript(js_w, handler) catch {
+        alloc.destroy(ctx);
+        server.sendError(ipc_id, "ExecuteScript failed") catch {};
+    };
+}
+
+fn onIpcEvalCompleted(ctx: *IpcEval, error_code: wv2.HRESULT, result: ?wv2.LPCWSTR) void {
+    const app = ctx.app;
+    const ipc_id = ctx.ipc_id;
+    const alloc = app.core_app.alloc;
+    defer alloc.destroy(ctx);
+
+    // The server may already be torn down (app quitting) — drop silently.
+    const server = app.ipc_server orelse return;
+
+    if (error_code != wv2.S_OK or result == null) {
+        server.sendError(ipc_id, "script evaluation failed") catch {};
+        return;
+    }
+
+    // result is already JSON (the script's return value JSON-encoded).
+    // Convert UTF-16 → UTF-8 and forward it as the response data.
+    const span = std.mem.span(result.?);
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, span) catch {
+        server.sendError(ipc_id, "out of memory") catch {};
+        return;
+    };
+    defer alloc.free(utf8);
+    server.sendOk(ipc_id, utf8) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// Agent IPC: Chrome DevTools Protocol verbs (snapshot / click / fill)
+// ---------------------------------------------------------------------------
+//
+// Each verb chains several CallDevToolsProtocolMethod calls. WebView2
+// delivers every completion on this UI thread, so the chain is a simple
+// state machine driven from a single completion handler: each step
+// issues the next CDP call carrying the same heap context, and the last
+// step answers the IPC request and frees the context. Errors at any step
+// answer the request (sendError) and free.
+
+/// One in-flight CDP verb. Allocated by startCdp, freed exactly once in
+/// finishOk/finishErr. The webview pointer is captured up front; if the
+/// pane is torn down mid-flight the app's ipc_server goes null first
+/// (App stops IPC before destroying panes), so completions drop quietly.
+const IpcCdp = struct {
+    app: *App,
+    ipc_id: u64,
+    webview: *wv2.ICoreWebView2,
+    verb: enum { snapshot, click, fill },
+    step: u8 = 0,
+    /// backendNodeId target for click/fill. Unused by snapshot.
+    ref: i64 = 0,
+    /// Owned UTF-8 text for fill (escaped into the CDP params later).
+    text: ?[]u8 = null,
+    /// Computed click point (DOM.getBoxModel center), px in CSS coords.
+    click_x: f64 = 0,
+    click_y: f64 = 0,
+};
+
+const IpcCdpHandler = wv2.CallDevToolsProtocolMethodCompletedHandler(IpcCdp);
+
+/// Begin a `snapshot` verb: Accessibility.enable, then getFullAXTree,
+/// then transform the tree into a compact [{ref,role,name}] array.
+pub fn snapshotForIpc(self: *BrowserPane, ipc_id: u64) void {
+    const ctx = self.startCdp(ipc_id, .snapshot) orelse return;
+    cdpCallCtx(ctx, "Accessibility.enable", "{}");
+}
+
+/// Begin a `click` verb on backend node `ref`: scrollIntoViewIfNeeded,
+/// getBoxModel (→ center), then a mousePressed/mouseReleased pair.
+pub fn clickForIpc(self: *BrowserPane, ipc_id: u64, ref: i64) void {
+    const ctx = self.startCdp(ipc_id, .click) orelse return;
+    ctx.ref = ref;
+    var buf: [128]u8 = undefined;
+    const params = std.fmt.bufPrint(
+        &buf,
+        "{{\"backendNodeId\":{d}}}",
+        .{ref},
+    ) catch {
+        finishErrStatic(ctx, "ref out of range");
+        return;
+    };
+    cdpCallCtx(ctx, "DOM.scrollIntoViewIfNeeded", params);
+}
+
+/// Begin a `fill` verb on backend node `ref`: DOM.focus then
+/// Input.insertText. `text` is copied; the caller keeps ownership of its
+/// slice.
+pub fn fillForIpc(self: *BrowserPane, ipc_id: u64, ref: i64, text: []const u8) void {
+    const ctx = self.startCdp(ipc_id, .fill) orelse return;
+    ctx.ref = ref;
+    const alloc = self.app.core_app.alloc;
+    ctx.text = alloc.dupe(u8, text) catch {
+        finishErrStatic(ctx, "out of memory");
+        return;
+    };
+    var buf: [128]u8 = undefined;
+    const params = std.fmt.bufPrint(
+        &buf,
+        "{{\"backendNodeId\":{d}}}",
+        .{ref},
+    ) catch {
+        finishErrStatic(ctx, "ref out of range");
+        return;
+    };
+    cdpCallCtx(ctx, "DOM.focus", params);
+}
+
+/// Allocate and initialize a verb context, or answer the request with an
+/// error (and return null) when the pane is not ready or OOM.
+fn startCdp(self: *BrowserPane, ipc_id: u64, verb: anytype) ?*IpcCdp {
+    const server = self.app.ipc_server orelse return null;
+    const alloc = self.app.core_app.alloc;
+    if (self.state != .ready or self.webview == null) {
+        server.sendError(ipc_id, "browser pane is not ready") catch {};
+        return null;
+    }
+    const ctx = alloc.create(IpcCdp) catch {
+        server.sendError(ipc_id, "out of memory") catch {};
+        return null;
+    };
+    ctx.* = .{
+        .app = self.app,
+        .ipc_id = ipc_id,
+        .webview = self.webview.?,
+        .verb = verb,
+    };
+    return ctx;
+}
+
+/// CDP completion: advance the verb's state machine. `result` is the CDP
+/// method's returnObject as JSON (UTF-16) on success, null on error.
+fn onCdpCompleted(ctx: *IpcCdp, error_code: wv2.HRESULT, result: ?wv2.LPCWSTR) void {
+    // The pane may have been torn down; App nulls ipc_server before that,
+    // so finishOk/finishErr no-op on the send but still free the context.
+    if (error_code != wv2.S_OK) {
+        finishErrStatic(ctx, "CDP step failed");
+        return;
+    }
+    const alloc = ctx.app.core_app.alloc;
+
+    switch (ctx.verb) {
+        .snapshot => switch (ctx.step) {
+            // 0: Accessibility.enable done → request the full AX tree.
+            0 => {
+                ctx.step = 1;
+                cdpCallCtx(ctx, "Accessibility.getFullAXTree", "{}");
+            },
+            // 1: getFullAXTree returned → transform and answer.
+            else => {
+                const json16 = result orelse {
+                    finishErrStatic(ctx, "empty AX tree");
+                    return;
+                };
+                const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(json16)) catch {
+                    finishErrStatic(ctx, "out of memory");
+                    return;
+                };
+                defer alloc.free(utf8);
+                const compact = transformAxTree(alloc, utf8) catch {
+                    finishErrStatic(ctx, "failed to parse AX tree");
+                    return;
+                };
+                defer alloc.free(compact);
+                finishOk(ctx, compact);
+            },
+        },
+
+        .click => switch (ctx.step) {
+            // 0: scrollIntoViewIfNeeded done → get the box model.
+            0 => {
+                ctx.step = 1;
+                var buf: [128]u8 = undefined;
+                const params = std.fmt.bufPrint(
+                    &buf,
+                    "{{\"backendNodeId\":{d}}}",
+                    .{ctx.ref},
+                ) catch {
+                    finishErrStatic(ctx, "ref out of range");
+                    return;
+                };
+                cdpCallCtx(ctx, "DOM.getBoxModel", params);
+            },
+            // 1: box model returned → compute center, dispatch mousePressed.
+            1 => {
+                const json16 = result orelse {
+                    finishErrStatic(ctx, "no box model");
+                    return;
+                };
+                computeBoxCenter(ctx, alloc, std.mem.span(json16)) catch {
+                    finishErrStatic(ctx, "element has no box (not visible?)");
+                    return;
+                };
+                ctx.step = 2;
+                var buf: [256]u8 = undefined;
+                const params = mouseEventParams(&buf, "mousePressed", ctx.click_x, ctx.click_y) catch {
+                    finishErrStatic(ctx, "format error");
+                    return;
+                };
+                cdpCallCtx(ctx, "Input.dispatchMouseEvent", params);
+            },
+            // 2: mousePressed done → mouseReleased.
+            2 => {
+                ctx.step = 3;
+                var buf: [256]u8 = undefined;
+                const params = mouseEventParams(&buf, "mouseReleased", ctx.click_x, ctx.click_y) catch {
+                    finishErrStatic(ctx, "format error");
+                    return;
+                };
+                cdpCallCtx(ctx, "Input.dispatchMouseEvent", params);
+            },
+            // 3: mouseReleased done → answer ok.
+            else => finishOk(ctx, "\"ok\""),
+        },
+
+        .fill => switch (ctx.step) {
+            // 0: DOM.focus done → insert the text.
+            0 => {
+                ctx.step = 1;
+                const text = ctx.text orelse "";
+                // Build {"text":<json-escaped>} with std.json escaping.
+                const params = std.fmt.allocPrint(
+                    alloc,
+                    "{{\"text\":{f}}}",
+                    .{std.json.fmt(text, .{})},
+                ) catch {
+                    finishErrStatic(ctx, "out of memory");
+                    return;
+                };
+                defer alloc.free(params);
+                cdpCallCtx(ctx, "Input.insertText", params);
+            },
+            // 1: insertText done → answer ok.
+            else => finishOk(ctx, "\"ok\""),
+        },
+    }
+}
+
+/// Issue the next CDP call in a chain, from a completion (no BrowserPane
+/// in hand). Mirrors cdpCall but reads alloc/webview off ctx.
+fn cdpCallCtx(ctx: *IpcCdp, method: []const u8, params_json: []const u8) void {
+    const alloc = ctx.app.core_app.alloc;
+    const method_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, method) catch {
+        finishErrStatic(ctx, "out of memory");
+        return;
+    };
+    defer alloc.free(method_w);
+    const params_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, params_json) catch {
+        finishErrStatic(ctx, "out of memory");
+        return;
+    };
+    defer alloc.free(params_w);
+
+    const handler = IpcCdpHandler.create(alloc, ctx, onCdpCompleted) catch {
+        finishErrStatic(ctx, "out of memory");
+        return;
+    };
+    defer handler.unref();
+
+    ctx.webview.callDevToolsProtocolMethod(method_w, params_w, handler) catch {
+        finishErrStatic(ctx, "CDP call failed");
+    };
+}
+
+/// Format Input.dispatchMouseEvent params for a left-button single click.
+fn mouseEventParams(buf: []u8, kind: []const u8, x: f64, y: f64) ![]u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"type\":\"{s}\",\"x\":{d:.2},\"y\":{d:.2},\"button\":\"left\",\"buttons\":1,\"clickCount\":1}}",
+        .{ kind, x, y },
+    );
+}
+
+/// Parse DOM.getBoxModel's returnObject and store the content-quad center
+/// on ctx. The quad is [x1,y1,x2,y2,x3,y3,x4,y4]; the center is the mean
+/// of the first and third corner (opposite corners of the rectangle).
+fn computeBoxCenter(ctx: *IpcCdp, alloc: Allocator, json16: []const u16) !void {
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(alloc, json16);
+    defer alloc.free(utf8);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, utf8, .{});
+    defer parsed.deinit();
+    const model = parsed.value.object.get("model") orelse return error.NoModel;
+    const content = model.object.get("content") orelse return error.NoContent;
+    const quad = content.array;
+    if (quad.items.len < 8) return error.BadQuad;
+    const x1 = try jsonNumber(quad.items[0]);
+    const y1 = try jsonNumber(quad.items[1]);
+    const x3 = try jsonNumber(quad.items[4]);
+    const y3 = try jsonNumber(quad.items[5]);
+    ctx.click_x = (x1 + x3) / 2.0;
+    ctx.click_y = (y1 + y3) / 2.0;
+}
+
+fn jsonNumber(v: std.json.Value) !f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => error.NotANumber,
+    };
+}
+
+/// Transform Accessibility.getFullAXTree's returnObject into a compact
+/// JSON array of {ref, role, name} for nodes that carry a backendDOMNodeId
+/// and a non-ignored role. `ref` is the backendDOMNodeId an agent feeds to
+/// click/fill. Caller owns the returned slice.
+fn transformAxTree(alloc: Allocator, tree_json: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, tree_json, .{});
+    defer parsed.deinit();
+
+    const nodes = (parsed.value.object.get("nodes") orelse return error.NoNodes).array;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var w = out.writer(alloc);
+    try w.writeByte('[');
+    var first = true;
+
+    for (nodes.items) |node| {
+        const obj = switch (node) {
+            .object => |o| o,
+            else => continue,
+        };
+        // Skip nodes the platform marks ignored (not useful to an agent).
+        if (obj.get("ignored")) |ig| {
+            if (ig == .bool and ig.bool) continue;
+        }
+        const backend = obj.get("backendDOMNodeId") orelse continue;
+        const ref: i64 = switch (backend) {
+            .integer => |i| i,
+            else => continue,
+        };
+        const role = axValueString(obj.get("role"));
+        const name = axValueString(obj.get("name"));
+        // Drop generic structural nodes with no name to keep the list
+        // focused on interactive/labeled elements.
+        if (name.len == 0 and (role.len == 0 or
+            std.mem.eql(u8, role, "generic") or
+            std.mem.eql(u8, role, "none") or
+            std.mem.eql(u8, role, "InlineTextBox") or
+            std.mem.eql(u8, role, "StaticText"))) continue;
+
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.print(
+            "{{\"ref\":{d},\"role\":{f},\"name\":{f}}}",
+            .{ ref, std.json.fmt(role, .{}), std.json.fmt(name, .{}) },
+        );
+    }
+    try w.writeByte(']');
+    return out.toOwnedSlice(alloc);
+}
+
+/// An AX node property is `{"type":..,"value":<string>}`. Pull the inner
+/// string value, or "" when absent/non-string.
+fn axValueString(v: ?std.json.Value) []const u8 {
+    const obj = switch (v orelse return "") {
+        .object => |o| o,
+        else => return "",
+    };
+    const inner = obj.get("value") orelse return "";
+    return switch (inner) {
+        .string => |s| s,
+        else => "",
+    };
+}
+
+/// Terminal step: answer ok with `data_json` (already valid JSON) and
+/// free the context.
+fn finishOk(ctx: *IpcCdp, data_json: []const u8) void {
+    if (ctx.app.ipc_server) |server| {
+        server.sendOk(ctx.ipc_id, data_json) catch {};
+    }
+    freeCdp(ctx);
+}
+
+/// Terminal error step from a completion: answer error and free.
+fn finishErrStatic(ctx: *IpcCdp, msg: []const u8) void {
+    if (ctx.app.ipc_server) |server| {
+        server.sendError(ctx.ipc_id, msg) catch {};
+    }
+    freeCdp(ctx);
+}
+
+fn freeCdp(ctx: *IpcCdp) void {
+    const alloc = ctx.app.core_app.alloc;
+    if (ctx.text) |t| alloc.free(t);
+    alloc.destroy(ctx);
+}
+
+/// Navigate to `url_w` (NUL-terminated UTF-16). If the webview is ready
+/// it navigates immediately; otherwise the URL is stashed and applied
+/// when creation completes (navigatePending). Returns an error only if
+/// the live webview rejects the Navigate call. Used by the agent IPC
+/// `navigate`/`open` commands (the address-bar path is
+/// navigateFromAddressBar).
+pub fn navigateUrl(self: *BrowserPane, url_w: [*:0]const u16) !void {
+    if (self.state == .ready) {
+        if (self.webview) |webview| {
+            try webview.navigate(url_w);
+            return;
+        }
+    }
+    // Not ready yet: stash as the pending URL, capped to the buffer.
+    const span = std.mem.span(url_w);
+    const n = @min(span.len, URL_MAX);
+    @memcpy(self.pending_url[0..n], span[0..n]);
     self.pending_url_len = n;
 }
 

@@ -12,6 +12,7 @@ const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
 const BrowserPane = @import("BrowserPane.zig");
+const ipc = @import("ipc.zig");
 const Pane = @import("Pane.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
@@ -31,6 +32,12 @@ pub const must_draw_from_app_thread = false;
 /// Custom window message used to wake up the message loop so that
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
+
+/// Posted by the IPC server's pipe thread (callback ipcCallback) to hand
+/// a parsed *ipc.Request to the GUI thread, which owns all HWND/WebView2
+/// access. lparam carries the request pointer. WM_APP+2/+3 are the
+/// update/tray callbacks (see below); this is the next free slot.
+const WM_APP_IPC_REQUEST: u32 = w32.WM_APP + 4;
 
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
@@ -121,6 +128,19 @@ webview2_pending: std.ArrayList(*BrowserPane) = .empty,
 /// must be balanced by CoUninitialize in terminate(); a failure (e.g.
 /// RPC_E_CHANGED_MODE) must NOT be.
 com_initialized: bool = false,
+
+/// Named-pipe IPC server for agent control (`ghostty +browser ...`).
+/// Started after msg_hwnd exists; its pipe thread parses requests and
+/// PostMessageW's each *ipc.Request to msg_hwnd (WM_APP_IPC_REQUEST),
+/// so all browser driving happens on this UI thread. Stopped before
+/// msg_hwnd is destroyed in terminate(). Null if startup failed (e.g.
+/// a stale pipe of the same name): IPC is then simply unavailable.
+ipc_server: ?*ipc.Server = null,
+
+/// Monotonic source of stable browser-pane ids handed back over IPC so
+/// later navigate/eval commands can target a specific pane. Assigned in
+/// BrowserPane.create; never reused within a process run.
+next_browser_id: u32 = 1,
 
 pub fn init(
     self: *App,
@@ -283,6 +303,11 @@ pub fn init(
 
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
+    // Start the agent IPC server now that msg_hwnd exists (the pipe
+    // thread posts requests to it). A failure here only disables the
+    // `ghostty +browser` CLI, so log and continue.
+    self.startIpcServer();
 
     // Register global hotkey for quick terminal (if configured).
     self.registerGlobalHotkey();
@@ -458,6 +483,18 @@ pub fn terminate(self: *App) void {
     if (self.quick_terminal) |qt| {
         qt.deinit();
         self.quick_terminal = null;
+    }
+
+    // Stop the IPC server BEFORE destroying msg_hwnd: the pipe thread's
+    // callback PostMessageW's to msg_hwnd, and stop() joins that thread,
+    // so no request can be posted to a dead window afterward. Any
+    // request already queued is drained by the loop exiting; if one is
+    // mid-flight in msgWndProc it completes before terminate() proceeds
+    // (single-threaded UI). sendOk/sendError after stop() is impossible
+    // because the GUI thread is here, not in msgWndProc.
+    if (self.ipc_server) |server| {
+        server.stop();
+        self.ipc_server = null;
     }
 
     if (self.msg_hwnd) |hwnd| {
@@ -2076,6 +2113,246 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Agent IPC (`ghostty +browser ...`)
+// ---------------------------------------------------------------------------
+
+/// Start the named-pipe IPC server on pipe ghostty-browser-<pid>. The
+/// pipe thread parses requests and posts each to msg_hwnd; this UI
+/// thread drives the browser in msgWndProc. Failure (e.g. a stale pipe)
+/// leaves ipc_server null — the CLI is then unavailable but the app runs.
+fn startIpcServer(self: *App) void {
+    const alloc = self.core_app.alloc;
+    var name_buf: [64]u8 = undefined;
+    const name = ipc.defaultPipeName(&name_buf) catch return;
+    self.ipc_server = ipc.Server.start(alloc, name, ipcCallback, self) catch |err| {
+        log.warn("failed to start browser IPC server: {}", .{err});
+        return;
+    };
+}
+
+/// Pipe-thread callback: hand the parsed request to the UI thread. On a
+/// PostMessageW failure (msg_hwnd gone, queue full) the request would
+/// otherwise leak, so destroy it here. ctx is the *App.
+fn ipcCallback(ctx: ?*anyopaque, req: *ipc.Request) void {
+    const self: *App = @ptrCast(@alignCast(ctx.?));
+    const hwnd = self.msg_hwnd orelse {
+        req.destroy();
+        return;
+    };
+    if (w32.PostMessageW(hwnd, WM_APP_IPC_REQUEST, 0, @bitCast(@intFromPtr(req))) == 0) {
+        req.destroy();
+    }
+}
+
+/// Handle one IPC request on the UI thread (from WM_APP_IPC_REQUEST).
+/// Drives the browser and answers via the server, then destroys the
+/// request. `eval` answers asynchronously (the ExecuteScript completion
+/// replies), so it must NOT also answer here.
+fn handleIpcRequest(self: *App, req: *ipc.Request) void {
+    defer req.destroy();
+    const server = self.ipc_server orelse return;
+
+    switch (req.cmd) {
+        .open => self.ipcOpen(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .navigate => self.ipcNavigate(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .eval => self.ipcEval(req) catch |err| {
+            // ipcEval only returns before dispatching the async script;
+            // once dispatched the completion owns the reply.
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        // snapshot/click/fill all answer asynchronously via the CDP
+        // completion chain (BrowserPane); these handlers only reply here
+        // on a synchronous setup error.
+        .snapshot => self.ipcSnapshot(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .click => self.ipcClick(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .fill => self.ipcFill(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+    }
+}
+
+/// Request-level failures surfaced to the client as the error response
+/// message (via @errorName). Window/pane operations can also fail with
+/// allocation/Win32/SplitTree errors, so the ipc* handlers return
+/// anyerror and the dispatcher names whatever propagates.
+const IpcError = error{
+    NoWindow,
+    MissingUrl,
+    MissingScript,
+    MissingRef,
+    MissingText,
+    UnknownId,
+    UrlTooLong,
+};
+
+/// Resolve the IPC target window: the foreground Ghostty window if one
+/// is, else the first live window. Null only when no windows exist.
+fn ipcTargetWindow(self: *App) ?*Window {
+    const fg = w32.GetForegroundWindow();
+    for (self.windows.items) |w| {
+        if (!w.closing and w.hwnd == fg) return w;
+    }
+    for (self.windows.items) |w| {
+        if (!w.closing) return w;
+    }
+    return null;
+}
+
+/// Find a browser pane by its IPC id across all live windows, or the
+/// most-recently-created browser pane (highest id) when `id` is null.
+fn ipcFindBrowser(self: *App, id: ?u32) ?*BrowserPane {
+    var best: ?*BrowserPane = null;
+    for (self.windows.items) |w| {
+        if (w.closing) continue;
+        for (0..w.tab_count) |t| {
+            var it = w.tab_trees[t].iterator();
+            while (it.next()) |entry| {
+                const browser = switch (entry.view.content) {
+                    .browser => |b| b,
+                    .terminal => continue,
+                };
+                if (id) |want| {
+                    if (browser.ipc_id == want) return browser;
+                } else if (best == null or browser.ipc_id > best.?.ipc_id) {
+                    best = browser;
+                }
+            }
+        }
+    }
+    return best;
+}
+
+/// Read an optional u32 "id" field from the request args.
+fn ipcArgId(req: *const ipc.Request) ?u32 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get("id") orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        else => null,
+    };
+}
+
+/// Read a required string field from the request args.
+fn ipcArgString(req: *const ipc.Request, key: []const u8) ?[]const u8 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Read an i64 field (the CDP backendNodeId `ref`) from the request args.
+fn ipcArgI64(req: *const ipc.Request, key: []const u8) ?i64 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+
+/// open {url, [target: "split"|"tab"]} → create a browser pane in the
+/// target window, navigate to url, reply with its assigned id.
+fn ipcOpen(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const url = ipcArgString(req, "url") orelse return IpcError.MissingUrl;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+
+    const as_tab = if (ipcArgString(req, "target")) |t|
+        std.mem.eql(u8, t, "tab")
+    else
+        false;
+
+    if (as_tab) {
+        try window.addBrowserTab();
+    } else {
+        try window.newBrowserSplit(.right);
+    }
+
+    // The just-created pane is the window's active pane.
+    const pane = window.getActivePane() orelse return IpcError.NoWindow;
+    const browser = switch (pane.content) {
+        .browser => |b| b,
+        .terminal => return IpcError.NoWindow,
+    };
+
+    var url_w: [2049]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(url_w[0 .. url_w.len - 1], url) catch
+        return IpcError.UrlTooLong;
+    url_w[wlen] = 0;
+    browser.navigateUrl(url_w[0..wlen :0]) catch {};
+
+    var data_buf: [32]u8 = undefined;
+    const data = std.fmt.bufPrint(&data_buf, "{{\"id\":{d}}}", .{browser.ipc_id}) catch
+        return error.NoSpaceLeft;
+    server.sendOk(req.id, data) catch {};
+}
+
+/// navigate {[id], url} → navigate the addressed (or most-recent)
+/// browser pane.
+fn ipcNavigate(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const url = ipcArgString(req, "url") orelse return IpcError.MissingUrl;
+    const browser = self.ipcFindBrowser(ipcArgId(req)) orelse return IpcError.UnknownId;
+
+    var url_w: [2049]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(url_w[0 .. url_w.len - 1], url) catch
+        return IpcError.UrlTooLong;
+    url_w[wlen] = 0;
+    browser.navigateUrl(url_w[0..wlen :0]) catch {};
+    server.sendOk(req.id, null) catch {};
+}
+
+/// eval {[id], js} → run js in the addressed (or most-recent) browser
+/// pane. The reply is sent asynchronously by the ExecuteScript
+/// completion (BrowserPane.evalForIpc), so this returns without sending.
+fn ipcEval(self: *App, req: *ipc.Request) anyerror!void {
+    const js = ipcArgString(req, "js") orelse return IpcError.MissingScript;
+    const browser = self.ipcFindBrowser(ipcArgId(req)) orelse return IpcError.UnknownId;
+
+    const alloc = self.core_app.alloc;
+    const js_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, js) catch
+        return error.OutOfMemory;
+    defer alloc.free(js_w);
+    browser.evalForIpc(req.id, js_w);
+}
+
+/// snapshot {[id]} → walk the addressed (or most-recent) browser pane's
+/// accessibility tree over CDP and reply with a compact [{ref,role,name}]
+/// array. Answered asynchronously by the CDP completion chain.
+fn ipcSnapshot(self: *App, req: *ipc.Request) anyerror!void {
+    const browser = self.ipcFindBrowser(ipcArgId(req)) orelse return IpcError.UnknownId;
+    browser.snapshotForIpc(req.id);
+}
+
+/// click {[id], ref} → click the element with backendNodeId `ref` in the
+/// addressed (or most-recent) browser pane. Answered asynchronously.
+fn ipcClick(self: *App, req: *ipc.Request) anyerror!void {
+    const ref = ipcArgI64(req, "ref") orelse return IpcError.MissingRef;
+    const browser = self.ipcFindBrowser(ipcArgId(req)) orelse return IpcError.UnknownId;
+    browser.clickForIpc(req.id, ref);
+}
+
+/// fill {[id], ref, text} → focus the element with backendNodeId `ref`
+/// and insert `text` in the addressed (or most-recent) browser pane.
+/// Answered asynchronously.
+fn ipcFill(self: *App, req: *ipc.Request) anyerror!void {
+    const ref = ipcArgI64(req, "ref") orelse return IpcError.MissingRef;
+    const text = ipcArgString(req, "text") orelse return IpcError.MissingText;
+    const browser = self.ipcFindBrowser(ipcArgId(req)) orelse return IpcError.UnknownId;
+    browser.fillForIpc(req.id, ref, text);
+}
+
 /// Append an entry to the sidebar notification log, bump the unread
 /// badge, and repaint every sidebar. Title/body are UTF-16 and
 /// truncated to the entry's inline buffers.
@@ -2673,6 +2950,14 @@ fn msgWndProc(
 
     if (msg == WM_APP_WAKEUP) {
         app.tick();
+        return 0;
+    }
+
+    if (msg == WM_APP_IPC_REQUEST) {
+        // lparam is the *ipc.Request handed over by the pipe thread; we
+        // own it now and handleIpcRequest destroys it.
+        const req: *ipc.Request = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        app.handleIpcRequest(req);
         return 0;
     }
 

@@ -778,6 +778,17 @@ const Subprocess = struct {
             // running in Ghostty.
             try env.put("GHOSTTY_BIN_DIR", exe_dir);
 
+            // Export the running instance's PID so `ghostty +browser`
+            // (and any future agent CLI) can resolve the per-process IPC
+            // pipe name (ghostty-browser-<pid>) without enumerating. Only
+            // meaningful where the browser IPC pipe exists (Win32).
+            if (comptime builtin.os.tag == .windows) {
+                try env.put(
+                    "GHOSTTY_PID",
+                    try std.fmt.allocPrint(alloc, "{d}", .{internal_os.windows.GetCurrentProcessId()}),
+                );
+            }
+
             // Append if we have a path. We want to append so that ghostty is
             // the last priority in the path. If we don't have a path set
             // then we just set it to the directory of the binary.

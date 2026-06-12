@@ -52,9 +52,11 @@ pub const max_line_bytes: usize = 1024 * 1024;
 /// the name; execution lives with the callback owner (App).
 pub const Command = enum {
     open,
+    navigate,
     eval,
     snapshot,
     click,
+    fill,
 };
 
 /// Protocol-level failures that map to error responses.
