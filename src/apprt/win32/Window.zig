@@ -893,11 +893,23 @@ pub fn addBrowserTab(self: *Window) !void {
 pub fn closeTab(self: *Window, pane: *Pane) void {
     const loc = self.findLoc(pane) orelse return;
     log.debug("closeTab called for pane={x} tab_count={}", .{ @intFromPtr(pane), loc.ws.tab_count });
-    self.closeTabByIndex(loc.tab);
+    // The pane may live in a NON-active workspace (a background shell
+    // exiting, an IPC-addressed browser closing): close the tab in the
+    // workspace that actually owns it, never the active one.
+    self.closeTabInWorkspace(self.workspaceIndex(loc.ws), loc.tab);
 }
 
+/// Close a tab by index within the ACTIVE workspace (tab bar / context
+/// menu paths, where the index is always active-workspace-relative).
 fn closeTabByIndex(self: *Window, idx: usize) void {
-    const ws = self.activeWorkspace();
+    self.closeTabInWorkspace(self.active_workspace, idx);
+}
+
+/// Close the tab at `idx` within workspace `ws_idx`, which need not be
+/// the active workspace (pane-pointer close paths resolve via findLoc).
+fn closeTabInWorkspace(self: *Window, ws_idx: usize, idx: usize) void {
+    if (ws_idx >= self.workspace_count) return;
+    const ws = &self.workspaces[ws_idx];
     if (idx >= ws.tab_count) return;
     // Cancel any in-progress rename (the edit control may belong to this tab).
     self.cancelTabRename();
@@ -924,7 +936,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
             // selects a survivor. closeWorkspace's own tab loop is a no-op
             // at tab_count==0, so the tree is freed exactly once.
             tree.deinit();
-            self.closeWorkspace(self.active_workspace);
+            self.closeWorkspace(ws_idx);
             return;
         }
         // Last tab of the only workspace → close the window. Set closing
@@ -941,8 +953,15 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         ws.active_tab -= 1;
     }
     tree.deinit();
-    self.selectTabIndex(ws.active_tab);
-    self.updateTabBarVisibility();
+    if (ws_idx == self.active_workspace) {
+        self.selectTabIndex(ws.active_tab);
+        self.updateTabBarVisibility();
+    } else {
+        // Background workspace: its panes are hidden and stay hidden;
+        // selectWorkspace lays it out when it next becomes active. The
+        // sidebar dot may change (aggregateStatus over fewer tabs).
+        self.invalidateSidebar();
+    }
 }
 
 /// Close tabs based on mode: this (current), other (all but current), right (all after current).
@@ -950,24 +969,30 @@ pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Su
     switch (mode) {
         .this => self.closeSplitSurface(surface),
         .other => {
-            const ws = self.activeWorkspace();
-            var current = (self.findLocOfSurface(surface) orelse return).tab;
-            var i: usize = ws.tab_count;
+            // Operate on the workspace that owns the surface (which may
+            // not be active, e.g. an IPC-addressed surface). The loop
+            // never empties the workspace (current survives), so no
+            // workspaces[] shift can invalidate ws_idx mid-loop.
+            const loc = self.findLocOfSurface(surface) orelse return;
+            const ws_idx = self.workspaceIndex(loc.ws);
+            var current = loc.tab;
+            var i: usize = loc.ws.tab_count;
             while (i > 0) {
                 i -= 1;
                 if (i != current) {
-                    self.closeTabByIndex(i);
+                    self.closeTabInWorkspace(ws_idx, i);
                     if (i < current) current -= 1;
                 }
             }
         },
         .right => {
-            const ws = self.activeWorkspace();
-            const current = (self.findLocOfSurface(surface) orelse return).tab;
-            var i: usize = ws.tab_count;
+            const loc = self.findLocOfSurface(surface) orelse return;
+            const ws_idx = self.workspaceIndex(loc.ws);
+            const current = loc.tab;
+            var i: usize = loc.ws.tab_count;
             while (i > current + 1) {
                 i -= 1;
-                self.closeTabByIndex(i);
+                self.closeTabInWorkspace(ws_idx, i);
             }
         },
     }
@@ -1037,12 +1062,21 @@ pub fn closeSplitPane(self: *Window, pane: *Pane) void {
     old_tree.deinit();
 
     if (next_pane) |np| {
-        log.debug("closeSplitPane: focusing next pane", .{});
-        self.layoutSplits();
-        np.focus();
+        // Only lay out and move focus when the pane lives in the ACTIVE
+        // workspace: a background workspace's survivors stay hidden (the
+        // active-pane slot was already updated above) and focusing one
+        // would SetFocus a hidden HWND, stealing keyboard focus from the
+        // visible workspace.
+        if (ws == self.activeWorkspace()) {
+            log.debug("closeSplitPane: focusing next pane", .{});
+            self.layoutSplits();
+            np.focus();
+        }
     } else {
         log.debug("closeSplitPane: no next pane, closing tab", .{});
-        self.closeTabByIndex(tab);
+        // `tab` is an index into loc.ws, which may not be the active
+        // workspace — close it where it lives.
+        self.closeTabInWorkspace(self.workspaceIndex(ws), tab);
     }
 }
 
@@ -1091,6 +1125,22 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     if (idx == self.active_workspace) return;
     self.cancelTabRename();
 
+    // Clear any in-progress tab or sidebar-row drag (mirrors
+    // selectTabIndex): an async switch (notif click, IPC jump) mid-drag
+    // must not leave a captured drag reordering the new workspace's
+    // tabs or the shifted rows. handleSidebarClick sets its drag state
+    // AFTER calling selectWorkspace, so click-then-drag is unaffected.
+    if (self.drag_tab >= 0) {
+        self.drag_tab = -1;
+        self.drag_active = false;
+        _ = w32.ReleaseCapture();
+    }
+    if (self.sidebar_drag_row >= 0) {
+        self.sidebar_drag_row = -1;
+        self.sidebar_drag_active = false;
+        _ = w32.ReleaseCapture();
+    }
+
     // Hide the outgoing workspace's active-tab panes (the only ones the
     // layout has shown) before switching, mirroring selectTabIndex's
     // hide-before-show ordering.
@@ -1103,6 +1153,13 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     }
 
     self.active_workspace = idx;
+
+    // The incoming active tab is now visible: clear its bell/exited
+    // status (mirrors selectTabIndex — status is "cleared when the tab
+    // is selected"), otherwise the sidebar dot sticks after the user
+    // has seen the tab.
+    const new_ws = self.activeWorkspace();
+    if (new_ws.tab_count > 0) new_ws.tab_status[new_ws.active_tab] = .normal;
 
     // The new workspace may have a different tab count, so the tab bar's
     // visibility can change. This may resize (changing surfaceRect), so
@@ -1201,6 +1258,11 @@ pub fn closeWorkspace(self: *Window, idx: usize) void {
     for (idx..new_count) |i| {
         self.workspaces[i] = self.workspaces[i + 1];
     }
+    // The shift leaves a duplicate of the last workspace past the new
+    // count, whose tab_trees alias the live workspace's heap data;
+    // value-init the slot so nothing can ever walk it (mirrors
+    // closeTabByIndex clearing its duplicated tree slot).
+    self.workspaces[new_count] = .{};
     self.workspace_count = new_count;
     self.active_workspace = survivor;
 
@@ -2497,11 +2559,13 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
 /// the tab bar and the sidebar. If clicked_tab is null (empty area),
 /// only "New Tab" is shown.
 fn showTabContextMenu(self: *Window, clicked_tab: ?usize, x: i32, y: i32) void {
-    const ws = self.activeWorkspace();
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
 
     if (clicked_tab) |tab| {
+        // Menu-construction reads only; never held across the modal
+        // menu loop below (workspaces[] can shift while it pumps).
+        const ws = self.activeWorkspace();
         _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_CLOSE, std.unicode.utf8ToUtf16LeStringLiteral("Close Tab"));
         _ = w32.AppendMenuW(menu, if (ws.tab_count > 1) w32.MF_STRING else w32.MF_GRAYED, TAB_CTX_CLOSE_OTHERS, std.unicode.utf8ToUtf16LeStringLiteral("Close Other Tabs"));
         _ = w32.AppendMenuW(menu, if (tab + 1 < ws.tab_count) w32.MF_STRING else w32.MF_GRAYED, TAB_CTX_CLOSE_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Close Tabs to the Right"));
@@ -2522,12 +2586,20 @@ fn showTabContextMenu(self: *Window, clicked_tab: ?usize, x: i32, y: i32) void {
         null,
     );
 
+    // The modal menu loop dispatched arbitrary messages: tabs may have
+    // closed, workspaces may have shifted (closeWorkspace moves the
+    // array under any held pointer), the window may be closing. Re-fetch
+    // the active workspace and re-validate the clicked index before
+    // acting; closeTabByIndex additionally bounds-checks each call.
+    if (self.closing) return;
+    const ws = self.activeWorkspace();
     switch (@as(usize, @intCast(cmd))) {
         TAB_CTX_CLOSE => {
             if (clicked_tab) |tab| self.closeTabByIndex(tab);
         },
         TAB_CTX_CLOSE_OTHERS => {
             if (clicked_tab) |tab| {
+                if (tab >= ws.tab_count) return;
                 var current = tab;
                 var i: usize = ws.tab_count;
                 while (i > 0) {
@@ -3548,6 +3620,11 @@ pub fn windowWndProc(
                 return 0;
             }
             if (x < window.sidebarWidth()) {
+                // The tab bar shares the top strip with the sidebar:
+                // moving left out of the tab bar into the sidebar gets no
+                // WM_MOUSELEAVE (still in the client area), so clear the
+                // tab-bar hover here or it sticks highlighted.
+                window.handleTabBarMouseLeave();
                 window.handleSidebarMouseMove(x, y);
                 return 0;
             }
