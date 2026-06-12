@@ -2265,10 +2265,10 @@ keybind: Keybinds = .{},
 /// Currently only supported on Linux (GTK).
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
-/// Whether to show a vertical session sidebar on the left side of the
-/// window (cmux-style). When enabled, the sidebar lists the tabs in the
-/// window and the top tab bar is hidden. Defaults to enabled on Windows;
-/// set to `false` for a classic top tab bar.
+/// Whether to show the vertical workspace sidebar on the left side of
+/// the window. The sidebar lists the window's workspaces; each
+/// workspace has its own tabs, shown in the top tab bar alongside the
+/// sidebar (see `window-show-tab-bar`). Enabled by default.
 ///
 /// This configuration can be reloaded at runtime.
 ///

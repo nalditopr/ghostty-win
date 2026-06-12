@@ -1,7 +1,7 @@
 # ghostty-win
 
 A native Windows build of the [Ghostty](https://ghostty.org) terminal emulator,
-with a session sidebar, embedded browser panes, and per-tab WSL backends.
+with a workspace sidebar, embedded browser panes, and per-tab WSL backends.
 
 > [!IMPORTANT]
 > **This is an unofficial community build. It is not affiliated with,
@@ -21,24 +21,40 @@ and extended with the features below.
 
 ## Features
 
-- **Session sidebar** — a vertical list of sessions with numbered rows,
-  per-session status dots (bell / process-exited), drag-to-resize, and
-  `alt+1`–`alt+8` jumping. Toggle with `window-show-sidebar = true`.
+- **Workspaces** — a window holds workspaces (sidebar rows), each with its
+  own set of tabs, each tab splitting into panes. The **workspace sidebar**
+  (on by default) has numbered rows with per-workspace status dots
+  (bell / process-exited, aggregated over the workspace's tabs),
+  rename (double-click or right-click), hover close-`×`, drag-to-reorder,
+  and drag-to-resize. Disable with `window-show-sidebar = false`.
+- **Per-workspace tab bar** — the top tab bar coexists with the sidebar and
+  shows the active workspace's tabs, with close-`×`, drag-to-reorder,
+  double-click rename, and `+`/`▾` new-tab buttons; `alt+1`–`alt+8` jump to
+  tabs within the active workspace. `window-show-tab-bar = always/auto/never`
+  applies per the active workspace's tab count.
 - **Backend picker** — open a new tab or split as your default shell,
   PowerShell, cmd, any installed **WSL distribution** (enumerated live from
-  the registry), or an embedded **browser**. Reachable from a dropdown
-  chevron on the new-session row, the tab bar's split-button, or
-  right-click. Splits inherit their source pane's backend.
+  the registry), or an embedded **browser**. Reachable from the `▾` chevron
+  on the sidebar's new-workspace row, the tab bar's `▾` segment, or a
+  terminal's *Split ... With...* menu. Plain splits inherit their source
+  pane's backend.
 - **Browser panes (WebView2)** — open a Chromium-based browser as a split
-  or a tab, with an address bar. Requires the Microsoft Edge WebView2
-  Runtime (preinstalled on Windows 11).
+  or a tab, with an address bar and close-`×`. Requires the Microsoft Edge
+  WebView2 Runtime (preinstalled on Windows 11).
+- **`ghostty +browser` CLI** — script the embedded browser panes of a
+  running instance over a named pipe: `open` / `navigate` / `eval` /
+  `snapshot` / `click` / `fill` / `list`.
 - **Notifications** — clickable desktop notifications that jump to the
-  originating tab, plus an in-app notifications panel in the sidebar.
+  originating tab (across workspaces), plus an in-app notifications panel
+  in the sidebar.
 - **Terminal context menu** — right-click for copy / paste / select-all /
-  splits / new tab, with the usual mouse-reporting passthrough.
+  splits / new tab / close pane, with the usual mouse-reporting passthrough.
 - **Working-directory inheritance** — new tabs and splits open in the
   current directory (OSC 7), including from PowerShell.
-- **Settings gear** — open or reload your config from the sidebar.
+- **Window state persistence** — size, position, and maximized state are
+  restored across restarts (`%LOCALAPPDATA%\ghostty\window-state`).
+- **Settings gear** — open or reload your config, or set the default shell,
+  from the sidebar.
 
 See [`docs/WINDOWS_FEATURES.md`](docs/WINDOWS_FEATURES.md) for the full
 feature guide and a keyboard/mouse cheat sheet.
