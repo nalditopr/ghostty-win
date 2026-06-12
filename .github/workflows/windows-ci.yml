@@ -24,7 +24,7 @@ jobs:
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}\zig-global
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
