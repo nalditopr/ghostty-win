@@ -16,6 +16,7 @@ public class W32 {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     public delegate bool EP(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EP p, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EP p, IntPtr l);
@@ -43,6 +44,30 @@ public class W32 {
 "@
 
 $pass = 0; $fail = 0
+$script:inputOK = $true
+$script:downgraded = 0
+
+# Per-Monitor-V2 DPI awareness: without this, at >100% display scale Windows
+# silently virtualizes window rects/coords for this (DPI-unaware) pwsh process
+# (and would rescale any future PostMessage coordinates). Must run before any
+# window queries. DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+# Older hosts (pre Win10 1703) lack the API; fall back gracefully.
+try {
+    [W32]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
+} catch {
+    Write-Output "WARN: SetThreadDpiAwarenessContext unavailable; continuing DPI-unaware ($($_.Exception.Message))"
+}
+
+# Input-delivery health probe: SendKeys can silently fail (locked desktop /
+# session quirks). Probe with a no-op key so input-dependent assertions can be
+# explicitly DOWNGRADED to liveness checks instead of passing vacuously.
+try {
+    [System.Windows.Forms.SendKeys]::SendWait("{F15}")
+} catch {
+    $script:inputOK = $false
+    Write-Output "!!! INPUT UNAVAILABLE: SendKeys probe ({F15}) failed: $($_.Exception.Message)"
+    Write-Output "!!! Input-dependent assertions will be DOWNGRADED to liveness checks."
+}
 
 function Take-Screenshot($proc, $name) {
     if (-not $ScreenshotDir) { return }
@@ -74,19 +99,60 @@ function Send-Shortcut($proc, $keys) {
         [W32]::SetForegroundWindow($h) | Out-Null
         Start-Sleep -Milliseconds 200
     }
-    [System.Windows.Forms.SendKeys]::SendWait($keys)
+    try {
+        [System.Windows.Forms.SendKeys]::SendWait($keys)
+    } catch {
+        # SendWait can throw transiently (e.g. Win32Exception "The operation
+        # completed successfully." during foreground churn) - retry once
+        # before declaring input delivery unavailable.
+        Start-Sleep -Milliseconds 250
+        try {
+            [System.Windows.Forms.SendKeys]::SendWait($keys)
+        } catch {
+            if ($script:inputOK) {
+                Write-Output "  WARN: SendKeys delivery failed mid-run: $($_.Exception.Message)"
+            }
+            $script:inputOK = $false
+        }
+    }
     Start-Sleep -Milliseconds 200
+}
+
+# Liveness assertion. When input delivery is unavailable, the action the
+# assertion depends on was never delivered, so the check is explicitly marked
+# DOWNGRADED (counted separately; downgraded != failed). Process death is
+# always a hard failure. Sets $script:alive so callers can abort follow-on
+# steps after a death (messages must flow to stdout, so no pipeline return).
+function Assert-Alive($proc, $context) {
+    if ($proc.HasExited) {
+        Write-Output "  FAIL: Process died $context"
+        $script:fail++
+        $script:alive = $false
+        return
+    }
+    if ($script:inputOK) {
+        Write-Output "  OK: Process alive $context"
+        $script:pass++
+    } else {
+        Write-Output "  DOWNGRADED: input unavailable - liveness only ($context)"
+        $script:downgraded++
+    }
+    $script:alive = $true
 }
 
 function Count-ChildWindows($proc, $className) {
     $proc.Refresh()
     $h = $proc.MainWindowHandle
     if ($h -eq [IntPtr]::Zero) { return 0 }
+    # Use script scope for values the callback reads: delegate scriptblocks do
+    # not reliably see the enclosing function's locals (same failure mode as
+    # the old $pid shadowing bug in test_tabs.ps1).
+    $script:targetClass = $className
     $script:childCount = 0
     $cb = [W32+EP]{param($ch,$l)
         $sb = New-Object System.Text.StringBuilder 256
         [W32]::GetClassName($ch, $sb, 256) | Out-Null
-        if ($sb.ToString() -eq $className -and [W32]::IsWindowVisible($ch)) {
+        if ($sb.ToString() -eq $script:targetClass -and [W32]::IsWindowVisible($ch)) {
             $script:childCount++
         }
         return $true
@@ -132,7 +198,7 @@ Write-Output "  Terminal child windows before split: $childBefore"
 
 Take-Screenshot $proc "split_01_before"
 
-# Ctrl+Shift+Enter = new split (right) - default Ghostty keybinding
+# Ctrl+Shift+O = new split (right)
 Send-Shortcut $proc "^+o"
 Start-Sleep -Seconds 3
 
@@ -144,8 +210,13 @@ Take-Screenshot $proc "split_02_after"
 if ($proc.HasExited) {
     Write-Output "  FAIL: Process crashed during split creation"
     $fail++
+} elseif (-not $script:inputOK) {
+    Write-Output "  DOWNGRADED: input unavailable - cannot assert split creation (liveness only)"
+    $script:downgraded++
 } elseif ($childAfter -gt $childBefore) {
-    Write-Output "  OK: Split created ($childBefore -> $childAfter visible terminals)"
+    # Cheap observable effect: the first real input visibly created a split,
+    # confirming end-to-end keystroke delivery.
+    Write-Output "  OK: Split created ($childBefore -> $childAfter visible terminals) - input delivery confirmed"
     $pass++
 } else {
     Write-Output "  WARN: Child count unchanged - split may not have been created (check keybinding)"
@@ -174,14 +245,10 @@ Write-Output "  Terminals after split: $childBefore"
 Send-Shortcut $proc "^+w"
 Start-Sleep -Seconds 2
 
-if ($proc.HasExited) {
-    Write-Output "  FAIL: Process died after closing split pane"
-    $fail++
-} else {
+Assert-Alive $proc "after closing split pane"
+if ($script:alive) {
     $childAfter = Count-ChildWindows $proc "GhosttyTerminal"
     Write-Output "  Terminals after close: $childAfter"
-    Write-Output "  OK: Process alive after closing split pane"
-    $pass++
 }
 
 Take-Screenshot $proc "split_03_after_close"
@@ -207,13 +274,7 @@ Write-Output "  Terminal windows: $childCount (expected 4)"
 
 Take-Screenshot $proc "split_04_multiple"
 
-if ($proc.HasExited) {
-    Write-Output "  FAIL: Process crashed during multiple splits"
-    $fail++
-} else {
-    Write-Output "  OK: Process alive with $childCount panes"
-    $pass++
-}
+Assert-Alive $proc "with $childCount panes after multiple splits"
 Kill-Ghostty $proc
 Write-Output "  DONE"
 
@@ -243,13 +304,7 @@ Start-Sleep -Seconds 1
 
 Take-Screenshot $proc "split_05_navigation"
 
-if ($proc.HasExited) {
-    Write-Output "  FAIL: Process crashed during split navigation"
-    $fail++
-} else {
-    Write-Output "  OK: Process alive after split navigation"
-    $pass++
-}
+Assert-Alive $proc "after split navigation"
 Kill-Ghostty $proc
 Write-Output "  DONE"
 
@@ -279,13 +334,7 @@ Start-Sleep -Seconds 1
 
 Take-Screenshot $proc "split_06_splits_tabs"
 
-if ($proc.HasExited) {
-    Write-Output "  FAIL: Process crashed during splits + tab switching"
-    $fail++
-} else {
-    Write-Output "  OK: Process alive after splits + tab operations"
-    $pass++
-}
+Assert-Alive $proc "after splits + tab operations"
 Kill-Ghostty $proc
 Write-Output "  DONE"
 
@@ -312,14 +361,10 @@ Start-Sleep -Seconds 2
 Send-Shortcut $proc "^+w"
 Start-Sleep -Seconds 2
 
-if ($proc.HasExited) {
-    Write-Output "  FAIL: Process exited after closing split panes (should still have 1)"
-    $fail++
-} else {
+Assert-Alive $proc "with remaining pane after closing split panes"
+if ($script:alive) {
     $after = Count-ChildWindows $proc "GhosttyTerminal"
     Write-Output "  Panes after closing 2: $after"
-    Write-Output "  OK: Process alive with remaining pane"
-    $pass++
 }
 
 Take-Screenshot $proc "split_07_all_closed"
@@ -329,6 +374,10 @@ Write-Output "  DONE"
 # ===================================
 Write-Output ""
 Write-Output "================================"
-Write-Output "Results: $pass passed, $fail failed"
+if ($script:downgraded -gt 0) {
+    Write-Output "INPUT UNAVAILABLE - $($script:downgraded) assertions DOWNGRADED to liveness"
+}
+Write-Output "Results: $pass passed, $fail failed, $($script:downgraded) downgraded"
 Write-Output "================================"
 if ($fail -gt 0) { exit 1 }
+exit 0

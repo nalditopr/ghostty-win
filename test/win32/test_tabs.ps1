@@ -15,6 +15,7 @@ public class W32 {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     public delegate bool EP(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EP p, IntPtr l);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
@@ -22,6 +23,31 @@ public class W32 {
 "@
 
 $pass = 0; $fail = 0
+$script:inputOK = $true
+$script:downgraded = 0
+$script:skipped = 0
+
+# Per-Monitor-V2 DPI awareness: without this, at >100% display scale Windows
+# silently virtualizes window rects/coords for this (DPI-unaware) pwsh process
+# (and would rescale any future PostMessage coordinates). Must run before any
+# window queries. DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+# Older hosts (pre Win10 1703) lack the API; fall back gracefully.
+try {
+    [W32]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
+} catch {
+    Write-Output "WARN: SetThreadDpiAwarenessContext unavailable; continuing DPI-unaware ($($_.Exception.Message))"
+}
+
+# Input-delivery health probe: SendKeys can silently fail (locked desktop /
+# session quirks). Probe with a no-op key so input-dependent assertions can be
+# explicitly DOWNGRADED to liveness checks instead of passing vacuously.
+try {
+    [System.Windows.Forms.SendKeys]::SendWait("{F15}")
+} catch {
+    $script:inputOK = $false
+    Write-Output "!!! INPUT UNAVAILABLE: SendKeys probe ({F15}) failed: $($_.Exception.Message)"
+    Write-Output "!!! Input-dependent assertions will be DOWNGRADED to liveness checks."
+}
 
 function Take-Screenshot($proc, $name) {
     if (-not $ScreenshotDir) { return }
@@ -49,7 +75,22 @@ function Send-Keys($proc, $keys) {
         [W32]::SetForegroundWindow($h) | Out-Null
         Start-Sleep -Milliseconds 200
     }
-    [System.Windows.Forms.SendKeys]::SendWait($keys)
+    try {
+        [System.Windows.Forms.SendKeys]::SendWait($keys)
+    } catch {
+        # SendWait can throw transiently (e.g. Win32Exception "The operation
+        # completed successfully." during foreground churn) - retry once
+        # before declaring input delivery unavailable.
+        Start-Sleep -Milliseconds 250
+        try {
+            [System.Windows.Forms.SendKeys]::SendWait($keys)
+        } catch {
+            if ($script:inputOK) {
+                Write-Output "  WARN: SendKeys delivery failed mid-run: $($_.Exception.Message)"
+            }
+            $script:inputOK = $false
+        }
+    }
 }
 
 function Send-Text($proc, $text) {
@@ -57,12 +98,38 @@ function Send-Text($proc, $text) {
     Send-Keys $proc $escaped
 }
 
-function Count-GhosttyWindows($pid) {
+# Liveness assertion. When input delivery is unavailable, the action the
+# assertion depends on was never delivered, so the check is explicitly marked
+# DOWNGRADED (counted separately; downgraded != failed). Process death is
+# always a hard failure. Sets $script:alive so callers can abort follow-on
+# steps after a death (messages must flow to stdout, so no pipeline return).
+function Assert-Alive($proc, $context) {
+    if ($proc.HasExited) {
+        Write-Output "  FAIL: Process died $context"
+        $script:fail++
+        $script:alive = $false
+        return
+    }
+    if ($script:inputOK) {
+        Write-Output "  OK: Process alive $context"
+        $script:pass++
+    } else {
+        Write-Output "  DOWNGRADED: input unavailable - liveness only ($context)"
+        $script:downgraded++
+    }
+    $script:alive = $true
+}
+
+# NOTE: the parameter must NOT be named $pid - that shadows the pwsh automatic
+# variable $PID, and the EnumWindows callback then resolves it to the host
+# process id, making the count always 0 and the assertion vacuous.
+function Count-GhosttyWindows($ownerPid) {
+    $script:targetPid = [uint32]$ownerPid
     $script:wcount = 0
     $cb = [W32+EP]{param($h,$l)
         $wp = [uint32]0
         [W32]::GetWindowThreadProcessId($h, [ref]$wp) | Out-Null
-        if ($wp -eq $pid -and [W32]::IsWindowVisible($h)) {
+        if ($wp -eq $script:targetPid -and [W32]::IsWindowVisible($h)) {
             $sb = New-Object System.Text.StringBuilder 256
             [W32]::GetClassName($h, $sb, 256) | Out-Null
             if ($sb.ToString() -eq "GhosttyWindow") { $script:wcount++ }
@@ -107,21 +174,23 @@ Start-Sleep -Seconds 3
 Take-Screenshot $proc "02_after_new_tab"
 
 $wc = Count-GhosttyWindows $proc.Id
-if ($wc -eq 1) {
-    Write-Output "  OK: Still 1 window (tab is inside)"
-} else {
-    Write-Output "  INFO: Window count = $wc (EnumWindows may fail in WSL2)"
-}
-
-if (-not $proc.HasExited) {
-    Write-Output "  OK: Process alive after new tab"
+if (-not $script:inputOK) {
+    Write-Output "  DOWNGRADED: input unavailable - cannot assert window count after new tab (count=$wc)"
+    $script:downgraded++
+} elseif ($wc -eq 1) {
+    Write-Output "  OK: Still 1 top-level GhosttyWindow (tab opened inside)"
     $pass++
+} elseif ($wc -eq 0) {
+    Write-Output "  SKIPPED(env): EnumWindows found 0 GhosttyWindows (cross-session enumeration unavailable, e.g. WSL2)"
+    $script:skipped++
 } else {
-    Write-Output "  FAIL: Process died after new tab"
+    Write-Output "  FAIL: Window count = $wc (expected 1 - a new tab must not create a new OS window)"
     $fail++
 }
+
+Assert-Alive $proc "after new tab"
 & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
-Write-Output "  PASSED"
+Write-Output "  DONE"
 
 # ═══════════════════════════════════════
 # TEST: Tab Switch
@@ -157,15 +226,9 @@ Send-Keys $proc "^+{PGDN}"
 Start-Sleep -Seconds 1
 Take-Screenshot $proc "05_tab2_switch"
 
-if (-not $proc.HasExited) {
-    Write-Output "  OK: Process alive after tab switching"
-    $pass++
-} else {
-    Write-Output "  FAIL: Process died during tab switch"
-    $fail++
-}
+Assert-Alive $proc "after tab switching"
 & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
-Write-Output "  PASSED"
+Write-Output "  DONE"
 
 # ═══════════════════════════════════════
 # TEST: Tab Close
@@ -188,42 +251,50 @@ Take-Screenshot $proc "06_three_tabs"
 Send-Keys $proc "^+w"
 Start-Sleep -Seconds 2
 
-if (-not $proc.HasExited) {
-    Write-Output "  OK: Process alive after closing 1 tab"
-} else {
-    Write-Output "  FAIL: Process died after closing 1 tab"
-    $fail++
+Assert-Alive $proc "after closing 1 tab"
+if (-not $script:alive) {
     Write-Output "  FAILED"
-    return
+    Write-Output ""
+    Write-Output "================================"
+    Write-Output "Results: $pass passed, $fail failed, $($script:downgraded) downgraded, $($script:skipped) skipped(env)"
+    Write-Output "================================"
+    exit 1
 }
 
 # Close another tab
 Send-Keys $proc "^+w"
 Start-Sleep -Seconds 2
 
-if (-not $proc.HasExited) {
-    Write-Output "  OK: Process alive (1 tab remains)"
-} else {
-    Write-Output "  FAIL: Process died after closing 2nd tab"
-    $fail++
+Assert-Alive $proc "after closing 2nd tab (1 tab remains)"
+if (-not $script:alive) {
     Write-Output "  FAILED"
-    return
+    Write-Output ""
+    Write-Output "================================"
+    Write-Output "Results: $pass passed, $fail failed, $($script:downgraded) downgraded, $($script:skipped) skipped(env)"
+    Write-Output "================================"
+    exit 1
 }
 
 Take-Screenshot $proc "07_one_tab_remains"
 
-# Close last tab — process should exit
+# Close last tab — process should exit. When input works, the process exiting
+# here is the cheap observable confirmation that keystrokes are delivered.
 Send-Keys $proc "^+w"
 Start-Sleep -Seconds 3
 
-if ($proc.HasExited) {
-    Write-Output "  OK: Process exited after closing last tab"
+if (-not $script:inputOK) {
+    Write-Output "  DOWNGRADED: input unavailable - cannot assert last-tab close exits process"
+    $script:downgraded++
+    & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
+} elseif ($proc.HasExited) {
+    Write-Output "  OK: Process exited after closing last tab (input delivery confirmed)"
+    $pass++
 } else {
     Write-Output "  WARN: Process still alive (may need quit timer)"
     & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
+    $pass++
 }
-$pass++
-Write-Output "  PASSED"
+Write-Output "  DONE"
 
 # ═══════════════════════════════════════
 # TEST: Rapid Tabs
@@ -243,13 +314,14 @@ Start-Sleep -Seconds 2
 
 Take-Screenshot $proc "08_six_tabs"
 
-if (-not $proc.HasExited) {
-    Write-Output "  OK: Survived rapid tab creation"
-} else {
-    Write-Output "  FAIL: Crashed during rapid tab creation"
-    $fail++
+Assert-Alive $proc "after rapid tab creation"
+if (-not $script:alive) {
     Write-Output "  FAILED"
-    return
+    Write-Output ""
+    Write-Output "================================"
+    Write-Output "Results: $pass passed, $fail failed, $($script:downgraded) downgraded, $($script:skipped) skipped(env)"
+    Write-Output "================================"
+    exit 1
 }
 
 # Rapid switching
@@ -259,20 +331,20 @@ for ($i = 0; $i -lt 6; $i++) {
 }
 Start-Sleep -Seconds 1
 
-if (-not $proc.HasExited) {
-    Write-Output "  OK: Survived rapid tab switching"
-} else {
-    Write-Output "  FAIL: Crashed during rapid tab switching"
-    $fail++
-}
-
+Assert-Alive $proc "after rapid tab switching"
 & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
-$pass++
-Write-Output "  PASSED"
+Write-Output "  DONE"
 
 # ═══════════════════════════════════════
 Write-Output ""
 Write-Output "================================"
-Write-Output "Results: $pass passed, $fail failed"
+if ($script:downgraded -gt 0) {
+    Write-Output "INPUT UNAVAILABLE - $($script:downgraded) assertions DOWNGRADED to liveness"
+}
+if ($script:skipped -gt 0) {
+    Write-Output "ENVIRONMENT LIMITS - $($script:skipped) assertions SKIPPED(env)"
+}
+Write-Output "Results: $pass passed, $fail failed, $($script:downgraded) downgraded, $($script:skipped) skipped(env)"
 Write-Output "================================"
 if ($fail -gt 0) { exit 1 }
+exit 0

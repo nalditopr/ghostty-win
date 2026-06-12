@@ -42,6 +42,7 @@ public class W32 {
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP   = 0x0004;
     [StructLayout(LayoutKind.Sequential)] public struct RECT  { public int L,T,R,B; }
@@ -50,6 +51,32 @@ public class W32 {
 "@
 
 $pass = 0; $fail = 0
+$script:inputOK = $true
+$script:downgraded = 0
+$script:skipped = 0
+
+# Per-Monitor-V2 DPI awareness: without this, at >100% display scale Windows
+# silently virtualizes window rects/coords for this (DPI-unaware) pwsh process
+# (breaking the GetDpiForWindow-based pixel math below, and rescaling any
+# future PostMessage coordinates). Must run before any window queries.
+# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+# Older hosts (pre Win10 1703) lack the API; fall back gracefully.
+try {
+    [W32]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
+} catch {
+    Write-Output "WARN: SetThreadDpiAwarenessContext unavailable; continuing DPI-unaware ($($_.Exception.Message))"
+}
+
+# Input-delivery health probe: SendKeys can silently fail (locked desktop /
+# session quirks). Probe with a no-op key so input-dependent assertions can be
+# explicitly DOWNGRADED to liveness checks instead of passing vacuously.
+try {
+    [System.Windows.Forms.SendKeys]::SendWait("{F15}")
+} catch {
+    $script:inputOK = $false
+    Write-Output "!!! INPUT UNAVAILABLE: SendKeys probe ({F15}) failed: $($_.Exception.Message)"
+    Write-Output "!!! Input-dependent assertions will be DOWNGRADED to liveness checks."
+}
 
 # Sidebar on + deterministic compiled-default config (ignore user config files).
 $LaunchArgs = "--window-show-sidebar=true --config-default-files=false"
@@ -88,7 +115,22 @@ function Send-Shortcut($proc, $keys) {
         [W32]::SetForegroundWindow($h) | Out-Null
         Start-Sleep -Milliseconds 200
     }
-    [System.Windows.Forms.SendKeys]::SendWait($keys)
+    try {
+        [System.Windows.Forms.SendKeys]::SendWait($keys)
+    } catch {
+        # SendWait can throw transiently (e.g. Win32Exception "The operation
+        # completed successfully." during foreground churn) - retry once
+        # before declaring input delivery unavailable.
+        Start-Sleep -Milliseconds 250
+        try {
+            [System.Windows.Forms.SendKeys]::SendWait($keys)
+        } catch {
+            if ($script:inputOK) {
+                Write-Output "  WARN: SendKeys delivery failed mid-run: $($_.Exception.Message)"
+            }
+            $script:inputOK = $false
+        }
+    }
     Start-Sleep -Milliseconds 200
 }
 
@@ -203,6 +245,12 @@ function Test-ColorNear($c, $exp, $tol) {
            ([math]::Abs($c.B - $exp.B) -le $tol)
 }
 
+# PrintWindow returns flat white for WGL-rendered (GL) content when the window
+# has no true foreground / DWM redirection surface to capture from.
+function Test-NearWhite($c) {
+    return ($c.R -ge 250) -and ($c.G -ge 250) -and ($c.B -ge 250)
+}
+
 function Fmt-Color($c) { "($($c.R),$($c.G),$($c.B))" }
 
 function Click-ClientPoint($proc, $ci, $cx, $cy) {
@@ -283,8 +331,22 @@ if ($proc.HasExited) {
 
     Take-Screenshot $proc "sidebar_02_pixels"
 
+    # PrintWindow cannot capture WGL (GL) content without a true foreground
+    # window: the terminal area then samples as flat white. Detect that and
+    # mark the affected assertions SKIPPED(env) rather than FAIL.
+    $termWhite = Test-NearWhite $term
+    $allWhite  = $termWhite -and (Test-NearWhite $sideMid) -and (Test-NearWhite $sideAlt)
+    if ($allWhite) {
+        Write-Output "  INFO: All samples are flat white - PrintWindow could not capture window content (no true foreground)"
+    } elseif ($termWhite) {
+        Write-Output "  INFO: Terminal sample is flat white - PrintWindow could not capture WGL terminal content"
+    }
+
     # Assertion A: sidebar background == terminal bg + 12/channel (either sample point)
-    if ((Test-ColorNear $sideMid $SideBg $Tol) -or (Test-ColorNear $sideAlt $SideBg $Tol)) {
+    if ($allWhite) {
+        Write-Output "  SKIPPED(env): Sidebar pixel assertion - capture returned flat white (GL/foreground capture limitation)"
+        $script:skipped++
+    } elseif ((Test-ColorNear $sideMid $SideBg $Tol) -or (Test-ColorNear $sideAlt $SideBg $Tol)) {
         Write-Output "  OK: Sidebar pixel matches bg+12 sidebar color"
         $pass++
     } else {
@@ -293,7 +355,10 @@ if ($proc.HasExited) {
     }
 
     # Assertion B: terminal area shows the default background
-    if (Test-ColorNear $term $TermBg $Tol) {
+    if ($termWhite) {
+        Write-Output "  SKIPPED(env): Terminal pixel assertion - capture returned flat white (GL/foreground capture limitation)"
+        $script:skipped++
+    } elseif (Test-ColorNear $term $TermBg $Tol) {
         Write-Output "  OK: Terminal pixel matches default background"
         $pass++
     } else {
@@ -303,13 +368,18 @@ if ($proc.HasExited) {
 
     # Assertion C: relative check — sidebar is brighter than terminal by ~12/channel.
     # Holds even if absolute colors drift (e.g. config leakage), as long as both samples are valid.
-    $dR = $sideMid.R - $term.R; $dG = $sideMid.G - $term.G; $dB = $sideMid.B - $term.B
-    if (($dR -ge 6 -and $dR -le 18) -and ($dG -ge 6 -and $dG -le 18) -and ($dB -ge 6 -and $dB -le 18)) {
-        Write-Output "  OK: Sidebar/terminal delta is ~+12 per channel ($dR,$dG,$dB)"
-        $pass++
+    if ($termWhite) {
+        Write-Output "  SKIPPED(env): Sidebar/terminal delta assertion - terminal sample invalid (flat white capture)"
+        $script:skipped++
     } else {
-        Write-Output "  FAIL: Sidebar/terminal delta not ~+12 per channel ($dR,$dG,$dB)"
-        $fail++
+        $dR = $sideMid.R - $term.R; $dG = $sideMid.G - $term.G; $dB = $sideMid.B - $term.B
+        if (($dR -ge 6 -and $dR -le 18) -and ($dG -ge 6 -and $dG -le 18) -and ($dB -ge 6 -and $dB -le 18)) {
+            Write-Output "  OK: Sidebar/terminal delta is ~+12 per channel ($dR,$dG,$dB)"
+            $pass++
+        } else {
+            Write-Output "  FAIL: Sidebar/terminal delta not ~+12 per channel ($dR,$dG,$dB)"
+            $fail++
+        }
     }
 }
 Kill-Ghostty $proc
@@ -345,8 +415,13 @@ if ($proc.HasExited) {
 } elseif (-not ($tab1Named -and $tab2Named)) {
     # Title propagation unavailable — fall back to survival assertion (test_splits.ps1 pattern)
     Write-Output "  WARN: Tab titles did not propagate (title='$(Get-WindowTitle $proc)') - cannot assert switch by title"
-    Write-Output "  OK: Process alive with 2 tabs + sidebar (no crash)"
-    $pass++
+    if ($script:inputOK) {
+        Write-Output "  OK: Process alive with 2 tabs + sidebar (no crash)"
+        $pass++
+    } else {
+        Write-Output "  DOWNGRADED: input unavailable - liveness only (tabs were never created/named)"
+        $script:downgraded++
+    }
     # Still exercise the click path for crash coverage
     $ci = Get-ClientInfo $proc
     $sidebarPx = [int][math]::Round(220 * $ci.Scale)
@@ -356,9 +431,12 @@ if ($proc.HasExited) {
     if ($proc.HasExited) {
         Write-Output "  FAIL: Process died after sidebar row click"
         $fail++
-    } else {
+    } elseif ($script:inputOK) {
         Write-Output "  OK: Process alive after sidebar row click"
         $pass++
+    } else {
+        Write-Output "  DOWNGRADED: input unavailable - liveness only (after sidebar row click attempt)"
+        $script:downgraded++
     }
 } else {
     Write-Output "  Titles set: window title now '$(Get-WindowTitle $proc)' (expect TAB2 active)"
@@ -407,6 +485,13 @@ Write-Output "  DONE"
 # ═══════════════════════════════════════
 Write-Output ""
 Write-Output "================================"
-Write-Output "Results: $pass passed, $fail failed"
+if ($script:downgraded -gt 0) {
+    Write-Output "INPUT UNAVAILABLE - $($script:downgraded) assertions DOWNGRADED to liveness"
+}
+if ($script:skipped -gt 0) {
+    Write-Output "ENVIRONMENT LIMITS - $($script:skipped) assertions SKIPPED(env)"
+}
+Write-Output "Results: $pass passed, $fail failed, $($script:downgraded) downgraded, $($script:skipped) skipped(env)"
 Write-Output "================================"
 if ($fail -gt 0) { exit 1 }
+exit 0

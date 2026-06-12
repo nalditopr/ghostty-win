@@ -93,6 +93,9 @@ public class Win32Test {
     [DllImport("user32.dll")]
     public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
     public const uint GW_OWNER = 4;
 
     public const uint SWP_NOZORDER = 0x0004;
@@ -107,6 +110,17 @@ public class Win32Test {
     }
 }
 "@
+
+# Per-Monitor-V2 DPI awareness: without this, at >100% display scale Windows
+# silently virtualizes window rects/coords for this (DPI-unaware) pwsh process
+# (and rescales any PostMessage coordinates). Must run before any window
+# queries. DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4.
+# Older hosts (pre Win10 1703) lack the API; fall back gracefully.
+try {
+    [Win32Test]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
+} catch {
+    Write-Warning "SetThreadDpiAwarenessContext unavailable; continuing DPI-unaware ($($_.Exception.Message))"
+}
 
 function Find-GhosttyWindow {
     param([int]$ProcessId = 0, [long]$DirectHwnd = 0)
@@ -235,7 +249,15 @@ function Invoke-SendKeys {
 
     if ($Keys) {
         # SendKeys format: {ENTER}, {TAB}, ^c (Ctrl+C), etc.
-        [System.Windows.Forms.SendKeys]::SendWait($Keys)
+        # SendWait can throw on locked desktops / isolated sessions; report
+        # delivery health explicitly instead of failing silently.
+        try {
+            [System.Windows.Forms.SendKeys]::SendWait($Keys)
+            Write-Output "SEND_OK=true"
+        } catch {
+            Write-Output "SEND_OK=false"
+            Write-Output "SEND_ERROR=$($_.Exception.Message)"
+        }
     }
     Write-Output "SENT=$Keys"
 }
@@ -253,7 +275,13 @@ function Invoke-SendText {
     if ($Text) {
         # Escape special SendKeys characters
         $escaped = $Text -replace '([+^%~{}()\[\]])', '{$1}'
-        [System.Windows.Forms.SendKeys]::SendWait($escaped)
+        try {
+            [System.Windows.Forms.SendKeys]::SendWait($escaped)
+            Write-Output "SEND_OK=true"
+        } catch {
+            Write-Output "SEND_OK=false"
+            Write-Output "SEND_ERROR=$($_.Exception.Message)"
+        }
     }
     Write-Output "SENT_TEXT=$Text"
 }
