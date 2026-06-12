@@ -721,6 +721,52 @@ pub fn addTab(self: *Window) !*Surface {
     return self.addTabWithCommand(null, null);
 }
 
+/// Like addTab, but the new tab inherits the active pane's backend
+/// ("follow the current console", mirroring how splits inherit via
+/// newSplit): a new tab opened from a WSL or PowerShell tab runs the
+/// same shell. Used by the plain new-tab UX paths — the tab bar "+"
+/// button, the new_tab binding action, and the New Tab context-menu
+/// entries. The backend picker stays an explicit override
+/// (addTabWithCommand), and window/workspace creation keeps the
+/// configured default (addTab). A null spawn_command (the default
+/// shell) or a browser pane (no terminal surface) falls back to the
+/// default, matching addTab. Surface.init deep copies the argv, so
+/// borrowing the source surface's copy is fine (same as newSplit).
+pub fn addTabInherit(self: *Window) !*Surface {
+    const command: ?[]const []const u8 = blk: {
+        const ws = self.activeWorkspace();
+        if (ws.tab_count == 0) break :blk null;
+        const src = ws.tab_active_pane[ws.active_tab].surface() orelse break :blk null;
+        break :blk src.spawn_command;
+    };
+    const title: ?[]const u8 = if (command) |argv| titleForCommand(argv) else null;
+    return self.addTabWithCommand(command, title);
+}
+
+/// Initial tab title for an inherited backend argv, mirroring the
+/// titles the backend picker passes to addTabWithCommand: pwsh /
+/// powershell → "PowerShell", cmd → "cmd", wsl with an explicit
+/// -d/--distribution → the distro name. Anything else (including a
+/// bare wsl.exe) returns null, leaving the default title until the
+/// shell's OSC title arrives. The distro case returns a slice into
+/// `argv`; addTabWithCommand copies the title before returning.
+fn titleForCommand(argv: []const []const u8) ?[]const u8 {
+    if (argv.len == 0) return null;
+    var exe = std.fs.path.basename(argv[0]);
+    if (std.ascii.endsWithIgnoreCase(exe, ".exe")) exe = exe[0 .. exe.len - 4];
+    if (std.ascii.eqlIgnoreCase(exe, "pwsh") or
+        std.ascii.eqlIgnoreCase(exe, "powershell")) return "PowerShell";
+    if (std.ascii.eqlIgnoreCase(exe, "cmd")) return "cmd";
+    if (std.ascii.eqlIgnoreCase(exe, "wsl")) {
+        var i: usize = 1;
+        while (i + 1 < argv.len) : (i += 1) {
+            if (std.mem.eql(u8, argv[i], "-d") or
+                std.mem.eql(u8, argv[i], "--distribution")) return argv[i + 1];
+        }
+    }
+    return null;
+}
+
 /// Like addTab, but optionally overrides the command the new tab runs
 /// (the new-session backend picker) and its initial title. The argv
 /// and title are copied as needed, so the caller's memory may be freed
@@ -2349,9 +2395,10 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
         return;
     }
 
-    // Check new-tab button.
+    // Check new-tab button. Plain "+" inherits the active pane's
+    // backend; the "▾" picker beside it is the explicit override.
     if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
-        _ = self.addTab() catch |err| {
+        _ = self.addTabInherit() catch |err| {
             log.err("failed to create new tab: {}", .{err});
             return;
         };
@@ -2379,6 +2426,37 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
             }
             return;
         }
+    }
+}
+
+/// Handle a middle-button click in the tab bar region: close the
+/// clicked tab (the browser / Windows Terminal convention), through
+/// the same closeTabByIndex path as the tab's close 'x'. The "+"
+/// button, its "▾" segment, and the empty strip are no-ops. Fires on
+/// the button-down press, matching how handleTabBarClick fires the
+/// close 'x' on WM_LBUTTONDOWN.
+fn handleTabBarMiddleClick(self: *Window, x: i16, y: i16) void {
+    if (!self.tab_bar_visible) return;
+    if (y >= self.tabBarHeight()) return;
+    for (0..self.activeWorkspace().tab_count) |i| {
+        const rect = self.tab_rects[i];
+        if (x >= rect.left and x < rect.right) {
+            self.closeTabByIndex(i);
+            return;
+        }
+    }
+}
+
+/// Handle a middle-button click in the sidebar region: close the
+/// clicked workspace row through the same closeWorkspace path as the
+/// row's close 'x' (the 'x' band is part of the row, so it closes
+/// too). Every other target — "+ New workspace", its "▾" segment, the
+/// notification panel, and the footer icons — is a no-op.
+fn handleSidebarMiddleClick(self: *Window, x: i32, y: i32) void {
+    if (self.closing) return;
+    switch (self.sidebarHitTest(x, y)) {
+        .workspace, .row_close => |i| self.closeWorkspace(i),
+        else => {},
     }
 }
 
@@ -2627,7 +2705,9 @@ fn showTabContextMenu(self: *Window, clicked_tab: ?usize, x: i32, y: i32) void {
             }
         },
         TAB_CTX_NEW_TAB => {
-            _ = self.addTab() catch |err| {
+            // Plain New Tab inherits the active pane's backend, same
+            // as the tab bar "+" button.
+            _ = self.addTabInherit() catch |err| {
                 log.err("failed to create new tab: {}", .{err});
             };
         },
@@ -3600,6 +3680,26 @@ pub fn windowWndProc(
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
+        w32.WM_MBUTTONDOWN => {
+            // Middle-click closes the clicked tab / workspace row
+            // (browser convention). Only the window's own chrome is
+            // routed: middle clicks over the terminal go to the
+            // surface child HWND's wndproc (paste / mouse reporting)
+            // and never arrive here; anything else (split dividers,
+            // sidebar edge) falls through untouched. The closing
+            // guard above already drops this message during teardown.
+            const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+            const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            if (x < window.sidebarWidth()) {
+                window.handleSidebarMiddleClick(x, y);
+                return 0;
+            }
+            if (y < window.tabBarHeight()) {
+                window.handleTabBarMiddleClick(@truncate(x), @truncate(y));
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_MOUSEMOVE => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
@@ -4143,4 +4243,37 @@ test "unit: default-shell distro ids at the reserved cap boundary" {
         @as(?[]const u8, null),
         defaultShellValue(DEFAULT_SHELL_DISTRO_CAP, &distros, &buf),
     );
+}
+
+test "unit: inherit title maps the picker backends" {
+    try testing.expectEqualStrings("PowerShell", titleForCommand(&.{"pwsh.exe"}).?);
+    try testing.expectEqualStrings("PowerShell", titleForCommand(&.{"powershell.exe"}).?);
+    try testing.expectEqualStrings("cmd", titleForCommand(&.{"cmd.exe"}).?);
+    // The exact argv the backend picker stores for a distro tab.
+    try testing.expectEqualStrings(
+        "Ubuntu-24.04",
+        titleForCommand(&.{ "wsl.exe", "--cd", "~", "-d", "Ubuntu-24.04" }).?,
+    );
+}
+
+test "unit: inherit title handles paths, case, and missing extension" {
+    try testing.expectEqualStrings(
+        "PowerShell",
+        titleForCommand(&.{"C:\\Program Files\\PowerShell\\7\\pwsh.exe"}).?,
+    );
+    try testing.expectEqualStrings("cmd", titleForCommand(&.{"CMD.EXE"}).?);
+    try testing.expectEqualStrings("Debian", titleForCommand(&.{ "wsl", "-d", "Debian" }).?);
+    try testing.expectEqualStrings(
+        "Debian",
+        titleForCommand(&.{ "wsl.exe", "--distribution", "Debian" }).?,
+    );
+}
+
+test "unit: inherit title unknown or degenerate argv keeps the default" {
+    try testing.expectEqual(@as(?[]const u8, null), titleForCommand(&.{}));
+    try testing.expectEqual(@as(?[]const u8, null), titleForCommand(&.{"nu.exe"}));
+    // wsl without an explicit distro: nothing to derive a name from.
+    try testing.expectEqual(@as(?[]const u8, null), titleForCommand(&.{"wsl.exe"}));
+    // Trailing -d with no value must not read past the argv.
+    try testing.expectEqual(@as(?[]const u8, null), titleForCommand(&.{ "wsl.exe", "-d" }));
 }

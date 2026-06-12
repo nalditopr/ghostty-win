@@ -847,11 +847,13 @@ pub fn performAction(
 
         .new_tab => {
             // Add a new tab to the parent window of the focused surface.
+            // Inherits the active pane's backend (keybind, command
+            // palette, and surface context menu all land here).
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
                     const parent = core_surface.rt_surface.parent_window;
-                    _ = parent.addTab() catch |err| {
+                    _ = parent.addTabInherit() catch |err| {
                         log.err("failed to add new tab err={}", .{err});
                     };
                 },
