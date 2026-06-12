@@ -18,6 +18,7 @@ const NOTIF_HEADER_BASE: i32 = 24;
 const NOTIF_ENTRY_BASE: i32 = 40;
 const NOTIF_CLEAR_W_BASE: i32 = 48;
 const BADGE_BASE: i32 = 14;
+const DROPDOWN_BASE: i32 = 24;
 
 /// Sidebar width clamp bounds in unscaled pixels, applied to both the
 /// `window-sidebar-width` config value and the drag-resize override.
@@ -29,6 +30,9 @@ pub const HitTarget = union(enum) {
     none,
     item: usize,
     new_session,
+    /// The dropdown chevron zone at the right edge of the
+    /// "+ New session" row (opens the backend picker).
+    new_session_dropdown,
     bell_icon,
     gear_icon,
     browser_icon,
@@ -161,7 +165,14 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
 
     const row: usize = @intCast(@divTrunc(y, ctx.item_h));
     if (row < ctx.tab_count) return .{ .item = row };
-    if (row == ctx.tab_count) return .new_session;
+    if (row == ctx.tab_count) {
+        // Dropdown chevron: like the footer slots, the zone spans the
+        // full row height for a forgiving click; only x decides.
+        const pad = scaled(PAD_BASE, ctx.scale);
+        const dd = scaled(DROPDOWN_BASE, ctx.scale);
+        if (x >= ctx.width - pad - dd and x < ctx.width - pad) return .new_session_dropdown;
+        return .new_session;
+    }
     return .none;
 }
 
@@ -169,6 +180,18 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
 pub fn itemRect(index: usize, width: i32, item_h: i32) w32.RECT {
     const top = @as(i32, @intCast(index)) * item_h;
     return .{ .left = 0, .top = top, .right = width, .bottom = top + item_h };
+}
+
+/// Painted rect of the "+ New session" dropdown chevron: a square,
+/// vertically centered in the row and right-aligned to the text pad.
+/// Ending at width-pad keeps it left of the drag-resize edge band
+/// (pad >= band width at any scale), which is hit-tested first.
+pub fn newSessionDropdownRect(tab_count: usize, width: i32, item_h: i32, scale: f32) w32.RECT {
+    const pad = scaled(PAD_BASE, scale);
+    const dd = scaled(DROPDOWN_BASE, scale);
+    const row = itemRect(tab_count, width, item_h);
+    const top = row.top + @divTrunc(item_h - dd, 2);
+    return .{ .left = width - pad - dd, .top = top, .right = width - pad, .bottom = top + dd };
 }
 
 /// Paint the full sidebar strip using double-buffered GDI painting.
@@ -354,12 +377,14 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             }
         }
 
+        const dd_rect = newSessionDropdownRect(win.tab_count, sidebar_w, item_h, win.scale);
+
         _ = w32.SetTextColor(mem_dc, inactive_text_color);
         const label = std.unicode.utf8ToUtf16LeStringLiteral("+ New session");
         var text_rect = w32.RECT{
             .left = accent_w + pad,
             .top = row.top,
-            .right = sidebar_w - pad,
+            .right = dd_rect.left,
             .bottom = row.bottom,
         };
         _ = w32.DrawTextW(
@@ -368,6 +393,27 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             label.len,
             &text_rect,
             w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+        );
+
+        // Dropdown chevron: hover-highlighted square, independent of
+        // the row-body hover above.
+        const dd_hot = win.sidebar_hover == .new_session_dropdown;
+        if (dd_hot) {
+            var dd_fill = dd_rect;
+            if (w32.CreateSolidBrush(hover_color)) |brush| {
+                _ = w32.FillRect(mem_dc, &dd_fill, brush);
+                _ = w32.DeleteObject(@ptrCast(brush));
+            }
+        }
+        _ = w32.SetTextColor(mem_dc, if (dd_hot) active_text_color else inactive_text_color);
+        const chevron = std.unicode.utf8ToUtf16LeStringLiteral("\u{25BE}");
+        var chevron_rect = dd_rect;
+        _ = w32.DrawTextW(
+            mem_dc,
+            chevron,
+            chevron.len,
+            &chevron_rect,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
     }
 
@@ -546,7 +592,7 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         );
 
         // Unread badge: amber square at the bell's top-right corner.
-        const unread = win.app.notif_unread;
+        const unread = win.app.notif_log.unread;
         if (unread > 0) {
             const badge = scaled(BADGE_BASE, win.scale);
             var badge_rect = w32.RECT{
@@ -636,6 +682,72 @@ test "sidebar hitTest: new session row directly below sessions" {
     const ctx = testCtx(3, false, 0);
     try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, 3 * 36, ctx));
     try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, 4 * 36 - 1, ctx));
+}
+
+test "sidebar hitTest: new session dropdown chevron band" {
+    // Chevron: x in [width-pad-dd, width-pad) = [188, 212) at the test
+    // geometry; the rest of the row is the body, including the strip
+    // right of the chevron.
+    const ctx = testCtx(3, false, 0);
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(187, 3 * 36, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(188, 3 * 36, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(211, 4 * 36 - 1, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(212, 3 * 36, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(219, 3 * 36, ctx));
+}
+
+test "sidebar hitTest: dropdown band only exists on the new session row" {
+    const ctx = testCtx(3, false, 0);
+    // The same x on a session row is still that item.
+    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(200, 0, ctx));
+    // And below the new-session row it stays none.
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(200, 4 * 36, ctx));
+}
+
+test "sidebar hitTest: zero tabs dropdown on row 0" {
+    const ctx = testCtx(0, false, 0);
+    try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(200, 0, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(100, 0, ctx));
+}
+
+test "sidebar newSessionDropdownRect: square right-aligned and centered in the row" {
+    // Row 3 spans y [108,144); a 24px square centered there is
+    // y [114,138), right-aligned to the text pad at x [188,212).
+    const r = newSessionDropdownRect(3, 220, 36, 1.0);
+    try testing.expectEqual(@as(i32, 188), r.left);
+    try testing.expectEqual(@as(i32, 212), r.right);
+    try testing.expectEqual(@as(i32, 114), r.top);
+    try testing.expectEqual(@as(i32, 138), r.bottom);
+}
+
+test "sidebar newSessionDropdownRect: scales with DPI and agrees with hitTest" {
+    // At 2.0 scale, width 440: pad=16, dd=48 — chevron x in [376, 424).
+    const ctx: HitCtx = .{
+        .item_h = 72,
+        .tab_count = 2,
+        .client_h = 800,
+        .width = 440,
+        .scale = 2.0,
+        .panel_open = false,
+        .notif_count = 0,
+    };
+    const r = newSessionDropdownRect(2, 440, 72, 2.0);
+    try testing.expectEqual(@as(i32, 376), r.left);
+    try testing.expectEqual(@as(i32, 424), r.right);
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(375, 2 * 72, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(376, 2 * 72, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(423, 3 * 72 - 1, ctx));
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(424, 2 * 72, ctx));
+}
+
+test "sidebar dropdown chevron clears the resize edge band" {
+    // WM_LBUTTONDOWN tests the edge band before the sidebar, so the
+    // chevron must end at or left of the band at any scale.
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 1.75, 2.0 };
+    for (scales) |s| {
+        const r = newSessionDropdownRect(0, 300, itemHeight(s), s);
+        try testing.expect(r.right <= 300 - edgeBandWidth(s));
+    }
 }
 
 test "sidebar hitTest: below the new session row is none" {

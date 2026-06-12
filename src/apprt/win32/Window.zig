@@ -31,6 +31,10 @@ app: *App,
 hwnd: ?w32.HWND = null,
 
 /// Tab split trees owned by this window (fixed-capacity inline array).
+/// First of the parallel per-tab arrays (trees, active pane, titles,
+/// title lengths, status) indexed by tab position: every per-tab array
+/// MUST be listed in tabArrays() so the shared insert/remove/move/swap
+/// helpers keep them aligned at all mutation sites.
 tab_count: usize = 0,
 tab_trees: [64]SplitTree(Pane) = undefined,
 
@@ -55,6 +59,10 @@ tab_rects: [64]w32.RECT = std.mem.zeroes([64]w32.RECT),
 /// Hit-test rectangle for the "+" (new tab) button.
 new_tab_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
+/// Hit-test rectangle for the "▾" (backend picker) segment beside the
+/// new-tab button.
+new_tab_dropdown_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
 /// Index of the tab currently being hovered (-1 = none).
 hover_tab: isize = -1,
 
@@ -63,6 +71,9 @@ hover_close: bool = false,
 
 /// Whether the "+" (new tab) button is being hovered.
 hover_new_tab: bool = false,
+
+/// Whether the "▾" (backend picker) segment is being hovered.
+hover_new_tab_dropdown: bool = false,
 
 /// Tab drag state: which tab is being dragged (-1 = none).
 drag_tab: isize = -1,
@@ -399,6 +410,70 @@ fn findHandle(self: *Window, tab_idx: usize, pane: *Pane) ?SplitTree(Pane).Node.
     return null;
 }
 
+/// The parallel per-tab arrays as a tuple of array pointers. EVERY
+/// per-tab array must be listed here: the mutation sites
+/// (addTabWithCommand/addBrowserTab insert, closeTabByIndex remove,
+/// moveTabTo reorder, moveTab swap) all operate on this tuple via the
+/// tabArrays* helpers below, so an array missing from this list
+/// silently desynchronizes from tab indices.
+fn tabArrays(self: *Window) struct {
+    *[MAX_TABS]SplitTree(Pane),
+    *[MAX_TABS]*Pane,
+    *[MAX_TABS][256]u16,
+    *[MAX_TABS]u16,
+    *[MAX_TABS]TabStatus,
+} {
+    return .{
+        &self.tab_trees,
+        &self.tab_active_pane,
+        &self.tab_titles,
+        &self.tab_title_lens,
+        &self.tab_status,
+    };
+}
+
+/// Shift entries [pos, count) right by one in every array of the
+/// tuple, opening a gap at pos. The caller fills the gap and bumps its
+/// count.
+fn tabArraysInsertGap(arrays: anytype, count: usize, pos: usize) void {
+    inline for (arrays) |arr| {
+        var i: usize = count;
+        while (i > pos) : (i -= 1) arr[i] = arr[i - 1];
+    }
+}
+
+/// Shift entries (idx, count) left by one in every array, overwriting
+/// idx. The caller decrements its count (and clears the now-duplicate
+/// last slot where stale pointers matter, e.g. tab_trees).
+fn tabArraysRemove(arrays: anytype, count: usize, idx: usize) void {
+    inline for (arrays) |arr| {
+        var i: usize = idx;
+        while (i + 1 < count) : (i += 1) arr[i] = arr[i + 1];
+    }
+}
+
+/// Move the entry at `from` to `to` in every array, shifting the
+/// entries between them one slot toward `from`.
+fn tabArraysMove(arrays: anytype, from: usize, to: usize) void {
+    inline for (arrays) |arr| {
+        const saved = arr[from];
+        var i: usize = from;
+        if (from < to) {
+            while (i < to) : (i += 1) arr[i] = arr[i + 1];
+        } else {
+            while (i > to) : (i -= 1) arr[i] = arr[i - 1];
+        }
+        arr[to] = saved;
+    }
+}
+
+/// Swap entries a and b in every array.
+fn tabArraysSwap(arrays: anytype, a: usize, b: usize) void {
+    inline for (arrays) |arr| {
+        std.mem.swap(@TypeOf(arr[a]), &arr[a], &arr[b]);
+    }
+}
+
 /// Add a new tab surface to this window. The surface is created,
 /// initialized, and inserted at the position dictated by config.
 pub fn addTab(self: *Window) !*Surface {
@@ -444,14 +519,7 @@ pub fn addTabWithCommand(
     };
 
     // Shift elements right to make room at pos.
-    var i: usize = self.tab_count;
-    while (i > pos) : (i -= 1) {
-        self.tab_trees[i] = self.tab_trees[i - 1];
-        self.tab_active_pane[i] = self.tab_active_pane[i - 1];
-        self.tab_titles[i] = self.tab_titles[i - 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i - 1];
-        self.tab_status[i] = self.tab_status[i - 1];
-    }
+    tabArraysInsertGap(self.tabArrays(), self.tab_count, pos);
     self.tab_trees[pos] = tree;
     self.tab_active_pane[pos] = pane;
     self.tab_status[pos] = .normal;
@@ -495,6 +563,85 @@ pub fn addTabWithCommand(
     return surface;
 }
 
+/// Add a browser (WebView2) pane as a new tab. Mirrors
+/// addTabWithCommand's tab-array bookkeeping with a BrowserPane leaf
+/// instead of a terminal surface; the title is "Browser" until the
+/// first DocumentTitleChanged. Closing it never prompts (no core
+/// surface, so no running-process check applies).
+pub fn addBrowserTab(self: *Window) !void {
+    if (self.closing) return error.WindowClosing;
+    // Quick terminals are transient single-surface popups with no tab
+    // bar or sidebar; no UI path offers them a browser tab, but guard
+    // anyway so a future caller can't create unreachable chrome.
+    if (self.is_quick_terminal) return error.QuickTerminal;
+    if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
+    self.cancelTabRename();
+
+    const alloc = self.app.core_app.alloc;
+
+    // Build the single-pane tree. The errdefers only cover the gap
+    // until the tree takes ownership via ref() (same shape as
+    // newBrowserSplit); past the block the insertion below cannot
+    // fail, so the tree is never deinit'd after tab_trees holds it.
+    var browser: *BrowserPane = undefined;
+    var browser_pane: *Pane = undefined;
+    const tree = blk: {
+        const b = try BrowserPane.create(alloc, self.app, self);
+        errdefer b.destroy(alloc);
+        const new_pane = try Pane.createBrowser(alloc, b);
+        errdefer alloc.destroy(new_pane);
+        const t = try SplitTree(Pane).init(alloc, new_pane);
+        browser = b;
+        browser_pane = new_pane;
+        break :blk t;
+    };
+
+    // Determine insert position based on config.
+    const pos: usize = switch (self.app.config.@"window-new-tab-position") {
+        .current => if (self.tab_count > 0) self.active_tab + 1 else 0,
+        .end => self.tab_count,
+    };
+
+    // Shift elements right to make room at pos.
+    tabArraysInsertGap(self.tabArrays(), self.tab_count, pos);
+    self.tab_trees[pos] = tree;
+    self.tab_active_pane[pos] = browser_pane;
+    self.tab_status[pos] = .normal;
+    self.tab_count += 1;
+
+    const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Browser");
+    @memcpy(self.tab_titles[pos][0..default_title.len], default_title);
+    self.tab_title_lens[pos] = @intCast(default_title.len);
+
+    if (self.tab_count == 1) {
+        // First tab — not reachable from the current UI (the picker
+        // only exists on live windows, which always have >= 1 tab),
+        // but mirror addTabWithCommand for robustness.
+        if (self.hwnd) |h| {
+            _ = w32.ShowWindow(h, w32.SW_SHOW);
+            _ = w32.UpdateWindow(h);
+        }
+        self.active_tab = pos;
+        self.updateWindowTitle();
+        self.layoutSplits();
+    } else {
+        self.selectTabIndex(pos);
+    }
+    self.updateTabBarVisibility();
+    self.invalidateSidebar();
+
+    // Begin async WebView2 creation now that the tree owns the pane
+    // (the in-flight race guard refs it).
+    browser.startCreation();
+
+    // Focus the address bar so the user can type a URL immediately.
+    if (browser.address_edit) |edit| {
+        _ = w32.SetFocus(edit);
+    } else {
+        browser_pane.focus();
+    }
+}
+
 /// Close a tab by pane pointer. Removes from the tab list,
 /// deinits the tree, and adjusts the active tab index.
 pub fn closeTab(self: *Window, pane: *Pane) void {
@@ -515,14 +662,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     // must never observe the dying tab. The local copy stays valid:
     // SplitTree is a value whose deinit frees the shared heap data.
     var tree = self.tab_trees[idx];
-    var i: usize = idx;
-    while (i + 1 < self.tab_count) : (i += 1) {
-        self.tab_trees[i] = self.tab_trees[i + 1];
-        self.tab_active_pane[i] = self.tab_active_pane[i + 1];
-        self.tab_titles[i] = self.tab_titles[i + 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i + 1];
-        self.tab_status[i] = self.tab_status[i + 1];
-    }
+    tabArraysRemove(self.tabArrays(), self.tab_count, idx);
     self.tab_count -= 1;
     // The shift leaves a duplicate of the last tree past the new
     // count; clear it so nothing can ever walk stale node pointers.
@@ -904,24 +1044,36 @@ fn endSidebarDrag(self: *Window) void {
     _ = w32.ReleaseCapture();
 }
 
-/// Create a new split in the active tab.
+/// Create a new split in the active tab. Splits inherit the source
+/// pane's backend (Windows Terminal semantics): a split off a WSL or
+/// PowerShell tab opens the same shell. Browser panes have no terminal
+/// surface, so a split off one falls back to the configured default.
 pub fn newSplit(self: *Window, direction: SplitTree(Pane).Split.Direction) !void {
+    if (self.tab_count == 0) return;
+    // Surface.init deep copies the argv, so borrowing the source
+    // surface's copy is fine.
+    const command: ?[]const []const u8 = if (self.tab_active_pane[self.active_tab].surface()) |src|
+        src.spawn_command
+    else
+        null;
+    return self.newSplitWithCommand(direction, command);
+}
+
+/// Like newSplit, but with an explicit command override (the backend
+/// picker) instead of inheriting the source pane's backend. Null runs
+/// the configured default. The argv is copied by Surface.init, so the
+/// caller's memory may be freed once this returns.
+pub fn newSplitWithCommand(
+    self: *Window,
+    direction: SplitTree(Pane).Split.Direction,
+    command: ?[]const []const u8,
+) !void {
     if (self.tab_count == 0) return;
     const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
 
     const active_pane = self.tab_active_pane[tab];
     const handle = self.findHandle(tab, active_pane) orelse return;
-
-    // Splits inherit the source pane's backend (Windows Terminal
-    // semantics): a split off a WSL or PowerShell tab opens the same
-    // shell. Browser panes have no terminal surface, so a split off
-    // one falls back to the configured default. Surface.init deep
-    // copies the argv, so borrowing the source surface's copy is fine.
-    const command: ?[]const []const u8 = if (active_pane.surface()) |src|
-        src.spawn_command
-    else
-        null;
 
     // Create new surface.
     const new_surface = try alloc.create(Surface);
@@ -1160,11 +1312,7 @@ pub fn moveTab(self: *Window, amount: isize) void {
     if (new_index == self.active_tab) return;
 
     // Swap all tab state between active_tab and new_index.
-    std.mem.swap(SplitTree(Pane), &self.tab_trees[self.active_tab], &self.tab_trees[new_index]);
-    std.mem.swap(*Pane, &self.tab_active_pane[self.active_tab], &self.tab_active_pane[new_index]);
-    std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
-    std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
-    std.mem.swap(TabStatus, &self.tab_status[self.active_tab], &self.tab_status[new_index]);
+    tabArraysSwap(self.tabArrays(), self.active_tab, new_index);
     self.active_tab = new_index;
     self.invalidateTabBar();
     self.invalidateSidebar();
@@ -1198,19 +1346,24 @@ pub fn onPaneTitleChanged(self: *Window, pane: *Pane, title: [:0]const u8) void 
     // UTF-16 units (browser titles are website-controlled; OSC titles
     // up to 511 bytes). One UTF-8 byte produces at most one UTF-16
     // unit, so capping the input at 255 bytes makes the worst case
-    // fit. Back up to a UTF-8 sequence boundary so the truncation
-    // doesn't invalidate the whole string.
-    var tlen: usize = @min(title.len, 255);
-    if (tlen < title.len) {
-        while (tlen > 0 and (title[tlen] & 0xC0) == 0x80) tlen -= 1;
-    }
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title[0..tlen]) catch 0;
+    // fit.
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, capUtf8(title, 255)) catch 0;
     const len: u16 = @intCast(@min(wlen, 255));
     @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
     self.tab_title_lens[tab_idx] = len;
     if (tab_idx == self.active_tab) self.updateWindowTitle();
     self.invalidateTabBar();
     self.invalidateSidebar();
+}
+
+/// Cap a UTF-8 string at `max_bytes`, backing up to a sequence
+/// boundary so the cut doesn't strand a partial multi-byte sequence
+/// (which would invalidate the whole string and drop the title).
+fn capUtf8(title: []const u8, max_bytes: usize) []const u8 {
+    if (title.len <= max_bytes) return title;
+    var len = max_bytes;
+    while (len > 0 and (title[len] & 0xC0) == 0x80) len -= 1;
+    return title[0..len];
 }
 
 /// Set the sidebar status indicator for the tab containing a surface.
@@ -1352,12 +1505,13 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
 
     // --- Calculate tab geometry ---
     const new_tab_btn_w: i32 = @intFromFloat(@round(36.0 * self.scale));
+    const dropdown_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
     const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
     const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
     const accent_h: i32 = @intFromFloat(@round(2.0 * self.scale));
 
     const tab_count_i32: i32 = @intCast(self.tab_count);
-    const available_w = client_w - new_tab_btn_w;
+    const available_w = client_w - new_tab_btn_w - dropdown_btn_w;
 
     // Calculate each tab's width: proportional, min 60px.
     const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
@@ -1506,6 +1660,40 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         );
     }
 
+    // --- Draw backend picker (▾) segment beside the new-tab button ---
+    {
+        const dd_left = self.new_tab_rect.right;
+        self.new_tab_dropdown_rect = w32.RECT{
+            .left = dd_left,
+            .top = 0,
+            .right = dd_left + dropdown_btn_w,
+            .bottom = bar_h,
+        };
+
+        // Hover highlight, independent of the "+" half.
+        if (self.hover_new_tab_dropdown) {
+            var dd_rect = self.new_tab_dropdown_rect;
+            if (w32.CreateSolidBrush(hover_color)) |brush| {
+                _ = w32.FillRect(mem_dc, &dd_rect, brush);
+                _ = w32.DeleteObject(@ptrCast(brush));
+            }
+        }
+
+        _ = w32.SetTextColor(mem_dc, if (self.hover_new_tab_dropdown)
+            active_text_color
+        else
+            inactive_text_color);
+        const chevron_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{25BE}");
+        var chevron_rect = self.new_tab_dropdown_rect;
+        _ = w32.DrawTextW(
+            mem_dc,
+            chevron_char,
+            1,
+            &chevron_rect,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+        );
+    }
+
     // --- BitBlt to screen ---
     _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
 }
@@ -1573,6 +1761,13 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
     if (!self.tab_bar_visible) return;
     if (y >= self.tabBarHeight()) return;
 
+    // Check the "▾" backend picker segment beside the new-tab button;
+    // anchor the picker under the split button, not at the click.
+    if (x >= self.new_tab_dropdown_rect.left and x < self.new_tab_dropdown_rect.right) {
+        self.showBackendMenu(self.new_tab_rect.left, self.tabBarHeight(), .new_tab);
+        return;
+    }
+
     // Check new-tab button.
     if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
         _ = self.addTab() catch |err| {
@@ -1615,41 +1810,9 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     // would otherwise point at the wrong tab after the move.
     self.cancelTabRename();
 
-    // Save the source tab state
-    const saved_tree = self.tab_trees[from];
-    const saved_pane = self.tab_active_pane[from];
-    const saved_title = self.tab_titles[from];
-    const saved_title_len = self.tab_title_lens[from];
-    const saved_status = self.tab_status[from];
-
-    if (from < to) {
-        // Shift left: move [from+1..to+1] to [from..to]
-        var i: usize = from;
-        while (i < to) : (i += 1) {
-            self.tab_trees[i] = self.tab_trees[i + 1];
-            self.tab_active_pane[i] = self.tab_active_pane[i + 1];
-            self.tab_titles[i] = self.tab_titles[i + 1];
-            self.tab_title_lens[i] = self.tab_title_lens[i + 1];
-            self.tab_status[i] = self.tab_status[i + 1];
-        }
-    } else {
-        // Shift right: move [to..from] to [to+1..from+1]
-        var i: usize = from;
-        while (i > to) : (i -= 1) {
-            self.tab_trees[i] = self.tab_trees[i - 1];
-            self.tab_active_pane[i] = self.tab_active_pane[i - 1];
-            self.tab_titles[i] = self.tab_titles[i - 1];
-            self.tab_title_lens[i] = self.tab_title_lens[i - 1];
-            self.tab_status[i] = self.tab_status[i - 1];
-        }
-    }
-
-    // Place the saved tab at the destination
-    self.tab_trees[to] = saved_tree;
-    self.tab_active_pane[to] = saved_pane;
-    self.tab_titles[to] = saved_title;
-    self.tab_title_lens[to] = saved_title_len;
-    self.tab_status[to] = saved_status;
+    // Lift the source tab out, shift the tabs between, drop it at the
+    // destination.
+    tabArraysMove(self.tabArrays(), from, to);
 
     self.active_tab = to;
     self.invalidateTabBar();
@@ -1676,11 +1839,14 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
     var new_hover: isize = -1;
     var new_close = false;
     var new_new_tab = false;
+    var new_dropdown = false;
 
     if (y < self.tabBarHeight()) {
-        // Check new-tab button.
+        // Check new-tab button and the "▾" segment beside it.
         if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
             new_new_tab = true;
+        } else if (x >= self.new_tab_dropdown_rect.left and x < self.new_tab_dropdown_rect.right) {
+            new_dropdown = true;
         } else {
             // Check tabs.
             const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
@@ -1697,10 +1863,13 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         }
     }
 
-    if (new_hover != self.hover_tab or new_close != self.hover_close or new_new_tab != self.hover_new_tab) {
+    if (new_hover != self.hover_tab or new_close != self.hover_close or
+        new_new_tab != self.hover_new_tab or new_dropdown != self.hover_new_tab_dropdown)
+    {
         self.hover_tab = new_hover;
         self.hover_close = new_close;
         self.hover_new_tab = new_new_tab;
+        self.hover_new_tab_dropdown = new_dropdown;
         self.invalidateTabBar();
     }
 }
@@ -1716,13 +1885,58 @@ const GEAR_CTX_OPEN_CONFIG: usize = 9201;
 const GEAR_CTX_OPEN_FOLDER: usize = 9202;
 const GEAR_CTX_RELOAD: usize = 9203;
 
-// New-session backend picker command IDs (right-click on the sidebar
-// "+ New session" row or the tab bar "+" button). Installed WSL distros
-// are appended at NEW_SESSION_DISTRO_BASE + index.
+// Backend picker command IDs (right-click on the sidebar "+ New
+// session" row or the tab bar "+" button opens it targeting a new
+// tab; the surface context menu's "Split ... With..." entries open it
+// targeting a split). Installed WSL distros are appended at
+// NEW_SESSION_DISTRO_BASE + index; the Browser entry at 9320 caps the
+// distro list so a pathological install count can't collide with it.
 const NEW_SESSION_DEFAULT: usize = 9300;
 const NEW_SESSION_PWSH: usize = 9301;
 const NEW_SESSION_CMD: usize = 9302;
 const NEW_SESSION_DISTRO_BASE: usize = 9310;
+const NEW_SESSION_BROWSER: usize = 9320;
+
+/// What a backend-picker menu ID resolves to. Pure mapping from the
+/// TrackPopupMenu result (0 = dismissed) and the number of distro
+/// entries that were appended; gaps in the ID space and distro IDs at
+/// or past the count resolve to .none.
+const PickerSelection = union(enum) {
+    none,
+    default,
+    pwsh,
+    cmd,
+    distro: usize,
+    browser,
+};
+
+fn pickerSelection(cmd_id: usize, distro_count: usize) PickerSelection {
+    switch (cmd_id) {
+        NEW_SESSION_DEFAULT => return .default,
+        NEW_SESSION_PWSH => return .pwsh,
+        NEW_SESSION_CMD => return .cmd,
+        NEW_SESSION_BROWSER => return .browser,
+        else => {},
+    }
+    if (cmd_id < NEW_SESSION_DISTRO_BASE) return .none;
+    const idx = cmd_id - NEW_SESSION_DISTRO_BASE;
+    if (idx >= distro_count) return .none;
+    return .{ .distro = idx };
+}
+
+/// Menu label for a WSL distro row: the name, with " (default)"
+/// appended for the distro wsl.exe launches without -d. Allocated;
+/// caller frees.
+fn distroMenuLabel(
+    alloc: Allocator,
+    name: []const u8,
+    is_default: bool,
+) Allocator.Error![]const u8 {
+    return if (is_default)
+        std.fmt.allocPrint(alloc, "{s} (default)", .{name})
+    else
+        alloc.dupe(u8, name);
+}
 
 /// Handle a right-button click in the tab bar region.
 /// Shows a context menu for the clicked tab.
@@ -1730,10 +1944,12 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
     if (!self.tab_bar_visible) return;
     if (y >= self.tabBarHeight()) return;
 
-    // Right-click on the "+" button opens the new-session backend
-    // picker instead of the tab context menu.
-    if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
-        self.showNewSessionMenu(x, y);
+    // Right-click on the "+" button or its "▾" segment opens the
+    // new-session backend picker instead of the tab context menu.
+    if ((x >= self.new_tab_rect.left and x < self.new_tab_rect.right) or
+        (x >= self.new_tab_dropdown_rect.left and x < self.new_tab_dropdown_rect.right))
+    {
+        self.showBackendMenu(x, y, .new_tab);
         return;
     }
 
@@ -1816,10 +2032,11 @@ fn showTabContextMenu(self: *Window, clicked_tab: ?usize, x: i32, y: i32) void {
 /// Handle WM_MOUSELEAVE: reset all hover state and repaint.
 fn handleTabBarMouseLeave(self: *Window) void {
     self.tracking_mouse = false;
-    if (self.hover_tab != -1 or self.hover_new_tab) {
+    if (self.hover_tab != -1 or self.hover_new_tab or self.hover_new_tab_dropdown) {
         self.hover_tab = -1;
         self.hover_close = false;
         self.hover_new_tab = false;
+        self.hover_new_tab_dropdown = false;
         self.invalidateTabBar();
     }
 }
@@ -1854,6 +2071,16 @@ fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
                 return;
             };
         },
+        .new_session_dropdown => {
+            // Anchor the picker under the row (Windows Terminal
+            // dropdown feel) rather than at the click point.
+            const row = Sidebar.itemRect(
+                self.tab_count,
+                self.sidebarWidth(),
+                Sidebar.itemHeight(self.scale),
+            );
+            self.showBackendMenu(row.left, row.bottom, .new_tab);
+        },
         .bell_icon => {
             self.notif_panel_open = !self.notif_panel_open;
             self.app.markNotifsRead();
@@ -1886,8 +2113,8 @@ fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
             self.showGearContextMenu(x, y);
             return;
         },
-        .new_session => {
-            self.showNewSessionMenu(x, y);
+        .new_session, .new_session_dropdown => {
+            self.showBackendMenu(x, y, .new_tab);
             return;
         },
         else => null,
@@ -1909,11 +2136,23 @@ fn havePwsh() bool {
     return n > 0 and n < buf.len;
 }
 
-/// Show the new-session backend picker at client coordinates (x, y):
-/// "Default" / "PowerShell" / "Command Prompt" plus each installed WSL
-/// distribution (Windows Terminal style). The selection opens a new tab
-/// running that backend, titled after it.
-fn showNewSessionMenu(self: *Window, x: i32, y: i32) void {
+/// Where a backend picked from showBackendMenu opens: a new tab, or a
+/// split off the active pane in the given direction.
+pub const BackendTarget = union(enum) {
+    new_tab,
+    split: SplitTree(Pane).Split.Direction,
+};
+
+/// Show the backend picker at client coordinates (x, y): "Default" /
+/// "PowerShell" / "Command Prompt", each installed WSL distribution
+/// (Windows Terminal style), and "Browser" (a WebView2 pane). The
+/// selection opens as a new tab or as a split per `target`; tabs are
+/// titled after the picked backend.
+pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) void {
+    // Quick terminals exclude picker-created tabs/splits entirely.
+    // They have no tab bar or sidebar, so the only QT-reachable call
+    // site is the surface "Split ... With..." menu (grayed there too).
+    if (self.closing or self.is_quick_terminal) return;
     const alloc = self.app.core_app.alloc;
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
@@ -1924,20 +2163,20 @@ fn showNewSessionMenu(self: *Window, x: i32, y: i32) void {
 
     // Enumerate installed distros at menu-open (a cheap registry read)
     // so new installs show up without restarting. Freed after the menu
-    // closes; selections copy what they need.
-    const distros: []internal_os.wsl.Distro = internal_os.wsl.list(alloc) catch &.{};
-    defer internal_os.wsl.free(alloc, distros);
+    // closes; selections copy what they need. Capped to the ID space
+    // below NEW_SESSION_BROWSER.
+    const all_distros: []internal_os.wsl.Distro = internal_os.wsl.list(alloc) catch &.{};
+    defer internal_os.wsl.free(alloc, all_distros);
+    const distros = all_distros[0..@min(
+        all_distros.len,
+        NEW_SESSION_BROWSER - NEW_SESSION_DISTRO_BASE,
+    )];
 
     if (distros.len > 0) {
         _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
         for (distros, 0..) |distro, i| {
-            // Label: "Name" or "Name (default)" for the distro wsl.exe
-            // launches without -d.
-            const label = if (distro.is_default)
-                std.fmt.allocPrint(alloc, "{s} (default)", .{distro.name}) catch continue
-            else
-                distro.name;
-            defer if (distro.is_default) alloc.free(label);
+            const label = distroMenuLabel(alloc, distro.name, distro.is_default) catch continue;
+            defer alloc.free(label);
 
             const label_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, label) catch continue;
             defer alloc.free(label_w);
@@ -1949,6 +2188,9 @@ fn showNewSessionMenu(self: *Window, x: i32, y: i32) void {
             );
         }
     }
+
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, NEW_SESSION_BROWSER, std.unicode.utf8ToUtf16LeStringLiteral("Browser"));
 
     // Convert client coords to screen coords for the popup.
     var pt = w32.POINT{ .x = x, .y = y };
@@ -1966,36 +2208,48 @@ fn showNewSessionMenu(self: *Window, x: i32, y: i32) void {
     // The modal menu loop dispatches arbitrary messages; re-check
     // before acting.
     if (self.closing) return;
-    const cmd_id: usize = @intCast(cmd);
-    switch (cmd_id) {
-        NEW_SESSION_DEFAULT => {
-            _ = self.addTab() catch |err| {
-                log.err("failed to create new tab: {}", .{err});
-            };
+
+    // Resolve the picked backend to an argv (null = the configured
+    // default — explicit for splits, which otherwise inherit the
+    // source pane's backend) and a tab title. Browser is a pane kind,
+    // not a command: dispatch it directly.
+    const Backend = struct {
+        argv: ?[]const []const u8,
+        title: ?[]const u8,
+    };
+    var distro_argv: [5][]const u8 = undefined;
+    const backend: Backend = switch (pickerSelection(@intCast(cmd), distros.len)) {
+        .none => return,
+        .browser => {
+            switch (target) {
+                .new_tab => self.addBrowserTab() catch |err| {
+                    log.err("failed to create browser tab: {}", .{err});
+                },
+                .split => |dir| self.newBrowserSplit(dir) catch |err| {
+                    log.err("failed to open browser split: {}", .{err});
+                },
+            }
+            return;
         },
-        NEW_SESSION_PWSH => {
-            const argv: []const []const u8 = if (havePwsh())
-                &.{"pwsh.exe"}
-            else
-                &.{"powershell.exe"};
-            _ = self.addTabWithCommand(argv, "PowerShell") catch |err| {
-                log.err("failed to create PowerShell tab: {}", .{err});
-            };
+        .default => .{ .argv = null, .title = null },
+        .pwsh => .{
+            .argv = if (havePwsh()) &.{"pwsh.exe"} else &.{"powershell.exe"},
+            .title = "PowerShell",
         },
-        NEW_SESSION_CMD => {
-            _ = self.addTabWithCommand(&.{"cmd.exe"}, "cmd") catch |err| {
-                log.err("failed to create cmd tab: {}", .{err});
-            };
-        },
-        else => {
-            if (cmd_id < NEW_SESSION_DISTRO_BASE) return;
-            const idx = cmd_id - NEW_SESSION_DISTRO_BASE;
-            if (idx >= distros.len) return;
+        .cmd => .{ .argv = &.{"cmd.exe"}, .title = "cmd" },
+        .distro => |idx| blk: {
             const distro = distros[idx];
-            const argv = [_][]const u8{ "wsl.exe", "--cd", "~", "-d", distro.name };
-            _ = self.addTabWithCommand(&argv, distro.name) catch |err| {
-                log.err("failed to create WSL tab for {s}: {}", .{ distro.name, err });
-            };
+            distro_argv = .{ "wsl.exe", "--cd", "~", "-d", distro.name };
+            break :blk .{ .argv = &distro_argv, .title = distro.name };
+        },
+    };
+
+    switch (target) {
+        .new_tab => _ = self.addTabWithCommand(backend.argv, backend.title) catch |err| {
+            log.err("failed to create new tab: {}", .{err});
+        },
+        .split => |dir| self.newSplitWithCommand(dir, backend.argv) catch |err| {
+            log.err("failed to create split: {}", .{err});
         },
     }
 }
@@ -2586,5 +2840,205 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "unit: window title cap ascii passes through" {
+    try testing.expectEqualStrings("hello", capUtf8("hello", 255));
+}
+
+test "unit: window title cap exact boundary is unchanged" {
+    try testing.expectEqualStrings("abcd", capUtf8("abcd", 4));
+}
+
+test "unit: window title cap truncates past the boundary" {
+    try testing.expectEqualStrings("abc", capUtf8("abcdef", 3));
+}
+
+test "unit: window title cap backs up over a split multi-byte sequence" {
+    // "aé" = 61 C3 A9; a cap of 2 lands inside é.
+    try testing.expectEqualStrings("a", capUtf8("a\xC3\xA9", 2));
+    // 4-byte emoji (U+1F600 = F0 9F 98 80) split at every interior byte.
+    const emoji = "ab\xF0\x9F\x98\x80";
+    try testing.expectEqualStrings("ab", capUtf8(emoji, 3));
+    try testing.expectEqualStrings("ab", capUtf8(emoji, 4));
+    try testing.expectEqualStrings("ab", capUtf8(emoji, 5));
+}
+
+test "unit: window title cap at a sequence boundary keeps the sequence" {
+    try testing.expectEqualStrings("a\xC3\xA9", capUtf8("a\xC3\xA9b", 3));
+}
+
+test "unit: window title cap empty and degenerate inputs" {
+    try testing.expectEqualStrings("", capUtf8("", 255));
+    try testing.expectEqualStrings("", capUtf8("abc", 0));
+    // All continuation bytes (malformed input): backs up to empty
+    // rather than returning a partial sequence.
+    try testing.expectEqualStrings("", capUtf8("\x80\x80\x80", 2));
+}
+
+test "unit: tab arrays insert gap at the end moves nothing" {
+    var ids = [_]u8{ 1, 2, 3, 0xAA };
+    var lens = [_]u16{ 10, 20, 30, 0xBBBB };
+    tabArraysInsertGap(.{ &ids, &lens }, 3, 3);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0xAA }, &ids);
+    try testing.expectEqualSlices(u16, &.{ 10, 20, 30, 0xBBBB }, &lens);
+}
+
+test "unit: tab arrays insert gap in the middle shifts the tail right" {
+    var ids = [_]u8{ 1, 2, 3, 0 };
+    var lens = [_]u16{ 10, 20, 30, 0 };
+    tabArraysInsertGap(.{ &ids, &lens }, 3, 1);
+    // The gap at 1 still holds its old value (the caller overwrites
+    // it); entries 2..3 are the old 1..2.
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 2, 3 }, &ids);
+    try testing.expectEqualSlices(u16, &.{ 10, 20, 20, 30 }, &lens);
+}
+
+test "unit: tab arrays remove at both edges" {
+    const Status = enum { normal, bell };
+    // Right edge: pure count decrement, no movement.
+    {
+        var ids = [_]u8{ 1, 2, 3 };
+        var status = [_]Status{ .normal, .bell, .bell };
+        tabArraysRemove(.{ &ids, &status }, 3, 2);
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, &ids);
+        try testing.expectEqualSlices(Status, &.{ .normal, .bell, .bell }, &status);
+    }
+    // Left edge: everything shifts down one (the last slot keeps a
+    // duplicate the caller clears where stale pointers matter).
+    {
+        var ids = [_]u8{ 1, 2, 3 };
+        var status = [_]Status{ .bell, .normal, .bell };
+        tabArraysRemove(.{ &ids, &status }, 3, 0);
+        try testing.expectEqualSlices(u8, &.{ 2, 3, 3 }, &ids);
+        try testing.expectEqualSlices(Status, &.{ .normal, .bell, .bell }, &status);
+    }
+}
+
+test "unit: tab arrays move right, left, and adjacent" {
+    {
+        var ids = [_]u8{ 1, 2, 3, 4 };
+        tabArraysMove(.{&ids}, 0, 3);
+        try testing.expectEqualSlices(u8, &.{ 2, 3, 4, 1 }, &ids);
+    }
+    {
+        var ids = [_]u8{ 1, 2, 3, 4 };
+        tabArraysMove(.{&ids}, 3, 0);
+        try testing.expectEqualSlices(u8, &.{ 4, 1, 2, 3 }, &ids);
+    }
+    {
+        var ids = [_]u8{ 1, 2, 3, 4 };
+        tabArraysMove(.{&ids}, 1, 2);
+        try testing.expectEqualSlices(u8, &.{ 1, 3, 2, 4 }, &ids);
+    }
+}
+
+test "unit: tab arrays swap" {
+    var ids = [_]u8{ 1, 2, 3 };
+    var lens = [_]u16{ 10, 20, 30 };
+    tabArraysSwap(.{ &ids, &lens }, 0, 2);
+    try testing.expectEqualSlices(u8, &.{ 3, 2, 1 }, &ids);
+    try testing.expectEqualSlices(u16, &.{ 30, 20, 10 }, &lens);
+}
+
+test "unit: tab arrays stay aligned across a mutation sequence" {
+    // The real invariant: entry i of every parallel array must describe
+    // the same logical tab after any mix of operations. Tab n carries
+    // id n and "title" n+100.
+    var ids: [5]u8 = undefined;
+    var titles: [5]u8 = undefined;
+    var count: usize = 0;
+    const arrays = .{ &ids, &titles };
+
+    // Insert 1 then 2 at the end, then 3 in the middle: order 1,3,2.
+    tabArraysInsertGap(arrays, count, 0);
+    ids[0] = 1;
+    titles[0] = 101;
+    count += 1;
+    tabArraysInsertGap(arrays, count, 1);
+    ids[1] = 2;
+    titles[1] = 102;
+    count += 1;
+    tabArraysInsertGap(arrays, count, 1);
+    ids[1] = 3;
+    titles[1] = 103;
+    count += 1;
+
+    tabArraysMove(arrays, 0, 2); // 3,2,1
+    tabArraysSwap(arrays, 0, 1); // 2,3,1
+    tabArraysRemove(arrays, count, 1); // 2,1
+    count -= 1;
+
+    try testing.expectEqualSlices(u8, &.{ 2, 1 }, ids[0..count]);
+    for (ids[0..count], titles[0..count]) |id, title| {
+        try testing.expectEqual(id + 100, title);
+    }
+}
+
+test "unit: picker selection maps the fixed entries" {
+    try testing.expectEqual(PickerSelection.default, pickerSelection(NEW_SESSION_DEFAULT, 0));
+    try testing.expectEqual(PickerSelection.pwsh, pickerSelection(NEW_SESSION_PWSH, 0));
+    try testing.expectEqual(PickerSelection.cmd, pickerSelection(NEW_SESSION_CMD, 0));
+    try testing.expectEqual(PickerSelection.browser, pickerSelection(NEW_SESSION_BROWSER, 0));
+}
+
+test "unit: picker selection maps distro ids by index" {
+    try testing.expectEqual(PickerSelection{ .distro = 0 }, pickerSelection(NEW_SESSION_DISTRO_BASE, 3));
+    try testing.expectEqual(PickerSelection{ .distro = 2 }, pickerSelection(NEW_SESSION_DISTRO_BASE + 2, 3));
+    // At or past the appended count: stale or foreign ID, no action.
+    try testing.expectEqual(PickerSelection.none, pickerSelection(NEW_SESSION_DISTRO_BASE + 3, 3));
+}
+
+test "unit: picker selection ignores dismissal and unknown ids" {
+    // TrackPopupMenu returns 0 when the menu is dismissed.
+    try testing.expectEqual(PickerSelection.none, pickerSelection(0, 5));
+    // Gaps in the ID space around the distro range.
+    try testing.expectEqual(PickerSelection.none, pickerSelection(NEW_SESSION_CMD + 1, 5));
+    try testing.expectEqual(PickerSelection.none, pickerSelection(NEW_SESSION_DISTRO_BASE - 1, 5));
+    // The Surface "Split ... With..." IDs (9321/9322) live above the
+    // browser entry and must not resolve here.
+    try testing.expectEqual(PickerSelection.none, pickerSelection(NEW_SESSION_BROWSER + 1, 5));
+}
+
+test "unit: picker browser id can never be claimed by a distro" {
+    // The call site caps the distro list below NEW_SESSION_BROWSER;
+    // even an uncapped count must resolve 9320 to browser, with the
+    // last representable distro index directly below it.
+    try testing.expectEqual(PickerSelection.browser, pickerSelection(NEW_SESSION_BROWSER, 64));
+    const cap = NEW_SESSION_BROWSER - NEW_SESSION_DISTRO_BASE;
+    try testing.expectEqual(
+        PickerSelection{ .distro = cap - 1 },
+        pickerSelection(NEW_SESSION_BROWSER - 1, cap),
+    );
+}
+
+test "unit: picker menu ids match the reserved registry" {
+    // 9300-9302 shells, 9310-9319 distros, 9320 browser (see the menu
+    // ID comment block); a change here collides with other menus.
+    try testing.expectEqual(@as(usize, 9300), NEW_SESSION_DEFAULT);
+    try testing.expectEqual(@as(usize, 9301), NEW_SESSION_PWSH);
+    try testing.expectEqual(@as(usize, 9302), NEW_SESSION_CMD);
+    try testing.expectEqual(@as(usize, 9310), NEW_SESSION_DISTRO_BASE);
+    try testing.expectEqual(@as(usize, 9320), NEW_SESSION_BROWSER);
+}
+
+test "unit: distro menu label formats the default marker" {
+    const alloc = testing.allocator;
+    {
+        const label = try distroMenuLabel(alloc, "Ubuntu-24.04", false);
+        defer alloc.free(label);
+        try testing.expectEqualStrings("Ubuntu-24.04", label);
+    }
+    {
+        const label = try distroMenuLabel(alloc, "Ubuntu-24.04", true);
+        defer alloc.free(label);
+        try testing.expectEqualStrings("Ubuntu-24.04 (default)", label);
     }
 }

@@ -102,16 +102,10 @@ desktop_notifs: [NOTIF_DESKTOP_SLOTS]?DesktopNotif = @splat(null),
 desktop_notif_next: usize = 0,
 
 /// Ring buffer of recent notifications listed in the sidebar's
-/// notifications panel, newest at notif_log_next-1. Slots are nulled
-/// when their window is destroyed or the log is cleared.
-notif_log: [NOTIF_LOG_CAP]?NotifEntry = @splat(null),
-
-/// Next notification log ring slot to overwrite.
-notif_log_next: usize = 0,
-
-/// Notifications pushed since the last markNotifsRead(). Drawn as the
-/// badge on the sidebar footer's bell icon.
-notif_unread: usize = 0,
+/// notifications panel (newest first). Slots are nulled when their
+/// window is destroyed or the log is cleared; the unread counter is
+/// drawn as the badge on the sidebar footer's bell icon.
+notif_log: NotifRing(NotifEntry, NOTIF_LOG_CAP) = .{},
 
 /// Shared WebView2 environment singleton. Created lazily by the first
 /// browser pane; all panes get controllers from the same environment.
@@ -1662,6 +1656,71 @@ pub const NotifEntry = struct {
     body_len: usize,
 };
 
+/// Fixed-capacity ring of optional entries with newest-first display
+/// indexing and an unread counter. Pure accounting (no Win32) so the
+/// wrap/hole/unread rules are unit-testable; callers handle repaints.
+pub fn NotifRing(comptime Entry: type, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+
+        /// Slots, written round-robin at `next`. Holes (nulled slots)
+        /// are skipped by count/at so display indices stay contiguous.
+        slots: [cap]?Entry = @splat(null),
+
+        /// Next slot to overwrite.
+        next: usize = 0,
+
+        /// Entries pushed since the last markRead. Counts pushes, not
+        /// live slots, so it can exceed `cap` (the sidebar badge
+        /// saturates its display at "9+" regardless).
+        unread: usize = 0,
+
+        pub fn push(self: *Self, entry: Entry) void {
+            self.slots[self.next] = entry;
+            self.next = (self.next + 1) % cap;
+            self.unread += 1;
+        }
+
+        /// Reset the unread counter. Returns true when it was nonzero
+        /// (the caller repaints only then).
+        pub fn markRead(self: *Self) bool {
+            if (self.unread == 0) return false;
+            self.unread = 0;
+            return true;
+        }
+
+        /// Drop every entry and the unread counter.
+        pub fn clear(self: *Self) void {
+            self.slots = @splat(null);
+            self.next = 0;
+            self.unread = 0;
+        }
+
+        /// Number of live entries.
+        pub fn count(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.slots) |slot| {
+                if (slot != null) n += 1;
+            }
+            return n;
+        }
+
+        /// The display_idx-th newest live entry (0 = newest), or null
+        /// past the end.
+        pub fn at(self: *const Self, display_idx: usize) ?*const Entry {
+            var seen: usize = 0;
+            for (0..cap) |offset| {
+                const idx = (self.next + cap - 1 - offset) % cap;
+                if (self.slots[idx]) |*entry| {
+                    if (seen == display_idx) return entry;
+                    seen += 1;
+                }
+            }
+            return null;
+        }
+    };
+}
+
 /// Minimum interval between update checks, in seconds. The check
 /// timestamp is persisted in %LOCALAPPDATA%/ghostty/update_check_at.
 const UPDATE_CHECK_INTERVAL_SECS: i64 = 60 * 60; // 1 hour
@@ -2039,34 +2098,25 @@ pub fn pushNotif(
     };
     @memcpy(entry.title[0..entry.title_len], title[0..entry.title_len]);
     @memcpy(entry.body[0..entry.body_len], body[0..entry.body_len]);
-    self.notif_log[self.notif_log_next] = entry;
-    self.notif_log_next = (self.notif_log_next + 1) % NOTIF_LOG_CAP;
-    self.notif_unread += 1;
+    self.notif_log.push(entry);
     for (self.windows.items) |w| w.invalidateSidebar();
 }
 
 /// Reset the unread badge (the sidebar bell was clicked).
 pub fn markNotifsRead(self: *App) void {
-    if (self.notif_unread == 0) return;
-    self.notif_unread = 0;
+    if (!self.notif_log.markRead()) return;
     for (self.windows.items) |w| w.invalidateSidebar();
 }
 
 /// Drop every notification log entry and the unread badge.
 pub fn clearNotifs(self: *App) void {
-    self.notif_log = @splat(null);
-    self.notif_log_next = 0;
-    self.notif_unread = 0;
+    self.notif_log.clear();
     for (self.windows.items) |w| w.invalidateSidebar();
 }
 
 /// Number of live entries in the notification log.
 pub fn notifCount(self: *const App) usize {
-    var n: usize = 0;
-    for (self.notif_log) |slot| {
-        if (slot != null) n += 1;
-    }
-    return n;
+    return self.notif_log.count();
 }
 
 /// The display_idx-th newest live notification (0 = newest), or null
@@ -2074,15 +2124,7 @@ pub fn notifCount(self: *const App) usize {
 /// contiguous; paint and hit-test resolve entries through this same
 /// mapping.
 pub fn notifAt(self: *const App, display_idx: usize) ?*const NotifEntry {
-    var seen: usize = 0;
-    for (0..NOTIF_LOG_CAP) |offset| {
-        const idx = (self.notif_log_next + NOTIF_LOG_CAP - 1 - offset) % NOTIF_LOG_CAP;
-        if (self.notif_log[idx]) |*entry| {
-            if (seen == display_idx) return entry;
-            seen += 1;
-        }
-    }
-    return null;
+    return self.notif_log.at(display_idx);
 }
 
 /// Remove a desktop notification's tray icon, kill its cleanup timer,
@@ -2111,7 +2153,7 @@ pub fn dropDesktopNotifsForWindow(self: *App, window: *Window) void {
     }
     // Same invalidation for the sidebar notification log. Slots are
     // nulled in place (not compacted) — notifAt skips holes.
-    for (&self.notif_log) |*slot| {
+    for (&self.notif_log.slots) |*slot| {
         if (slot.*) |*entry| {
             if (entry.window == window) slot.* = null;
         }
@@ -2709,4 +2751,80 @@ fn msgWndProc(
     }
 
     return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "unit: notif ring push and newest-first indexing" {
+    var ring: NotifRing(u32, 4) = .{};
+    try testing.expectEqual(@as(usize, 0), ring.count());
+    try testing.expectEqual(@as(?*const u32, null), ring.at(0));
+
+    ring.push(1);
+    ring.push(2);
+    ring.push(3);
+    try testing.expectEqual(@as(usize, 3), ring.count());
+    try testing.expectEqual(@as(u32, 3), ring.at(0).?.*);
+    try testing.expectEqual(@as(u32, 2), ring.at(1).?.*);
+    try testing.expectEqual(@as(u32, 1), ring.at(2).?.*);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(3));
+}
+
+test "unit: notif ring wraps at capacity dropping the oldest" {
+    // The real log capacity: 70 pushes into 64 slots leave 7..70 live.
+    var ring: NotifRing(u32, NOTIF_LOG_CAP) = .{};
+    var i: u32 = 1;
+    while (i <= 70) : (i += 1) ring.push(i);
+    try testing.expectEqual(@as(usize, 64), ring.count());
+    try testing.expectEqual(@as(u32, 70), ring.at(0).?.*);
+    try testing.expectEqual(@as(u32, 7), ring.at(63).?.*);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(64));
+    // Unread counts pushes, not live slots: it may exceed the capacity
+    // (the sidebar badge saturates its display at "9+" regardless).
+    try testing.expectEqual(@as(usize, 70), ring.unread);
+}
+
+test "unit: notif ring unread and markRead" {
+    var ring: NotifRing(u32, 4) = .{};
+    try testing.expect(!ring.markRead());
+    ring.push(1);
+    ring.push(2);
+    try testing.expectEqual(@as(usize, 2), ring.unread);
+    try testing.expect(ring.markRead());
+    try testing.expectEqual(@as(usize, 0), ring.unread);
+    try testing.expect(!ring.markRead());
+    // Entries survive a read; only the badge resets.
+    try testing.expectEqual(@as(usize, 2), ring.count());
+}
+
+test "unit: notif ring clear drops entries and unread" {
+    var ring: NotifRing(u32, 4) = .{};
+    ring.push(1);
+    ring.push(2);
+    ring.clear();
+    try testing.expectEqual(@as(usize, 0), ring.count());
+    try testing.expectEqual(@as(usize, 0), ring.unread);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(0));
+    // The ring is fully reusable after a clear.
+    ring.push(9);
+    try testing.expectEqual(@as(u32, 9), ring.at(0).?.*);
+    try testing.expectEqual(@as(usize, 1), ring.unread);
+}
+
+test "unit: notif ring skips holes keeping display indices contiguous" {
+    var ring: NotifRing(u32, 4) = .{};
+    ring.push(1);
+    ring.push(2);
+    ring.push(3);
+    // Null the middle entry in place (the window-destroyed
+    // invalidation in dropDesktopNotifsForWindow does this).
+    ring.slots[1] = null;
+    try testing.expectEqual(@as(usize, 2), ring.count());
+    try testing.expectEqual(@as(u32, 3), ring.at(0).?.*);
+    try testing.expectEqual(@as(u32, 1), ring.at(1).?.*);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(2));
 }

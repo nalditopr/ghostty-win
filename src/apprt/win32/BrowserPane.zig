@@ -375,19 +375,24 @@ fn onDocumentTitleChanged(self: *BrowserPane, sender: ?*wv2.ICoreWebView2, args:
     // in std 0.15), so cap the input before converting. One UTF-16
     // code unit expands to at most 3 UTF-8 bytes (surrogate pairs are
     // 2 units -> 4 bytes, which is smaller per unit).
-    var span: []const u16 = std.mem.span(title16);
-    const max_units = (self.title_buf.len - 1) / 3;
-    if (span.len > max_units) {
-        span = span[0..max_units];
-        // Don't cut a surrogate pair in half: a dangling high
-        // surrogate would make the whole conversion fail.
-        if (span.len > 0 and span[span.len - 1] >= 0xD800 and span[span.len - 1] <= 0xDBFF) {
-            span = span[0 .. span.len - 1];
-        }
-    }
+    const span = capUtf16(std.mem.span(title16), (self.title_buf.len - 1) / 3);
     const len = std.unicode.utf16LeToUtf8(self.title_buf[0 .. self.title_buf.len - 1], span) catch return;
     self.title_buf[len] = 0;
     self.parent_window.onPaneTitleChanged(pane, self.title_buf[0..len :0]);
+}
+
+/// Cap a UTF-16 string at `max_units` code units without splitting a
+/// surrogate pair: a dangling high surrogate at the cut would make
+/// the whole utf16LeToUtf8 conversion fail (and the title be dropped).
+fn capUtf16(span: []const u16, max_units: usize) []const u16 {
+    if (span.len <= max_units) return span;
+    var capped = span[0..max_units];
+    if (capped.len > 0 and
+        capped[capped.len - 1] >= 0xD800 and capped[capped.len - 1] <= 0xDBFF)
+    {
+        capped = capped[0 .. capped.len - 1];
+    }
+    return capped;
 }
 
 /// Navigate to the address bar's text. Prepends https:// when the
@@ -626,4 +631,57 @@ pub fn hostWndProc(
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "unit: browser title cap ascii passes through" {
+    const input = [_]u16{ 'h', 'e', 'l', 'l', 'o' };
+    try testing.expectEqualSlices(u16, &input, capUtf16(&input, 170));
+}
+
+test "unit: browser title cap exact boundary is unchanged" {
+    const input = [_]u16{ 'a', 'b', 'c', 'd' };
+    try testing.expectEqualSlices(u16, &input, capUtf16(&input, 4));
+}
+
+test "unit: browser title cap truncates past the boundary" {
+    const input = [_]u16{ 'a', 'b', 'c', 'd', 'e' };
+    try testing.expectEqualSlices(u16, &.{ 'a', 'b', 'c' }, capUtf16(&input, 3));
+}
+
+test "unit: browser title cap drops a surrogate pair split by the cut" {
+    // U+1F600 as the pair (0xD83D, 0xDE00) straddling max_units=4: the
+    // dangling high surrogate must go with it.
+    const input = [_]u16{ 'a', 'b', 'c', 0xD83D, 0xDE00 };
+    try testing.expectEqualSlices(u16, &.{ 'a', 'b', 'c' }, capUtf16(&input, 4));
+}
+
+test "unit: browser title cap keeps a surrogate pair ending at the cut" {
+    const input = [_]u16{ 'a', 'b', 0xD83D, 0xDE00, 'c' };
+    try testing.expectEqualSlices(u16, &.{ 'a', 'b', 0xD83D, 0xDE00 }, capUtf16(&input, 4));
+}
+
+test "unit: browser title cap empty and zero-unit inputs" {
+    try testing.expectEqualSlices(u16, &.{}, capUtf16(&.{}, 170));
+    const input = [_]u16{ 'a', 'b' };
+    try testing.expectEqualSlices(u16, &.{}, capUtf16(&input, 0));
+}
+
+test "unit: browser title cap worst-case expansion fits title_buf" {
+    // Mirror onDocumentTitleChanged's buffer math: a capped input must
+    // always convert into title_buf.len - 1 bytes, even when every code
+    // unit expands to 3 UTF-8 bytes (U+FFFF).
+    const buf_len = @typeInfo(@FieldType(BrowserPane, "title_buf")).array.len;
+    const max_units = (buf_len - 1) / 3;
+    var input: [max_units + 50]u16 = @splat(0xFFFF);
+    const capped = capUtf16(&input, max_units);
+    try testing.expectEqual(max_units, capped.len);
+    var buf: [buf_len]u8 = undefined;
+    const len = try std.unicode.utf16LeToUtf8(buf[0 .. buf_len - 1], capped);
+    try testing.expectEqual(max_units * 3, len);
 }

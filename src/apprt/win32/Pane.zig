@@ -50,41 +50,69 @@ pub fn ref(self: *Pane, alloc: Allocator) Allocator.Error!*Pane {
     return self;
 }
 
+/// What unref() must do after decrementing the count. Pure (decided by
+/// unrefAction) so the rules are unit-testable; the actions themselves
+/// are HWND/WebView2 calls.
+const UnrefAction = enum { keep, hide_zombie, destroy };
+
+/// The unref state machine. `remaining` is the post-decrement count.
+/// A browser pane can outlive its trees while async WebView2 creation
+/// holds an in-flight ref; if an unref took it out of every tab of its
+/// window (tab closed mid-creation), its host HWND must hide so the
+/// zombie can't keep painting, eating mouse input, or taking focus.
+/// Transient unrefs during tree rebuilds (split/resize/equalize) leave
+/// the pane findable in a tree and keep it untouched, as do all
+/// non-final unrefs of terminal panes.
+fn unrefAction(
+    remaining: u32,
+    kind: std.meta.Tag(Content),
+    in_a_tab: bool,
+) UnrefAction {
+    if (remaining == 0) return .destroy;
+    return switch (kind) {
+        .terminal => .keep,
+        .browser => if (in_a_tab) .keep else .hide_zombie,
+    };
+}
+
 /// SplitTree view protocol: decrement reference count. At zero the
 /// content is torn down and the pane itself is freed.
 pub fn unref(self: *Pane, alloc: Allocator) void {
     self.ref_count -= 1;
-    if (self.ref_count > 0) {
-        // A browser pane can outlive its trees while async WebView2
-        // creation holds an in-flight ref. If this unref took the pane
-        // out of every tab of its window (tab closed mid-creation),
-        // hide the host HWND immediately so the zombie can't keep
-        // painting, eating mouse input, or taking focus. Transient
-        // unrefs during tree rebuilds (split/resize/equalize) leave
-        // the pane findable in a tree and are not affected.
-        switch (self.content) {
-            .browser => |browser| {
-                if (browser.parent_window.findTabIndex(self) == null) {
-                    if (browser.host_hwnd) |h| {
-                        _ = w32.ShowWindow(h, w32.SW_HIDE);
-                    }
-                }
-            },
-            .terminal => {},
-        }
-        return;
-    }
-    switch (self.content) {
-        .terminal => |surface_ptr| {
-            if (surface_ptr.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
-            surface_ptr.deinit();
-            alloc.destroy(surface_ptr);
+    const action = switch (self.content) {
+        .terminal => unrefAction(self.ref_count, .terminal, true),
+        .browser => |browser| unrefAction(
+            self.ref_count,
+            .browser,
+            // Only consulted when refs remain (zero destroys either
+            // way); the short-circuit keeps findTabIndex out of the
+            // teardown path.
+            self.ref_count > 0 and
+                browser.parent_window.findTabIndex(self) != null,
+        ),
+    };
+    switch (action) {
+        .keep => {},
+        .hide_zombie => {
+            // unrefAction only returns this for browser content.
+            const browser = self.content.browser;
+            if (browser.host_hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
         },
-        // Closes the controller and destroys the host HWND before the
-        // parent Window teardown, mirroring the WGL ordering rule.
-        .browser => |browser| browser.destroy(alloc),
+        .destroy => {
+            switch (self.content) {
+                .terminal => |surface_ptr| {
+                    if (surface_ptr.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+                    surface_ptr.deinit();
+                    alloc.destroy(surface_ptr);
+                },
+                // Closes the controller and destroys the host HWND
+                // before the parent Window teardown, mirroring the WGL
+                // ordering rule.
+                .browser => |browser| browser.destroy(alloc),
+            }
+            alloc.destroy(self);
+        },
     }
-    alloc.destroy(self);
 }
 
 /// SplitTree view protocol: identity comparison.
@@ -111,4 +139,53 @@ pub fn surface(self: *const Pane) ?*Surface {
         .terminal => |surface_ptr| surface_ptr,
         .browser => null,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "unit: pane unref destroys at zero regardless of kind" {
+    try testing.expectEqual(UnrefAction.destroy, unrefAction(0, .terminal, true));
+    try testing.expectEqual(UnrefAction.destroy, unrefAction(0, .terminal, false));
+    try testing.expectEqual(UnrefAction.destroy, unrefAction(0, .browser, true));
+    try testing.expectEqual(UnrefAction.destroy, unrefAction(0, .browser, false));
+}
+
+test "unit: pane unref keeps live panes that are still owned" {
+    try testing.expectEqual(UnrefAction.keep, unrefAction(1, .terminal, true));
+    try testing.expectEqual(UnrefAction.keep, unrefAction(1, .browser, true));
+    try testing.expectEqual(UnrefAction.keep, unrefAction(3, .browser, true));
+}
+
+test "unit: pane unref hides only an orphaned browser" {
+    // The in-flight WebView2 creation ref outliving every tab is the
+    // zombie case; terminals never hide before destruction.
+    try testing.expectEqual(UnrefAction.hide_zombie, unrefAction(1, .browser, false));
+    try testing.expectEqual(UnrefAction.hide_zombie, unrefAction(2, .browser, false));
+    try testing.expectEqual(UnrefAction.keep, unrefAction(1, .terminal, false));
+}
+
+test "unit: pane ref counts up and returns self" {
+    // No test calls unref(): analyzing it pulls the entire content
+    // teardown graph (Surface.deinit -> renderer -> a comptime
+    // apprt.gtk reference) into the test build, which then collects
+    // gtk's refAllDecls test and fails on the absent GTK modules. The
+    // unref decision rules are covered through unrefAction above.
+    var pane: Pane = .{ .content = .{ .terminal = undefined } };
+    try testing.expectEqual(@as(u32, 0), pane.ref_count);
+    const p = try pane.ref(testing.allocator);
+    try testing.expectEqual(&pane, p);
+    try testing.expectEqual(@as(u32, 1), pane.ref_count);
+    _ = try pane.ref(testing.allocator);
+    try testing.expectEqual(@as(u32, 2), pane.ref_count);
+}
+
+test "unit: pane eql is identity" {
+    var a: Pane = .{ .content = .{ .terminal = undefined } };
+    var b: Pane = .{ .content = .{ .terminal = undefined } };
+    try testing.expect(a.eql(&a));
+    try testing.expect(!a.eql(&b));
 }

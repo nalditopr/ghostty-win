@@ -1806,13 +1806,19 @@ pub fn handleMouseButton(
 }
 
 // Terminal context menu command IDs (tab bar context menu uses 9001+).
+// 9107 (Open Browser Split) was retired in favor of the "Split ...
+// With..." backend picker entries below; Browser lives in that menu.
 const CTX_COPY: usize = 9101;
 const CTX_PASTE: usize = 9102;
 const CTX_SELECT_ALL: usize = 9103;
 const CTX_SPLIT_RIGHT: usize = 9104;
 const CTX_SPLIT_DOWN: usize = 9105;
 const CTX_NEW_TAB: usize = 9106;
-const CTX_BROWSER_SPLIT: usize = 9107;
+// "Split ... With..." open the window backend picker (whose own IDs
+// are 9300-9320) targeting a split; allocated past 9320 to keep the
+// documented 9320+ range contiguous.
+const CTX_SPLIT_RIGHT_WITH: usize = 9321;
+const CTX_SPLIT_DOWN_WITH: usize = 9322;
 
 /// Show the terminal context menu at the screen cursor and run the
 /// chosen command through the core binding-action path (the same
@@ -1832,10 +1838,13 @@ fn showContextMenu(self: *Surface) void {
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, L("Split Right"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, L("Split Down"));
+    // The backend picker refuses quick terminals (showBackendMenu's
+    // guard); gray its entries so that isn't a silent no-op.
+    const with_flags: u32 = if (self.parent_window.is_quick_terminal) w32.MF_GRAYED else w32.MF_STRING;
+    _ = w32.AppendMenuW(menu, with_flags, CTX_SPLIT_RIGHT_WITH, L("Split Right With..."));
+    _ = w32.AppendMenuW(menu, with_flags, CTX_SPLIT_DOWN_WITH, L("Split Down With..."));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_NEW_TAB, L("New Tab"));
-    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_BROWSER_SPLIT, L("Open Browser Split"));
 
     var pt: w32.POINT = undefined;
     if (w32.GetCursorPos_(&pt) == 0) return;
@@ -1853,15 +1862,21 @@ fn showContextMenu(self: *Surface) void {
     // closing (or the surface shutting down) while it was up.
     if (self.parent_window.closing or !self.core_surface_ready) return;
 
-    // Browser split is a window-level action with no core binding.
-    if (@as(usize, @intCast(cmd)) == CTX_BROWSER_SPLIT) {
-        self.parent_window.newBrowserSplit(.right) catch |err| {
-            log.err("failed to open browser split: {}", .{err});
-        };
+    // "Split ... With..." opens the backend picker as a follow-up
+    // menu at the same cursor position, targeting a split. The picker
+    // takes window client coordinates.
+    const cmd_id: usize = @intCast(cmd);
+    if (cmd_id == CTX_SPLIT_RIGHT_WITH or cmd_id == CTX_SPLIT_DOWN_WITH) {
+        const win = self.parent_window;
+        var client_pt = pt;
+        if (win.hwnd) |wh| _ = w32.ScreenToClient(wh, &client_pt);
+        win.showBackendMenu(client_pt.x, client_pt.y, .{
+            .split = if (cmd_id == CTX_SPLIT_RIGHT_WITH) .right else .down,
+        });
         return;
     }
 
-    const ba: input.Binding.Action = switch (@as(usize, @intCast(cmd))) {
+    const ba: input.Binding.Action = switch (cmd_id) {
         CTX_COPY => .{ .copy_to_clipboard = .mixed },
         CTX_PASTE => .paste_from_clipboard,
         CTX_SELECT_ALL => .select_all,
