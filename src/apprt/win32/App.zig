@@ -1103,6 +1103,7 @@ pub fn performAction(
         .cell_size,
         .progress_report,
         .readonly,
+        .selection_changed, // No accessibility consumer on Win32 yet
         // Platform-specific actions that don't apply on Windows:
         .secure_input, // macOS EnableSecureEventInput
         .undo, // macOS NSUndoManager
@@ -1378,7 +1379,7 @@ pub fn performAction(
             return true;
         },
 
-        // All 65 apprt actions are now handled above.
+        // All 66 apprt actions are now handled above.
     }
 }
 
