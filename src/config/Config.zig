@@ -2267,12 +2267,13 @@ keybind: Keybinds = .{},
 
 /// Whether to show a vertical session sidebar on the left side of the
 /// window (cmux-style). When enabled, the sidebar lists the tabs in the
-/// window and the top tab bar is hidden.
+/// window and the top tab bar is hidden. Defaults to enabled on Windows;
+/// set to `false` for a classic top tab bar.
 ///
 /// This configuration can be reloaded at runtime.
 ///
 /// Currently only supported on Windows (win32).
-@"window-show-sidebar": bool = false,
+@"window-show-sidebar": bool = true,
 
 /// The width of the session sidebar in pixels. This is the unscaled
 /// width; the actual width is scaled by the display's DPI. The value
