@@ -665,15 +665,15 @@ pub fn performAction(
                     // Mark the tab in the sidebar unless the bell rang
                     // in the active tab of the foreground window, where
                     // the user already sees it.
-                    const tab_idx = parent_window.findTabIndexOfSurface(rt_surface);
-                    const active = if (tab_idx) |idx|
-                        idx == parent_window.active_tab
+                    const loc = parent_window.findLocOfSurface(rt_surface);
+                    const active = if (loc) |l|
+                        l.ws == parent_window.activeWorkspace() and l.tab == l.ws.active_tab
                     else
                         false;
                     if (!active or !foreground) {
                         parent_window.setTabStatusForSurface(rt_surface, .bell);
-                        const title: []const u16 = if (tab_idx) |idx|
-                            parent_window.tab_titles[idx][0..parent_window.tab_title_lens[idx]]
+                        const title: []const u16 = if (loc) |l|
+                            l.ws.tab_titles[l.tab][0..l.ws.tab_title_lens[l.tab]]
                         else
                             std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
                         self.pushNotif(
@@ -971,8 +971,8 @@ pub fn performAction(
                     // active tab; the user may be looking elsewhere
                     // when the shell exits.
                     parent_window.setTabStatusForSurface(rt_surface, .exited);
-                    const title: []const u16 = if (parent_window.findTabIndexOfSurface(rt_surface)) |idx|
-                        parent_window.tab_titles[idx][0..parent_window.tab_title_lens[idx]]
+                    const title: []const u16 = if (parent_window.findLocOfSurface(rt_surface)) |l|
+                        l.ws.tab_titles[l.tab][0..l.ws.tab_title_lens[l.tab]]
                     else
                         std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
                     self.pushNotif(
@@ -1293,9 +1293,13 @@ pub fn performAction(
                         // ShowWindow(SW_RESTORE) brings back from minimize.
                         _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
                         _ = w32.SetForegroundWindow(hwnd);
-                        // Make sure the tab containing this surface is active.
-                        if (win.findTabIndexOfSurface(core_surface.rt_surface)) |idx| {
-                            if (idx != win.active_tab) win.selectTabIndex(idx);
+                        // Make sure the workspace AND tab containing this
+                        // surface are active: select the workspace first
+                        // (it re-lays out for the new tab count), then the
+                        // tab within it. Order matters.
+                        if (win.findLocOfSurface(core_surface.rt_surface)) |loc| {
+                            win.selectWorkspace(win.workspaceIndex(loc.ws));
+                            if (loc.tab != loc.ws.active_tab) win.selectTabIndex(loc.tab);
                         }
                         // Focus the surface's child HWND.
                         if (core_surface.rt_surface.hwnd) |sh| {
@@ -1372,9 +1376,8 @@ pub fn performAction(
                     // Both .tab and .surface trigger inline rename on the
                     // current tab. On Win32 there's no separate surface title
                     // UI — the tab title IS the surface identity.
-                    core_surface.rt_surface.parent_window.startTabRename(
-                        core_surface.rt_surface.parent_window.active_tab,
-                    );
+                    const pw = core_surface.rt_surface.parent_window;
+                    pw.startTabRename(pw.activeWorkspace().active_tab);
                 },
             }
             return true;
@@ -2237,7 +2240,7 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
         if (w == window) break w;
     } else return false;
     if (win.closing) return false;
-    const idx = win.findTabIndexOfSurface(surface) orelse return false;
+    const loc = win.findLocOfSurface(surface) orelse return false;
 
     const win_hwnd = win.hwnd orelse return false;
     _ = w32.ShowWindow(win_hwnd, w32.SW_RESTORE);
@@ -2246,7 +2249,10 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
     // process; a plain SetForegroundWindow would only flash the
     // taskbar button.
     forceForegroundWindow(win_hwnd);
-    if (idx != win.active_tab) win.selectTabIndex(idx);
+    // Select the workspace containing the surface first (re-lays out for
+    // its tab count), then the tab within it. Order matters.
+    win.selectWorkspace(win.workspaceIndex(loc.ws));
+    if (loc.tab != loc.ws.active_tab) win.selectTabIndex(loc.tab);
     if (surface.hwnd) |sh| _ = w32.SetFocus(sh);
     return true;
 }
@@ -2351,17 +2357,19 @@ fn ipcFindBrowser(self: *App, id: ?u32) ?*BrowserPane {
     var best: ?*BrowserPane = null;
     for (self.windows.items) |w| {
         if (w.closing) continue;
-        for (0..w.tab_count) |t| {
-            var it = w.tab_trees[t].iterator();
-            while (it.next()) |entry| {
-                const browser = switch (entry.view.content) {
-                    .browser => |b| b,
-                    .terminal => continue,
-                };
-                if (id) |want| {
-                    if (browser.ipc_id == want) return browser;
-                } else if (best == null or browser.ipc_id > best.?.ipc_id) {
-                    best = browser;
+        for (w.workspaces[0..w.workspace_count]) |*ws| {
+            for (0..ws.tab_count) |t| {
+                var it = ws.tab_trees[t].iterator();
+                while (it.next()) |entry| {
+                    const browser = switch (entry.view.content) {
+                        .browser => |b| b,
+                        .terminal => continue,
+                    };
+                    if (id) |want| {
+                        if (browser.ipc_id == want) return browser;
+                    } else if (best == null or browser.ipc_id > best.?.ipc_id) {
+                        best = browser;
+                    }
                 }
             }
         }
@@ -3060,8 +3068,8 @@ fn surfaceWndProc(
             const win = surface.parent_window;
             if (!win.closing) {
                 if (surface.pane) |pane| {
-                    if (win.findTabIndex(pane)) |idx| {
-                        win.tab_active_pane[idx] = pane;
+                    if (win.findLoc(pane)) |loc| {
+                        loc.ws.tab_active_pane[loc.tab] = pane;
                     }
                 }
             }

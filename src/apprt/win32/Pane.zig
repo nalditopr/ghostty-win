@@ -85,10 +85,10 @@ pub fn unref(self: *Pane, alloc: Allocator) void {
             self.ref_count,
             .browser,
             // Only consulted when refs remain (zero destroys either
-            // way); the short-circuit keeps findTabIndex out of the
+            // way); the short-circuit keeps findLoc out of the
             // teardown path.
             self.ref_count > 0 and
-                browser.parent_window.findTabIndex(self) != null,
+                browser.parent_window.findLoc(self) != null,
         ),
     };
     switch (action) {

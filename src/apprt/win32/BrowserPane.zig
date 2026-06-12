@@ -243,7 +243,7 @@ pub fn onEnvironment(self: *BrowserPane, env_opt: ?*wv2.ICoreWebView2Environment
     // of building a controller for a zombie host. parent_window is
     // valid whenever state != .closing (the host's WM_DESTROY flags
     // closing before the window can go away).
-    if (self.parent_window.findTabIndex(pane) == null) {
+    if (self.parent_window.findLoc(pane) == null) {
         pane.unref(alloc);
         return;
     }
@@ -302,7 +302,7 @@ fn onControllerCreated(
         controller.close() catch {};
         return;
     }
-    if (self.parent_window.findTabIndex(pane) == null) {
+    if (self.parent_window.findLoc(pane) == null) {
         // The tab closed while controller creation was in flight; the
         // host HWND survived (the in-flight ref kept the pane alive)
         // so state is still .creating. Don't wire up a zombie: shut
@@ -358,8 +358,8 @@ fn onGotFocus(self: *BrowserPane, sender: ?*wv2.ICoreWebView2Controller, args: ?
     // Only record the pane as active for the tab that actually owns
     // it; a stale focus event must never plant a dangling pointer in
     // another tab's slot.
-    const idx = win.findTabIndex(pane) orelse return;
-    win.tab_active_pane[idx] = pane;
+    const loc = win.findLoc(pane) orelse return;
+    loc.ws.tab_active_pane[loc.tab] = pane;
 }
 
 fn onNavigationCompleted(
@@ -1141,8 +1141,8 @@ pub fn hostWndProc(
                 // tab that owns this pane (a zombie host or a pane not
                 // yet in a tree must not be recorded anywhere).
                 if (self.pane) |pane| {
-                    if (win.findTabIndex(pane)) |idx| {
-                        win.tab_active_pane[idx] = pane;
+                    if (win.findLoc(pane)) |loc| {
+                        loc.ws.tab_active_pane[loc.tab] = pane;
                     }
                 }
             }

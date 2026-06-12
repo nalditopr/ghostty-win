@@ -1,7 +1,8 @@
-//! Session sidebar for the Win32 apprt. A vertical strip on the left
-//! edge of the window that lists each tab as a session row plus a
-//! "+ New session" row. Enabled via the `window-show-sidebar` config
-//! option, which replaces the top tab bar.
+//! Workspace sidebar for the Win32 apprt. A vertical strip on the left
+//! edge of the window that lists each workspace as a row plus a
+//! "+ New workspace" row. Enabled via the `window-show-sidebar` config
+//! option. The top tab bar (showing the active workspace's tabs)
+//! coexists with the sidebar, offset to its right.
 
 const std = @import("std");
 const w32 = @import("win32.zig");
@@ -30,9 +31,11 @@ pub const MAX_WIDTH: u32 = 400;
 /// Result of hit-testing a point against the sidebar.
 pub const HitTarget = union(enum) {
     none,
-    item: usize,
-    /// The close 'x' glyph at the right edge of session row `index`.
-    /// Hit-tested ahead of `.item` within the row; revealed on hover.
+    /// A workspace row body. The sidebar lists workspaces (one row each);
+    /// clicking switches to that workspace.
+    workspace: usize,
+    /// The close 'x' glyph at the right edge of workspace row `index`.
+    /// Hit-tested ahead of `.workspace` within the row; revealed on hover.
     row_close: usize,
     new_session,
     /// The dropdown chevron zone at the right edge of the
@@ -122,7 +125,8 @@ pub fn hitTestEdge(x: i32, edge: i32, band_w: i32) bool {
 /// fields are plain values so the function stays pure and testable.
 pub const HitCtx = struct {
     item_h: i32,
-    tab_count: usize,
+    /// Number of workspace rows (one per workspace in the window).
+    workspace_count: usize,
     /// Full client height (the footer is anchored to the bottom).
     client_h: i32,
     /// Sidebar width (the "Clear" button is right-aligned).
@@ -133,9 +137,9 @@ pub const HitCtx = struct {
     notif_count: usize,
 };
 
-/// Hit-test a point against the sidebar. Top-to-bottom: session rows
-/// (0..tab_count-1), the "+ New session" row, then — when open — the
-/// notifications panel (header with the Clear button, entry rows
+/// Hit-test a point against the sidebar. Top-to-bottom: workspace rows
+/// (0..workspace_count-1), the "+ New workspace" row, then — when open —
+/// the notifications panel (header with the Clear button, entry rows
 /// newest-first), and finally the footer strip (bell/gear icons). The
 /// row area ends at the panel top (footer top when closed); rows under
 /// the panel/footer are not hit.
@@ -176,7 +180,7 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
     }
 
     const row: usize = @intCast(@divTrunc(y, ctx.item_h));
-    if (row < ctx.tab_count) {
+    if (row < ctx.workspace_count) {
         // Close 'x' band: like the dropdown chevron, the zone spans the
         // full row height for a forgiving click; only x decides. It
         // takes priority over the row body. The band matches
@@ -184,9 +188,9 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
         const pad = scaled(PAD_BASE, ctx.scale);
         const cw = scaled(CLOSE_BASE, ctx.scale);
         if (x >= ctx.width - pad - cw and x < ctx.width - pad) return .{ .row_close = row };
-        return .{ .item = row };
+        return .{ .workspace = row };
     }
-    if (row == ctx.tab_count) {
+    if (row == ctx.workspace_count) {
         // Dropdown chevron: like the footer slots, the zone spans the
         // full row height for a forgiving click; only x decides.
         const pad = scaled(PAD_BASE, ctx.scale);
@@ -229,8 +233,8 @@ pub fn newSessionDropdownRect(tab_count: usize, width: i32, item_h: i32, scale: 
 }
 
 /// Paint the full sidebar strip using double-buffered GDI painting.
-/// Draws session rows (status dot, number, title) and the
-/// "+ New session" row. The caller owns BeginPaint/EndPaint.
+/// Draws workspace rows (status dot, number, name) and the
+/// "+ New workspace" row. The caller owns BeginPaint/EndPaint.
 pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     const hwnd = win.hwnd orelse return;
     const sidebar_w = win.sidebarWidth();
@@ -298,6 +302,9 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
 
     // --- Row geometry ---
+    // The sidebar lists WORKSPACES, one row each. The "+ New workspace"
+    // row sits directly below the last workspace row.
+    const ws_count = win.workspace_count;
     const item_h = itemHeight(win.scale);
     const pad = scaled(PAD_BASE, win.scale);
     const accent_w = scaled(ACCENT_W_BASE, win.scale);
@@ -313,10 +320,11 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     else
         footer_top;
 
-    // --- Draw each session row ---
-    for (0..win.tab_count) |i| {
+    // --- Draw each workspace row ---
+    for (0..ws_count) |i| {
+        const wsp = &win.workspaces[i];
         var row = itemRect(i, sidebar_w, item_h);
-        const is_active = (i == win.active_tab);
+        const is_active = (i == win.active_workspace);
         // The row reads as hovered when the cursor is over its body or
         // its close 'x'; the close glyph itself only appears in either
         // case (mirrors the tab bar revealing 'x' on hover).
@@ -325,7 +333,7 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             else => false,
         };
         const is_hovered = close_hovered or switch (win.sidebar_hover) {
-            .item => |h| h == i,
+            .workspace => |h| h == i,
             else => false,
         };
 
@@ -353,9 +361,10 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             }
         }
 
-        // Draw status dot.
-        if (win.tab_status[i] != .normal) {
-            _ = w32.SetTextColor(mem_dc, switch (win.tab_status[i]) {
+        // Draw status dot: the worst status across the workspace's tabs.
+        const status = wsp.aggregateStatus();
+        if (status != .normal) {
+            _ = w32.SetTextColor(mem_dc, switch (status) {
                 .bell => bell_color,
                 .exited => exited_color,
                 .normal => unreachable,
@@ -376,8 +385,9 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             );
         }
 
-        // Draw "N  title" where N is index+1 for the first nine rows
-        // (matches the default alt+1..8 goto_tab keybinds).
+        // Draw "N  name" where N is index+1 for the first nine rows
+        // (matches the default alt+1..8 goto keybinds). The label is the
+        // workspace name, falling back to "Workspace N" when unnamed.
         var text_buf: [260]u16 = undefined;
         var text_len: usize = 0;
         if (i < 9) {
@@ -386,9 +396,24 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             text_buf[2] = ' ';
             text_len = 3;
         }
-        const title_len: usize = win.tab_title_lens[i];
-        @memcpy(text_buf[text_len .. text_len + title_len], win.tab_titles[i][0..title_len]);
-        text_len += title_len;
+        if (wsp.name_len > 0) {
+            const name_len: usize = wsp.name_len;
+            @memcpy(text_buf[text_len .. text_len + name_len], wsp.name[0..name_len]);
+            text_len += name_len;
+        } else {
+            // Fallback label: "Workspace <n>" (1-based).
+            const fallback = std.unicode.utf8ToUtf16LeStringLiteral("Workspace ");
+            @memcpy(text_buf[text_len .. text_len + fallback.len], fallback);
+            text_len += fallback.len;
+            // Append the 1-based index. Workspaces cap at 16, so at most
+            // two digits.
+            var num_buf: [2]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i + 1}) catch num_buf[0..0];
+            for (num_str) |c| {
+                text_buf[text_len] = c;
+                text_len += 1;
+            }
+        }
 
         if (text_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
@@ -428,9 +453,9 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         }
     }
 
-    // --- Draw "+ New session" row ---
+    // --- Draw "+ New workspace" row ---
     {
-        var row = itemRect(win.tab_count, sidebar_w, item_h);
+        var row = itemRect(ws_count, sidebar_w, item_h);
         if (win.sidebar_hover == .new_session) {
             if (w32.CreateSolidBrush(hover_color)) |brush| {
                 _ = w32.FillRect(mem_dc, &row, brush);
@@ -438,10 +463,10 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             }
         }
 
-        const dd_rect = newSessionDropdownRect(win.tab_count, sidebar_w, item_h, win.scale);
+        const dd_rect = newSessionDropdownRect(ws_count, sidebar_w, item_h, win.scale);
 
         _ = w32.SetTextColor(mem_dc, inactive_text_color);
-        const label = std.unicode.utf8ToUtf16LeStringLiteral("+ New session");
+        const label = std.unicode.utf8ToUtf16LeStringLiteral("+ New workspace");
         var text_rect = w32.RECT{
             .left = accent_w + pad,
             .top = row.top,
@@ -715,10 +740,10 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
 /// (open), bell x in [8,32), gear x in [40,64), globe x in [72,96),
 /// panel header y in [208,232) with Clear at x>=172, entry rows 40px
 /// from y=232.
-fn testCtx(tab_count: usize, panel_open: bool, notif_count: usize) HitCtx {
+fn testCtx(ws_count: usize, panel_open: bool, notif_count: usize) HitCtx {
     return .{
         .item_h = 36,
-        .tab_count = tab_count,
+        .workspace_count = ws_count,
         .client_h = 400,
         .width = 220,
         .scale = 1.0,
@@ -727,16 +752,16 @@ fn testCtx(tab_count: usize, panel_open: bool, notif_count: usize) HitCtx {
     };
 }
 
-test "sidebar hitTest: rows map to items" {
+test "sidebar hitTest: rows map to workspaces" {
     const ctx = testCtx(3, false, 0);
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(10, 0, ctx));
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(10, 35, ctx));
-    try testing.expectEqual(HitTarget{ .item = 2 }, hitTest(10, 2 * 36, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(10, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(10, 35, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 2 }, hitTest(10, 2 * 36, ctx));
 }
 
 test "sidebar hitTest: row boundary belongs to the lower row" {
     // y == item_h is the first pixel of row 1, not part of row 0.
-    try testing.expectEqual(HitTarget{ .item = 1 }, hitTest(10, 36, testCtx(3, false, 0)));
+    try testing.expectEqual(HitTarget{ .workspace = 1 }, hitTest(10, 36, testCtx(3, false, 0)));
 }
 
 test "sidebar hitTest: row close band takes priority over the row body" {
@@ -744,11 +769,11 @@ test "sidebar hitTest: row close band takes priority over the row body" {
     // the test geometry (pad=8, cw=20). The rest of the row is body,
     // including the strip right of the band (x>=212) and left of it.
     const ctx = testCtx(3, false, 0);
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(191, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(191, 0, ctx));
     try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(192, 0, ctx));
     try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(211, 35, ctx));
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(212, 0, ctx));
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(219, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(212, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(219, 0, ctx));
 }
 
 test "sidebar hitTest: close band is per-row" {
@@ -773,7 +798,7 @@ test "sidebar rowCloseRect: scales with DPI and agrees with hitTest" {
     // At 2.0 scale, width 440: pad=16, cw=40 — close x in [384, 424).
     const ctx: HitCtx = .{
         .item_h = 72,
-        .tab_count = 2,
+        .workspace_count = 2,
         .client_h = 800,
         .width = 440,
         .scale = 2.0,
@@ -783,10 +808,10 @@ test "sidebar rowCloseRect: scales with DPI and agrees with hitTest" {
     const r = rowCloseRect(0, 440, 72, 2.0);
     try testing.expectEqual(@as(i32, 384), r.left);
     try testing.expectEqual(@as(i32, 424), r.right);
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(383, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(383, 0, ctx));
     try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(384, 0, ctx));
     try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(423, 71, ctx));
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(424, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(424, 0, ctx));
 }
 
 test "sidebar rowCloseRect clears the resize edge band" {
@@ -823,7 +848,7 @@ test "sidebar hitTest: dropdown band only exists on the new session row" {
     // it is either the row body or (in the close band) the close 'x',
     // never .new_session_dropdown.
     const body = hitTest(160, 0, ctx);
-    try testing.expectEqual(HitTarget{ .item = 0 }, body);
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, body);
     const close = hitTest(200, 0, ctx);
     try testing.expectEqual(HitTarget{ .row_close = 0 }, close);
     // And below the new-session row it stays none.
@@ -850,7 +875,7 @@ test "sidebar newSessionDropdownRect: scales with DPI and agrees with hitTest" {
     // At 2.0 scale, width 440: pad=16, dd=48 — chevron x in [376, 424).
     const ctx: HitCtx = .{
         .item_h = 72,
-        .tab_count = 2,
+        .workspace_count = 2,
         .client_h = 800,
         .width = 440,
         .scale = 2.0,
@@ -930,14 +955,14 @@ test "sidebar hitTest: footer boundary clips the row area" {
 test "sidebar hitTest: closed panel area behaves as row space" {
     // With the panel closed, y in [208, 368) is plain row space.
     const ctx = testCtx(10, false, 5);
-    try testing.expectEqual(HitTarget{ .item = 6 }, hitTest(10, 220, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 6 }, hitTest(10, 220, ctx));
 }
 
 test "sidebar hitTest: open panel covers the row area beneath it" {
     // Rows end at panel_top=208: y=207 is row 5, y=208 is the panel
     // header (not Clear at x=10).
     const ctx = testCtx(10, true, 5);
-    try testing.expectEqual(HitTarget{ .item = 5 }, hitTest(10, 207, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 5 }, hitTest(10, 207, ctx));
     try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 208, ctx));
 }
 
@@ -1000,7 +1025,7 @@ test "sidebar hitTest: globe slot scales with DPI" {
     // footer_top = 800 - 64 = 736.
     const ctx: HitCtx = .{
         .item_h = 72,
-        .tab_count = 2,
+        .workspace_count = 2,
         .client_h = 800,
         .width = 440,
         .scale = 2.0,
@@ -1034,8 +1059,8 @@ test "sidebar hitTest and itemRect agree on row bounds" {
     const ctx = testCtx(5, false, 0);
     for (0..4) |i| {
         const r = itemRect(i, 220, ctx.item_h);
-        try testing.expectEqual(HitTarget{ .item = i }, hitTest(10, r.top, ctx));
-        try testing.expectEqual(HitTarget{ .item = i }, hitTest(10, r.bottom - 1, ctx));
+        try testing.expectEqual(HitTarget{ .workspace = i }, hitTest(10, r.top, ctx));
+        try testing.expectEqual(HitTarget{ .workspace = i }, hitTest(10, r.bottom - 1, ctx));
     }
 }
 
