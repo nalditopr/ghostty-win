@@ -889,13 +889,23 @@ pub fn newSplit(self: *Window, direction: SplitTree(Pane).Split.Direction) !void
     const active_pane = self.tab_active_pane[tab];
     const handle = self.findHandle(tab, active_pane) orelse return;
 
+    // Splits inherit the source pane's backend (Windows Terminal
+    // semantics): a split off a WSL or PowerShell tab opens the same
+    // shell. Browser panes have no terminal surface, so a split off
+    // one falls back to the configured default. Surface.init deep
+    // copies the argv, so borrowing the source surface's copy is fine.
+    const command: ?[]const []const u8 = if (active_pane.surface()) |src|
+        src.spawn_command
+    else
+        null;
+
     // Create new surface.
     const new_surface = try alloc.create(Surface);
     errdefer {
         new_surface.deinit();
         alloc.destroy(new_surface);
     }
-    try new_surface.init(self.app, self, .split, null);
+    try new_surface.init(self.app, self, .split, command);
 
     // Create a single-node tree for the new surface's pane. The block
     // scopes the pane errdefer to the window between Pane.create and

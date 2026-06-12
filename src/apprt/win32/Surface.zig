@@ -150,6 +150,13 @@ palette_filtered: [palette_entries.len]u16 = undefined,
 /// lifetime (the pane unrefs to zero only when it destroys us).
 pane: *Pane = undefined,
 
+/// The per-surface command override this surface was spawned with (the
+/// new-session backend picker), if any. Owned deep copy, freed in
+/// deinit(). Splits read this from their source surface so they inherit
+/// the same backend (Windows Terminal semantics); null means the
+/// configured default shell.
+spawn_command: ?[]const []const u8 = null,
+
 /// Initialize a new Surface by creating a Win32 window and WGL context,
 /// then initialize the core terminal surface (fonts, renderer, PTY, IO).
 /// `command` optionally overrides the configured command for this one
@@ -165,6 +172,20 @@ pub fn init(
     self.* = .{
         .app = app,
         .parent_window = parent,
+    };
+
+    // Retain an owned deep copy of the command override so splits
+    // created off this surface can inherit the same backend (Windows
+    // Terminal semantics). Freed in deinit(). This is independent of
+    // the copy newConfigWithCommand makes below: that one lives in the
+    // surface config's arena and dies with it; this one lives exactly
+    // as long as the Surface.
+    if (command) |argv| {
+        self.spawn_command = try dupeArgv(app.core_app.alloc, argv);
+    }
+    errdefer if (self.spawn_command) |argv| {
+        freeArgv(app.core_app.alloc, argv);
+        self.spawn_command = null;
     };
 
     // Create a manual-reset event for synchronizing resize with the
@@ -289,8 +310,35 @@ pub fn init(
     self.core_surface_initialized = true;
 }
 
+/// Deep-copy an argv slice with `alloc`. On failure, any partial
+/// allocations are freed before the error is returned.
+fn dupeArgv(alloc: Allocator, argv: []const []const u8) ![]const []const u8 {
+    const args = try alloc.alloc([]const u8, argv.len);
+    var copied: usize = 0;
+    errdefer {
+        for (args[0..copied]) |arg| alloc.free(arg);
+        alloc.free(args);
+    }
+    for (argv, 0..) |arg, i| {
+        args[i] = try alloc.dupe(u8, arg);
+        copied = i + 1;
+    }
+    return args;
+}
+
+/// Free an argv slice produced by dupeArgv.
+fn freeArgv(alloc: Allocator, argv: []const []const u8) void {
+    for (argv) |arg| alloc.free(arg);
+    alloc.free(argv);
+}
+
 pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
+
+    if (self.spawn_command) |argv| {
+        freeArgv(self.app.core_app.alloc, argv);
+        self.spawn_command = null;
+    }
 
     if (self.core_surface_initialized) {
         log.debug("surface deinit: core_surface.deinit start", .{});
