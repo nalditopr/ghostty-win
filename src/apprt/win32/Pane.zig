@@ -54,7 +54,26 @@ pub fn ref(self: *Pane, alloc: Allocator) Allocator.Error!*Pane {
 /// content is torn down and the pane itself is freed.
 pub fn unref(self: *Pane, alloc: Allocator) void {
     self.ref_count -= 1;
-    if (self.ref_count > 0) return;
+    if (self.ref_count > 0) {
+        // A browser pane can outlive its trees while async WebView2
+        // creation holds an in-flight ref. If this unref took the pane
+        // out of every tab of its window (tab closed mid-creation),
+        // hide the host HWND immediately so the zombie can't keep
+        // painting, eating mouse input, or taking focus. Transient
+        // unrefs during tree rebuilds (split/resize/equalize) leave
+        // the pane findable in a tree and are not affected.
+        switch (self.content) {
+            .browser => |browser| {
+                if (browser.parent_window.findTabIndex(self) == null) {
+                    if (browser.host_hwnd) |h| {
+                        _ = w32.ShowWindow(h, w32.SW_HIDE);
+                    }
+                }
+            },
+            .terminal => {},
+        }
+        return;
+    }
     switch (self.content) {
         .terminal => |surface_ptr| {
             if (surface_ptr.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);

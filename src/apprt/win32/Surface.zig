@@ -147,8 +147,11 @@ palette_filtered: [palette_entries.len]u16 = undefined,
 
 /// The Pane that wraps this surface in its tab's SplitTree. Set by
 /// Pane.create immediately after Surface.init; valid for the surface's
-/// lifetime (the pane unrefs to zero only when it destroys us).
-pane: *Pane = undefined,
+/// lifetime (the pane unrefs to zero only when it destroys us). Null
+/// in the window between Surface.init (which publishes us in the
+/// HWND's GWLP_USERDATA) and Pane.create — message handlers running
+/// in that gap must not dereference it.
+pane: ?*Pane = null,
 
 /// The per-surface command override this surface was spawned with (the
 /// new-session backend picker), if any. Owned deep copy, freed in

@@ -123,6 +123,11 @@ webview2_env_state: enum { none, creating, ready, failed } = .none,
 /// flushWebView2Pending hands it off via onEnvironment.
 webview2_pending: std.ArrayList(*BrowserPane) = .empty,
 
+/// Whether init()'s CoInitializeEx succeeded (S_OK or S_FALSE). Both
+/// must be balanced by CoUninitialize in terminate(); a failure (e.g.
+/// RPC_E_CHANGED_MODE) must NOT be.
+com_initialized: bool = false,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -166,6 +171,7 @@ pub fn init(
         .config = config,
         .hinstance = hinstance,
         .bg_brush = bg_brush,
+        .com_initialized = hr_coinit == 0 or hr_coinit == 1,
     };
 
     // Register the window container class (GDI painting, no CS_OWNDC).
@@ -511,7 +517,13 @@ pub fn terminate(self: *App) void {
     }
 
     self.config.deinit();
-    w32.CoUninitialize();
+    // Balance CoInitializeEx only when it actually succeeded —
+    // CoUninitialize after RPC_E_CHANGED_MODE would tear down an
+    // apartment we don't own.
+    if (self.com_initialized) {
+        w32.CoUninitialize();
+        self.com_initialized = false;
+    }
 }
 
 /// Wake up the message loop from any thread by posting a message
@@ -2582,9 +2594,19 @@ fn surfaceWndProc(
         },
 
         w32.WM_SETFOCUS => {
-            // Update the active pane for this tab when a split pane gains focus.
-            const tab = surface.parent_window.active_tab;
-            surface.parent_window.tab_active_pane[tab] = surface.pane;
+            // Update the active pane for the tab that owns this pane
+            // when a split pane gains focus. Guarded: the pane back-
+            // pointer is null during Surface.init, the window may be
+            // mid-teardown, and a stale focus event must never plant
+            // a pane in a tab slot that doesn't own it.
+            const win = surface.parent_window;
+            if (!win.closing) {
+                if (surface.pane) |pane| {
+                    if (win.findTabIndex(pane)) |idx| {
+                        win.tab_active_pane[idx] = pane;
+                    }
+                }
+            }
             surface.handleFocus(true);
             return 0;
         },

@@ -507,8 +507,14 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
     // Cancel any in-progress rename (the edit control may belong to this tab).
     self.cancelTabRename();
+
+    // Detach the tab from the window state BEFORE tree.deinit():
+    // deinit can destroy a browser host HWND, which moves focus
+    // synchronously and re-enters our wndprocs (WM_SETFOCUS &c).
+    // Those handlers read tab_trees/tab_active_pane/active_tab and
+    // must never observe the dying tab. The local copy stays valid:
+    // SplitTree is a value whose deinit frees the shared heap data.
     var tree = self.tab_trees[idx];
-    tree.deinit(); // This unrefs all panes → Pane.unref frees when ref_count=0
     var i: usize = idx;
     while (i + 1 < self.tab_count) : (i += 1) {
         self.tab_trees[i] = self.tab_trees[i + 1];
@@ -518,8 +524,15 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_status[i] = self.tab_status[i + 1];
     }
     self.tab_count -= 1;
+    // The shift leaves a duplicate of the last tree past the new
+    // count; clear it so nothing can ever walk stale node pointers.
+    self.tab_trees[self.tab_count] = .empty;
+
     if (self.tab_count == 0) {
+        // Set closing before deinit so re-entrant input/focus messages
+        // are dropped by the wndproc guards while panes are torn down.
         self.closing = true;
+        tree.deinit(); // unrefs all panes → Pane.unref frees at ref_count=0
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
@@ -528,6 +541,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     } else if (self.active_tab > idx) {
         self.active_tab -= 1;
     }
+    tree.deinit();
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
 }
@@ -560,7 +574,8 @@ pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Su
 
 /// Close a single terminal surface's pane. See closeSplitPane.
 pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
-    self.closeSplitPane(surface.pane);
+    const pane = surface.pane orelse return;
+    self.closeSplitPane(pane);
 }
 
 /// Close a single pane within a split tree. If it's the last pane
@@ -604,13 +619,22 @@ pub fn closeSplitPane(self: *Window, pane: *Pane) void {
     };
     log.debug("closeSplitPane: remove returned, new_tree nodes={}", .{new_tree.nodes.len});
 
+    // Publish the new tree and a surviving active pane BEFORE deiniting
+    // the old tree: the deinit can destroy a browser host HWND, which
+    // moves focus synchronously and re-enters wndprocs that read
+    // tab_trees/tab_active_pane. They must see post-removal state, not
+    // the dying pane.
     var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
     self.tab_trees[tab] = new_tree;
+    const survivor: ?*Pane = next_pane orelse blk: {
+        var it = new_tree.iterator();
+        break :blk if (it.next()) |entry| entry.view else null;
+    };
+    if (survivor) |sp| self.tab_active_pane[tab] = sp;
+    old_tree.deinit();
 
     if (next_pane) |np| {
         log.debug("closeSplitPane: focusing next pane", .{});
-        self.tab_active_pane[tab] = np;
         self.layoutSplits();
         np.focus();
     } else {
@@ -910,10 +934,13 @@ pub fn newSplit(self: *Window, direction: SplitTree(Pane).Split.Direction) !void
     // Create a single-node tree for the new surface's pane. The block
     // scopes the pane errdefer to the window between Pane.create and
     // the tree taking ownership via ref().
+    var inserted_pane: *Pane = undefined;
     var insert_tree = blk: {
         const new_pane = try Pane.create(alloc, new_surface);
         errdefer alloc.destroy(new_pane);
-        break :blk try SplitTree(Pane).init(alloc, new_pane);
+        const tree = try SplitTree(Pane).init(alloc, new_pane);
+        inserted_pane = new_pane;
+        break :blk tree;
     };
     defer insert_tree.deinit();
 
@@ -932,10 +959,10 @@ pub fn newSplit(self: *Window, direction: SplitTree(Pane).Split.Direction) !void
     self.tab_trees[tab] = new_tree;
 
     // Focus the new pane.
-    self.tab_active_pane[tab] = new_surface.pane;
+    self.tab_active_pane[tab] = inserted_pane;
 
     self.layoutSplits();
-    new_surface.pane.focus();
+    inserted_pane.focus();
 }
 
 /// Create a new browser (WebView2) split in the active tab, in the
@@ -948,6 +975,11 @@ pub fn newBrowserSplit(self: *Window, direction: SplitTree(Pane).Split.Direction
         log.warn("newBrowserSplit: no tabs, ignoring", .{});
         return;
     }
+    // An in-progress inline tab rename owns an Edit control whose
+    // teardown re-enters via EN_KILLFOCUS; settle it before mutating
+    // the tree (same protocol as addTabWithCommand/selectTabIndex).
+    self.cancelTabRename();
+
     const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
 
@@ -959,6 +991,7 @@ pub fn newBrowserSplit(self: *Window, direction: SplitTree(Pane).Split.Direction
     // insert_tree.deinit() is the sole cleanup path (no double-free
     // when split() fails).
     var browser: *BrowserPane = undefined;
+    var browser_pane: *Pane = undefined;
     var insert_tree = blk: {
         const b = try BrowserPane.create(alloc, self.app, self);
         errdefer b.destroy(alloc);
@@ -966,6 +999,7 @@ pub fn newBrowserSplit(self: *Window, direction: SplitTree(Pane).Split.Direction
         errdefer alloc.destroy(new_pane);
         const tree = try SplitTree(Pane).init(alloc, new_pane);
         browser = b;
+        browser_pane = new_pane;
         break :blk tree;
     };
     defer insert_tree.deinit();
@@ -982,7 +1016,7 @@ pub fn newBrowserSplit(self: *Window, direction: SplitTree(Pane).Split.Direction
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
 
-    self.tab_active_pane[tab] = browser.pane;
+    self.tab_active_pane[tab] = browser_pane;
     self.layoutSplits();
 
     // Begin async WebView2 creation now that the tree owns the pane
@@ -993,7 +1027,7 @@ pub fn newBrowserSplit(self: *Window, direction: SplitTree(Pane).Split.Direction
     if (browser.address_edit) |edit| {
         _ = w32.SetFocus(edit);
     } else {
-        browser.pane.focus();
+        browser_pane.focus();
     }
 }
 
@@ -1150,7 +1184,8 @@ fn updateWindowTitle(self: *Window) void {
 /// Called when a terminal surface's title changes. Delegates to the
 /// pane variant.
 pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) void {
-    self.onPaneTitleChanged(surface.pane, title);
+    const pane = surface.pane orelse return;
+    self.onPaneTitleChanged(pane, title);
 }
 
 /// Called when a pane's title changes. Updates the stored title
@@ -1158,7 +1193,18 @@ pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) 
 pub fn onPaneTitleChanged(self: *Window, pane: *Pane, title: [:0]const u8) void {
     const tab_idx = self.findTabIndex(pane) orelse return;
     var wbuf: [256]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
+    // utf8ToUtf16Le ASSERTS the destination is large enough (no
+    // DestTooSmall error in std 0.15) and titles can exceed 256
+    // UTF-16 units (browser titles are website-controlled; OSC titles
+    // up to 511 bytes). One UTF-8 byte produces at most one UTF-16
+    // unit, so capping the input at 255 bytes makes the worst case
+    // fit. Back up to a UTF-8 sequence boundary so the truncation
+    // doesn't invalidate the whole string.
+    var tlen: usize = @min(title.len, 255);
+    if (tlen < title.len) {
+        while (tlen > 0 and (title[tlen] & 0xC0) == 0x80) tlen -= 1;
+    }
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title[0..tlen]) catch 0;
     const len: u16 = @intCast(@min(wlen, 255));
     @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
     self.tab_title_lens[tab_idx] = len;
@@ -2140,7 +2186,14 @@ pub fn cancelTabRename(self: *Window) void {
 /// because Win32 destroys child HWNDs during DestroyWindow and the
 /// OpenGL driver crashes if contexts are still active on destroyed windows.
 pub fn close(self: *Window) void {
-    // First, cleanly shut down all surfaces (renderer/IO threads, WGL, DC).
+    // Flag teardown FIRST: destroying a browser pane's host HWND inside
+    // cleanupAllSurfaces moves focus synchronously back into
+    // windowWndProc (WM_SETFOCUS), and other queued input can be
+    // dispatched during the destroy. The closing guards drop those
+    // messages so nothing touches the mid-teardown tab arrays.
+    self.closing = true;
+
+    // Cleanly shut down all surfaces (renderer/IO threads, WGL, DC).
     self.cleanupAllSurfaces();
 
     // Now safe to destroy the parent HWND (children already cleaned up).
