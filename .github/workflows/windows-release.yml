@@ -19,10 +19,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Zig 0.15.2
-        uses: mlugg/setup-zig@v1
+      - name: Cache Zig 0.15.2
+        id: cache-zig
+        uses: actions/cache@v4
         with:
-          version: 0.15.2
+          path: ${{ runner.temp }}\zig
+          key: zig-0.15.2-windows-x86_64
+
+      - name: Download Zig 0.15.2
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip' -OutFile "$env:RUNNER_TEMP\zig.zip"
+          Expand-Archive "$env:RUNNER_TEMP\zig.zip" -DestinationPath "$env:RUNNER_TEMP\zig" -Force
+
+      - name: Add Zig to PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$env:RUNNER_TEMP\zig\zig-x86_64-windows-0.15.2"
 
       - name: Determine version
         id: ver
