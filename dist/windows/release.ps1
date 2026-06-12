@@ -108,8 +108,10 @@ Write-Host ''
 if ($SkipBuild) {
     Write-Host 'Skipping zig build (-SkipBuild); using existing zig-out\bin.' -ForegroundColor Yellow
 } else {
-    if (-not (Test-Path $ZigExe)) {
-        Fail "Zig compiler not found at: $ZigExe"
+    # $ZigExe may be a full path or a bare command on PATH (CI). Test-Path
+    # only resolves the former, so fall back to Get-Command for the latter.
+    if (-not (Test-Path $ZigExe) -and -not (Get-Command $ZigExe -ErrorAction SilentlyContinue)) {
+        Fail "Zig compiler not found: $ZigExe"
     }
     Write-Host 'Building ghostty (ReleaseFast)...' -ForegroundColor Cyan
     Push-Location $RepoRoot
