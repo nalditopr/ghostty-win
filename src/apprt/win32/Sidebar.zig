@@ -39,7 +39,8 @@ pub const HitTarget = union(enum) {
     row_close: usize,
     new_session,
     /// The dropdown chevron zone at the right edge of the
-    /// "+ New session" row (opens the backend picker).
+    /// "+ New session" row (opens the backend picker targeting a new
+    /// workspace whose first tab runs the chosen backend).
     new_session_dropdown,
     bell_icon,
     gear_icon,

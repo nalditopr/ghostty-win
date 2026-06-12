@@ -1172,13 +1172,20 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     self.invalidateSidebar();
 }
 
-/// Create a new workspace (a new sidebar row), make it active, and give
-/// it one tab. No-op for QuickTerminal (single-workspace) or when the
-/// MAX_WORKSPACES cap is reached. The slot is value-initialized (`= .{}`)
-/// so tab_status starts .normal and name_len starts 0 (see Workspace).
-pub fn newWorkspace(self: *Window) void {
-    if (self.is_quick_terminal) return;
-    if (self.workspace_count >= MAX_WORKSPACES) return;
+/// Create a new workspace slot (a new sidebar row) and make it active,
+/// WITHOUT giving it a tab. Returns the new index, or null for
+/// QuickTerminal (single-workspace) or when the MAX_WORKSPACES cap is
+/// reached. The slot is value-initialized (`= .{}`) so tab_status
+/// starts .normal and name_len starts 0 (see Workspace).
+///
+/// Callers MUST immediately populate the workspace with one tab — and
+/// collapse it via closeWorkspace(idx) if that fails — so the "every
+/// workspace has at least one tab" invariant holds. Shared by
+/// newWorkspace (default tab) and showBackendMenu's .new_workspace
+/// target (picked-backend tab).
+fn createAndSelectWorkspace(self: *Window) ?usize {
+    if (self.is_quick_terminal) return null;
+    if (self.workspace_count >= MAX_WORKSPACES) return null;
     self.cancelTabRename();
 
     const idx = self.workspace_count;
@@ -1186,8 +1193,16 @@ pub fn newWorkspace(self: *Window) void {
     self.workspace_count += 1;
 
     // selectWorkspace runs the hide-before-show switch onto the (empty)
-    // new workspace; addTab then creates its first tab in it.
+    // new workspace; the caller's tab creation then populates it.
     self.selectWorkspace(idx);
+    return idx;
+}
+
+/// Create a new workspace (a new sidebar row), make it active, and give
+/// it one tab. No-op for QuickTerminal (single-workspace) or when the
+/// MAX_WORKSPACES cap is reached.
+pub fn newWorkspace(self: *Window) void {
+    const idx = self.createAndSelectWorkspace() orelse return;
     _ = self.addTab() catch |err| {
         // The slot exists but has no tab. Collapse it back so the window
         // never shows an empty workspace.
@@ -2285,19 +2300,11 @@ pub fn toggleFullscreen(self: *Window) void {
         var mi: w32.MONITORINFO = undefined;
         mi.cbSize = @sizeOf(w32.MONITORINFO);
         if (w32.GetMonitorInfoW(monitor, &mi) != 0) {
-            _ = w32.SetWindowPos(hwnd, null,
-                mi.rcMonitor.left, mi.rcMonitor.top,
-                mi.rcMonitor.right - mi.rcMonitor.left,
-                mi.rcMonitor.bottom - mi.rcMonitor.top,
-                w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
+            _ = w32.SetWindowPos(hwnd, null, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
         }
     } else {
         _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, self.saved_style);
-        _ = w32.SetWindowPos(hwnd, null,
-            self.saved_rect.left, self.saved_rect.top,
-            self.saved_rect.right - self.saved_rect.left,
-            self.saved_rect.bottom - self.saved_rect.top,
-            w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
+        _ = w32.SetWindowPos(hwnd, null, self.saved_rect.left, self.saved_rect.top, self.saved_rect.right - self.saved_rect.left, self.saved_rect.bottom - self.saved_rect.top, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
     }
     self.is_fullscreen = !self.is_fullscreen;
 }
@@ -2318,8 +2325,7 @@ pub fn toggleWindowDecorations(self: *Window) void {
         _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, new_style);
     }
     // Force frame recalculation.
-    _ = w32.SetWindowPos(hwnd, null, 0, 0, 0, 0,
-        w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED | w32.SWP_NOMOVE | w32.SWP_NOSIZE);
+    _ = w32.SetWindowPos(hwnd, null, 0, 0, 0, 0, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED | w32.SWP_NOMOVE | w32.SWP_NOSIZE);
 }
 
 /// Handle WM_SIZE: re-layout the active tab's split panes and repaint
@@ -2684,12 +2690,15 @@ fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
             // Anchor the picker under the "+ New workspace" row (Windows
             // Terminal dropdown feel) rather than at the click point. The
             // row sits at index workspace_count (below the workspace rows).
+            // The picked backend becomes the FIRST TAB of a NEW WORKSPACE
+            // (this row creates workspaces; the tab bar's ▾ is the
+            // new-tab-in-active-workspace picker).
             const row = Sidebar.itemRect(
                 self.workspace_count,
                 self.sidebarWidth(),
                 Sidebar.itemHeight(self.scale),
             );
-            self.showBackendMenu(row.left, row.bottom, .new_tab);
+            self.showBackendMenu(row.left, row.bottom, .new_workspace);
         },
         .bell_icon => {
             self.notif_panel_open = !self.notif_panel_open;
@@ -2724,7 +2733,10 @@ fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
         .workspace => |i| self.showWorkspaceContextMenu(i, x, y),
         .row_close => |i| self.showWorkspaceContextMenu(i, x, y),
         .gear_icon => self.showGearContextMenu(x, y),
-        .new_session, .new_session_dropdown => self.showBackendMenu(x, y, .new_tab),
+        // Right-clicking the "+ New workspace" row (or its ▾ chevron)
+        // opens the picker with the same new-workspace target as the
+        // chevron's left-click.
+        .new_session, .new_session_dropdown => self.showBackendMenu(x, y, .new_workspace),
         else => {},
     }
 }
@@ -2784,18 +2796,21 @@ fn havePwsh() bool {
     return n > 0 and n < buf.len;
 }
 
-/// Where a backend picked from showBackendMenu opens: a new tab, or a
+/// Where a backend picked from showBackendMenu opens: a new tab in the
+/// active workspace, the first tab of a brand-new workspace, or a
 /// split off the active pane in the given direction.
 pub const BackendTarget = union(enum) {
     new_tab,
+    new_workspace,
     split: SplitTree(Pane).Split.Direction,
 };
 
 /// Show the backend picker at client coordinates (x, y): "Default" /
 /// "PowerShell" / "Command Prompt", each installed WSL distribution
 /// (Windows Terminal style), and "Browser" (a WebView2 pane). The
-/// selection opens as a new tab or as a split per `target`; tabs are
-/// titled after the picked backend.
+/// selection opens as a new tab, as the first tab of a new workspace,
+/// or as a split per `target`; tabs are titled after the picked
+/// backend.
 pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) void {
     // Quick terminals exclude picker-created tabs/splits entirely.
     // They have no tab bar or sidebar, so the only QT-reachable call
@@ -2873,6 +2888,16 @@ pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) voi
                 .new_tab => self.addBrowserTab() catch |err| {
                     log.err("failed to create browser tab: {}", .{err});
                 },
+                .new_workspace => {
+                    const idx = self.createAndSelectWorkspace() orelse return;
+                    self.addBrowserTab() catch |err| {
+                        // Same collapse-the-empty-slot path as
+                        // newWorkspace: never show a 0-tab workspace.
+                        log.err("failed to create browser tab for new workspace: {}", .{err});
+                        self.closeWorkspace(idx);
+                    };
+                    self.invalidateSidebar();
+                },
                 .split => |dir| self.newBrowserSplit(dir) catch |err| {
                     log.err("failed to open browser split: {}", .{err});
                 },
@@ -2895,6 +2920,19 @@ pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) voi
     switch (target) {
         .new_tab => _ = self.addTabWithCommand(backend.argv, backend.title) catch |err| {
             log.err("failed to create new tab: {}", .{err});
+        },
+        .new_workspace => {
+            // Create-and-select FIRST so the picked backend becomes the
+            // new workspace's first tab (a .default pick passes
+            // null/null, identical to newWorkspace's plain addTab).
+            const idx = self.createAndSelectWorkspace() orelse return;
+            _ = self.addTabWithCommand(backend.argv, backend.title) catch |err| {
+                // Same collapse-the-empty-slot path as newWorkspace:
+                // never show a 0-tab workspace.
+                log.err("failed to create first tab for new workspace: {}", .{err});
+                self.closeWorkspace(idx);
+            };
+            self.invalidateSidebar();
         },
         .split => |dir| self.newSplitWithCommand(dir, backend.argv) catch |err| {
             log.err("failed to create split: {}", .{err});
@@ -3144,7 +3182,18 @@ fn startRename(self: *Window, rect: w32.RECT, initial: []const u16, target: Rena
     // Set font — stored for cleanup
     self.rename_font = w32.CreateFontW(
         -@as(i32, @intFromFloat(@round(12.0 * self.scale))),
-        0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
     );
     if (self.rename_font) |f| {
@@ -3198,7 +3247,10 @@ pub fn finishTabRename(self: *Window) void {
     // re-entrant call a no-op.
     self.rename_edit = null;
     _ = w32.DestroyWindow(edit);
-    if (self.rename_font) |f| { _ = w32.DeleteObject(f); self.rename_font = null; }
+    if (self.rename_font) |f| {
+        _ = w32.DeleteObject(f);
+        self.rename_font = null;
+    }
     self.invalidateTabBar();
     self.invalidateSidebar();
 
@@ -3212,7 +3264,10 @@ pub fn cancelTabRename(self: *Window) void {
         // Same re-entry concern as finishTabRename: null before destroy.
         self.rename_edit = null;
         _ = w32.DestroyWindow(edit);
-        if (self.rename_font) |f| { _ = w32.DeleteObject(f); self.rename_font = null; }
+        if (self.rename_font) |f| {
+            _ = w32.DeleteObject(f);
+            self.rename_font = null;
+        }
         if (self.getActivePane()) |p| p.focus();
     }
 }

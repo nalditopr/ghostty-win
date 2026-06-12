@@ -54,9 +54,9 @@ window-show-sidebar = false
 - **`+ New workspace`** row at the bottom of the list creates a new workspace
   with one tab and switches to it.
 - **▾ chevron** at the right edge of the `+ New workspace` row opens the
-  **backend picker** — note this opens a **new tab in the current
-  workspace** (Default / PowerShell / Command Prompt / each WSL distro /
-  Browser), not a new workspace.
+  **backend picker** and creates a **new workspace** whose **first tab runs
+  the chosen backend** (Default / PowerShell / Command Prompt / each WSL
+  distro / Browser). Right-clicking the row opens the same picker.
 - **Drag to resize**: grab the narrow band along the sidebar's right edge
   (the cursor changes to horizontal resize arrows) and drag. Width is clamped
   to 120–400 px. The dragged width lasts until the next config reload, which
@@ -168,8 +168,8 @@ The value is a program name (looked up on `PATH`) optionally followed by
 arguments, exactly as the `command` option documents upstream. The
 **backend picker** (the tab bar's `▾` segment, the sidebar's `▾` chevron, and
 the *Split ... With...* menu) still lets you launch a **one-off**
-PowerShell/cmd/WSL session for a single tab or split without changing the
-default.
+PowerShell/cmd/WSL session — as a tab, as a new workspace's first tab, or as
+a split — without changing the default.
 
 ## Terminal Right-Click Menu
 
@@ -279,7 +279,7 @@ appear in two places:
 
 - The **backend picker** (the tab bar's `▾` segment, the sidebar's `▾`
   chevron, or a terminal's *Split ... With...* menu) lists each distro for a
-  one-off tab or split.
+  one-off tab, new workspace, or split.
 - The gear's **Set default shell...** picker lists each distro to make it the
   shell every new session uses (see [Default Shell](#default-shell)).
 
@@ -352,7 +352,7 @@ Apply with the gear menu's *Reload config* or the `reload_config` keybind.
 | Hover row → click `×` | sidebar | Close the workspace |
 | Right-click row | sidebar | Rename Workspace / Close Workspace / New Workspace |
 | Left-click `+ New workspace` | sidebar | New workspace (with one tab) |
-| Left-click `▾` on that row | sidebar | Backend picker → new **tab** in the active workspace |
+| Left-click `▾` on that row | sidebar | Backend picker → new **workspace** whose first tab runs the chosen backend |
 | Drag right edge | sidebar | Resize sidebar (120–400 px) |
 | Left-click tab | tab bar | Switch to that tab |
 | Drag tab left/right | tab bar | Reorder tabs |

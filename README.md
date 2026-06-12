@@ -32,12 +32,13 @@ and extended with the features below.
   double-click rename, and `+`/`▾` new-tab buttons; `alt+1`–`alt+8` jump to
   tabs within the active workspace. `window-show-tab-bar = always/auto/never`
   applies per the active workspace's tab count.
-- **Backend picker** — open a new tab or split as your default shell,
-  PowerShell, cmd, any installed **WSL distribution** (enumerated live from
-  the registry), or an embedded **browser**. Reachable from the `▾` chevron
-  on the sidebar's new-workspace row, the tab bar's `▾` segment, or a
-  terminal's *Split ... With...* menu. Plain splits inherit their source
-  pane's backend.
+- **Backend picker** — open a new tab, workspace, or split as your default
+  shell, PowerShell, cmd, any installed **WSL distribution** (enumerated live
+  from the registry), or an embedded **browser**. The `▾` chevron on the
+  sidebar's new-workspace row creates a **new workspace** whose first tab
+  runs the chosen backend; the tab bar's `▾` segment opens it as a new tab
+  in the active workspace; a terminal's *Split ... With...* menu opens it as
+  a split. Plain splits inherit their source pane's backend.
 - **Browser panes (WebView2)** — open a Chromium-based browser as a split
   or a tab, with an address bar and close-`×`. Requires the Microsoft Edge
   WebView2 Runtime (preinstalled on Windows 11).
