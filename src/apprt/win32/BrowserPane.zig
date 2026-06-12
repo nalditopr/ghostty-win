@@ -32,6 +32,11 @@ pub const ADDRESS_EDIT_ID: u16 = 400;
 /// Address-bar strip height in unscaled pixels.
 const ADDRESS_BAR_BASE: f32 = 28.0;
 
+/// Width (unscaled px) of the close-'x' button sitting at the right edge
+/// of the address-bar strip. Mirrors the sidebar row close band so the
+/// affordance feels identical across chrome surfaces.
+const CLOSE_BASE: f32 = 24.0;
+
 /// Max URL length in UTF-16 code units.
 const URL_MAX: usize = 2048;
 
@@ -68,6 +73,16 @@ address_edit: ?w32.HWND = null,
 
 /// Font for the address-bar Edit (deleted on destroy).
 address_font: ?*anyopaque = null,
+
+/// True while the cursor is over the address-bar close-'x' button, so
+/// it paints red (the tab/sidebar close-hover color) instead of gray.
+close_hovered: bool = false,
+
+/// True between a left-press and left-release that both land on the
+/// close-'x': the actual close fires on release only when the press
+/// started on the button (Win32 button convention), so a press-drag-off
+/// doesn't close the pane.
+close_pressed: bool = false,
 
 /// Async-creation lifecycle. `closing` is set by destroy() and by the
 /// host's WM_DESTROY (parent died while creation was in flight).
@@ -134,7 +149,8 @@ pub fn create(alloc: Allocator, app: *App, parent: *Window) !*BrowserPane {
     _ = w32.SetWindowLongPtrW(host, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
     // Address-bar Edit. Real geometry is applied by layoutChildren on
-    // the first WM_SIZE from layoutSplits.
+    // the first WM_SIZE from layoutSplits. Its width reserves the
+    // close-'x' column at the right edge (cw + a pad gap).
     const bar_h = self.addressBarHeight();
     const pad = self.addressBarPad();
     const edit = w32.CreateWindowExW(
@@ -144,7 +160,7 @@ pub fn create(alloc: Allocator, app: *App, parent: *Window) !*BrowserPane {
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.ES_AUTOHSCROLL,
         pad,
         pad,
-        @max(sr.right - sr.left - pad * 2, 1),
+        editWidthAt(sr.right - sr.left, parent.scale),
         @max(bar_h - pad * 2, 1),
         host,
         @ptrFromInt(@as(usize, ADDRESS_EDIT_ID)),
@@ -915,11 +931,64 @@ pub fn onParentWindowMoved(self: *BrowserPane) void {
 }
 
 fn addressBarHeight(self: *const BrowserPane) i32 {
-    return @intFromFloat(@round(ADDRESS_BAR_BASE * self.parent_window.scale));
+    return barHeightAt(self.parent_window.scale);
 }
 
 fn addressBarPad(self: *const BrowserPane) i32 {
-    return @intFromFloat(@round(3.0 * self.parent_window.scale));
+    return barPadAt(self.parent_window.scale);
+}
+
+fn barHeightAt(scale: f32) i32 {
+    return @intFromFloat(@round(ADDRESS_BAR_BASE * scale));
+}
+
+fn barPadAt(scale: f32) i32 {
+    return @intFromFloat(@round(3.0 * scale));
+}
+
+fn closeWidthAt(scale: f32) i32 {
+    return @intFromFloat(@round(CLOSE_BASE * scale));
+}
+
+/// Pure geometry for the close-'x' button rect given the host client
+/// width and DPI scale. Shared by paint, hit-test, and the edit-width
+/// reservation so they can never disagree. Unit-tested directly.
+fn closeRectAt(width: i32, scale: f32) w32.RECT {
+    const bar_h = barHeightAt(scale);
+    const pad = barPadAt(scale);
+    const cw = closeWidthAt(scale);
+    return .{
+        .left = @max(width - pad - cw, 0),
+        .top = pad,
+        .right = @max(width - pad, 0),
+        .bottom = @max(bar_h - pad, pad),
+    };
+}
+
+/// Pure address-bar EDIT width: the bar minus left pad, the close
+/// column, and a pad gap before it. Floored at 1. The EDIT's right edge
+/// (pad + this) must stay left of closeRectAt().left at every scale.
+fn editWidthAt(width: i32, scale: f32) i32 {
+    const pad = barPadAt(scale);
+    const cw = closeWidthAt(scale);
+    return @max(width - pad * 3 - cw, 1);
+}
+
+/// Screen-relative rect of the address-bar close-'x' button given the
+/// host's client width. Shared by paint and hit-testing so the glyph and
+/// its click target stay identical at every scale. The button occupies
+/// the full bar height on the right edge, inset by the bar pad.
+fn closeRect(self: *const BrowserPane, width: i32) w32.RECT {
+    return closeRectAt(width, self.parent_window.scale);
+}
+
+/// True when client point (x,y) is inside the close-'x' button.
+fn pointInClose(self: *const BrowserPane, x: i32, y: i32) bool {
+    const host = self.host_hwnd orelse return false;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(host, &rect) == 0) return false;
+    const r = self.closeRect(rect.right - rect.left);
+    return x >= r.left and x < r.right and y >= r.top and y < r.bottom;
 }
 
 /// Re-layout the address bar and webview bounds from the host's
@@ -935,11 +1004,12 @@ fn layoutChildren(self: *BrowserPane, width: i32, height: i32) void {
     const bar_h = self.addressBarHeight();
     const pad = self.addressBarPad();
     if (self.address_edit) |edit| {
+        // Reserve the close-'x' column plus a pad gap on the right.
         _ = w32.MoveWindow(
             edit,
             pad,
             pad,
-            @max(width - pad * 2, 1),
+            editWidthAt(width, self.parent_window.scale),
             @max(bar_h - pad * 2, 1),
             1,
         );
@@ -991,6 +1061,46 @@ fn paintHost(self: *BrowserPane, hwnd: w32.HWND) void {
             w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
     }
+
+    self.paintCloseButton(hdc, rect.right - rect.left);
+}
+
+/// Paint the close-'x' glyph at the right of the address-bar strip.
+/// Gray normally, red (the shared close-hover color) while hovered.
+/// Uses only SetTextColor + DrawTextW on the address font, so it adds
+/// no GDI objects to delete.
+fn paintCloseButton(self: *BrowserPane, hdc: w32.HDC, width: i32) void {
+    var r = self.closeRect(width);
+    if (r.right <= r.left) return;
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    _ = w32.SetTextColor(hdc, if (self.close_hovered)
+        w32.RGB(232, 65, 65)
+    else
+        w32.RGB(150, 150, 150));
+    var old_font: ?*anyopaque = null;
+    if (self.address_font) |font| {
+        old_font = w32.SelectObject(hdc, font);
+    }
+    defer if (old_font) |f| {
+        _ = w32.SelectObject(hdc, f);
+    };
+    const glyph = L("\u{00D7}"); // multiplication sign (same as tab/sidebar close)
+    _ = w32.DrawTextW(
+        hdc,
+        glyph,
+        glyph.len,
+        &r,
+        w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+    );
+}
+
+/// Repaint only the close-'x' column (cheap; avoids flickering the EDIT).
+fn invalidateCloseButton(self: *BrowserPane) void {
+    const host = self.host_hwnd orelse return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(host, &rect) == 0) return;
+    var r = self.closeRect(rect.right - rect.left);
+    _ = w32.InvalidateRect(host, &r, 1);
 }
 
 /// Window procedure for browser host HWNDs (GhosttyBrowserHost class).
@@ -1062,6 +1172,63 @@ pub fn hostWndProc(
             return 0;
         },
 
+        w32.WM_MOUSEMOVE => {
+            const x: i32 = @intCast(@as(i16, @truncate(lparam & 0xFFFF)));
+            const y: i32 = @intCast(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
+            const over = self.pointInClose(x, y);
+            if (over != self.close_hovered) {
+                self.close_hovered = over;
+                self.invalidateCloseButton();
+            }
+            if (over) {
+                // Ask for WM_MOUSELEAVE so the red hover clears when the
+                // cursor leaves the host (mirrors the tab-bar tracking).
+                var tme = w32.TRACKMOUSEEVENT{
+                    .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                    .dwFlags = w32.TME_LEAVE,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                _ = w32.TrackMouseEvent(&tme);
+            }
+            return 0;
+        },
+
+        w32.WM_MOUSELEAVE => {
+            if (self.close_hovered) {
+                self.close_hovered = false;
+                self.invalidateCloseButton();
+            }
+            return 0;
+        },
+
+        w32.WM_LBUTTONDOWN => {
+            const x: i32 = @intCast(@as(i16, @truncate(lparam & 0xFFFF)));
+            const y: i32 = @intCast(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
+            self.close_pressed = self.pointInClose(x, y);
+            return 0;
+        },
+
+        w32.WM_LBUTTONUP => {
+            const x: i32 = @intCast(@as(i16, @truncate(lparam & 0xFFFF)));
+            const y: i32 = @intCast(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
+            const pressed = self.close_pressed;
+            self.close_pressed = false;
+            // Close only when both the press and the release landed on
+            // the button, and the window isn't already tearing down.
+            if (pressed and self.pointInClose(x, y) and !self.parent_window.closing) {
+                if (self.pane) |pane| {
+                    // closeSplitPane synchronously destroys this host
+                    // HWND and frees `self` (via Pane.unref ->
+                    // BrowserPane.destroy). Nothing below may touch
+                    // `self` or `hwnd` after this call.
+                    self.parent_window.closeSplitPane(pane);
+                    return 0;
+                }
+            }
+            return 0;
+        },
+
         w32.WM_CTLCOLOREDIT => {
             // Dark mode colors for the address-bar Edit (same scheme as
             // the search edit in App.surfaceWndProc).
@@ -1096,6 +1263,54 @@ pub fn hostWndProc(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "unit: browser close button sits at the right edge, inside the bar" {
+    const width: i32 = 800;
+    const r = closeRectAt(width, 1.0);
+    const pad = barPadAt(1.0);
+    const cw = closeWidthAt(1.0);
+    // Right edge inset by pad; width is exactly the close column.
+    try testing.expectEqual(width - pad, r.right);
+    try testing.expectEqual(width - pad - cw, r.left);
+    try testing.expectEqual(cw, r.right - r.left);
+    // Vertically within the bar strip (top..bottom inside 0..bar_h).
+    try testing.expectEqual(pad, r.top);
+    try testing.expect(r.bottom <= barHeightAt(1.0));
+    try testing.expect(r.bottom > r.top);
+}
+
+test "unit: browser edit never overlaps the close button at any scale" {
+    // The EDIT's right edge (left pad + edit width) must stay strictly
+    // left of the close button's left edge so the URL field and the
+    // close 'x' never collide, at every DPI scale and a range of widths.
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 1.75, 2.0 };
+    const widths = [_]i32{ 120, 300, 640, 800, 1920 };
+    for (scales) |scale| {
+        for (widths) |width| {
+            const pad = barPadAt(scale);
+            const edit_right = pad + editWidthAt(width, scale);
+            const close_left = closeRectAt(width, scale).left;
+            try testing.expect(edit_right <= close_left);
+        }
+    }
+}
+
+test "unit: browser close geometry scales with DPI" {
+    // The column widens proportionally; the right inset is the bar pad.
+    try testing.expectEqual(closeWidthAt(2.0), closeRectAt(800, 2.0).right - closeRectAt(800, 2.0).left);
+    try testing.expect(closeWidthAt(2.0) > closeWidthAt(1.0));
+    try testing.expectEqual(800 - barPadAt(1.5), closeRectAt(800, 1.5).right);
+}
+
+test "unit: browser tiny widths keep the close rect non-negative" {
+    // Degenerate narrow panes must not produce a negative-origin rect
+    // (the @max clamps guard against it). The rect collapses but stays
+    // well-formed; pointInClose then never matches inside it.
+    const r = closeRectAt(4, 1.0);
+    try testing.expect(r.left >= 0);
+    try testing.expect(r.right >= 0);
+    try testing.expect(r.right >= r.left);
+}
 
 test "unit: browser title cap ascii passes through" {
     const input = [_]u16{ 'h', 'e', 'l', 'l', 'o' };

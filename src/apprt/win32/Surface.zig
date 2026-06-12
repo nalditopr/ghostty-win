@@ -1296,6 +1296,27 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     }
 }
 
+/// Build the "Close Pane" context-menu label, appending a tab-separated
+/// keybind hint (e.g. "Close Pane\tCtrl+Shift+W") when `trigger` is set.
+/// Win32 renders the text after the tab right-aligned as the accelerator.
+/// Returns a NUL-terminated UTF-16 slice backed by `buf`.
+fn closePaneLabel(trigger: ?input.Binding.Trigger, buf: []u16) [:0]const u16 {
+    const base = std.unicode.utf8ToUtf16LeStringLiteral("Close Pane");
+    @memcpy(buf[0..base.len], base);
+    var len: usize = base.len;
+    if (trigger) |t| {
+        var kb_buf: [48]u8 = undefined;
+        const kb_len = formatTrigger(t, &kb_buf);
+        if (kb_len > 0 and len + 1 + kb_len < buf.len) {
+            buf[len] = '\t';
+            len += 1;
+            len += std.unicode.utf8ToUtf16Le(buf[len..], kb_buf[0..kb_len]) catch 0;
+        }
+    }
+    buf[len] = 0;
+    return buf[0..len :0];
+}
+
 /// Format a keybinding trigger as a human-readable string (e.g. "Ctrl+Shift+T").
 fn formatTrigger(trigger: input.Binding.Trigger, buf: []u8) usize {
     var pos: usize = 0;
@@ -1819,6 +1840,9 @@ const CTX_NEW_TAB: usize = 9106;
 // documented 9320+ range contiguous.
 const CTX_SPLIT_RIGHT_WITH: usize = 9321;
 const CTX_SPLIT_DOWN_WITH: usize = 9322;
+// Close this pane (or the whole tab if it's the only pane). 9400+ is the
+// reserved range for tab-UI feature work (Stage 2).
+const CTX_CLOSE_PANE: usize = 9400;
 
 /// Show the terminal context menu at the screen cursor and run the
 /// chosen command through the core binding-action path (the same
@@ -1845,6 +1869,15 @@ fn showContextMenu(self: *Surface) void {
     _ = w32.AppendMenuW(menu, with_flags, CTX_SPLIT_DOWN_WITH, L("Split Down With..."));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_NEW_TAB, L("New Tab"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+
+    // "Close Pane" — closes this pane via closeSplitSurface, which falls
+    // back to closing the whole tab when this is the only pane (matching
+    // the existing close-surface semantics). Append the close_surface
+    // keybind as a hint when one is configured (e.g. "Close Pane\tCtrl+Shift+W").
+    var close_label_buf: [64]u16 = undefined;
+    const close_label = closePaneLabel(self.app.config.keybind.set.getTrigger(.close_surface), &close_label_buf);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_CLOSE_PANE, close_label);
 
     var pt: w32.POINT = undefined;
     if (w32.GetCursorPos_(&pt) == 0) return;
@@ -1883,6 +1916,11 @@ fn showContextMenu(self: *Surface) void {
         CTX_SPLIT_RIGHT => .{ .new_split = .right },
         CTX_SPLIT_DOWN => .{ .new_split = .down },
         CTX_NEW_TAB => .new_tab,
+        // Routed through the binding action (not closeSplitSurface
+        // directly): close_surface posts WM_CLOSE, deferring the actual
+        // teardown out of this menu's modal loop so we never destroy
+        // `self` while still on the stack here.
+        CTX_CLOSE_PANE => .close_surface,
         else => return,
     };
     _ = self.core_surface.performBindingAction(ba) catch |err| {

@@ -1452,6 +1452,144 @@ fn resolveConfigFile(self: *App) ?[]const u8 {
     return path;
 }
 
+/// Produce config-file text with the `command` key set to `value`,
+/// preserving every other line. If a non-comment `command = ...` line
+/// already exists, the first one is replaced in place (later duplicates
+/// are left untouched — the config parser uses the last occurrence, but
+/// rewriting only the first keeps edits minimal and predictable); a
+/// commented `# command = ...` line is NOT treated as a match. If no
+/// active `command` line exists, `command = <value>` is appended on its
+/// own line (with a preceding newline only when the source does not end
+/// in one). The result is owned by the caller.
+///
+/// `value` is a raw config value (e.g. "pwsh.exe" or
+/// "wsl.exe --cd ~ -d Ubuntu") and is written verbatim; callers pass a
+/// program name or a space-joined argv that the config's Command parser
+/// understands.
+fn setCommandInConfigText(
+    alloc: Allocator,
+    source: []const u8,
+    value: []const u8,
+) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var replaced = false;
+    var it = std.mem.splitScalar(u8, source, '\n');
+    var first = true;
+    while (it.next()) |raw_line| {
+        // splitScalar yields a trailing empty segment when the source
+        // ends in '\n'; preserve the structure by re-emitting newlines
+        // between segments rather than after each.
+        if (!first) try out.append(alloc, '\n');
+        first = false;
+
+        // A line is the `command` key if, after trimming, the text
+        // before the first '=' equals "command" (case-sensitive, like
+        // the config parser). Tolerate a trailing '\r' from CRLF files.
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (!replaced) {
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+                const key = std.mem.trim(u8, trimmed[0..eq], " \t");
+                if (std.mem.eql(u8, key, "command")) {
+                    try out.appendSlice(alloc, "command = ");
+                    try out.appendSlice(alloc, value);
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        try out.appendSlice(alloc, raw_line);
+    }
+
+    if (!replaced) {
+        // Append on its own line. Add a separating newline unless the
+        // file is empty or already ends in one.
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+            try out.append(alloc, '\n');
+        }
+        try out.appendSlice(alloc, "command = ");
+        try out.appendSlice(alloc, value);
+        try out.append(alloc, '\n');
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+/// Set the default shell by writing `command = <value>` into the user
+/// config file (preserving all other content), then hard-reloading so
+/// the change takes effect for subsequently created tabs/splits. This
+/// is the GUI exposure of the `command` config option, which the
+/// default-tab path already honors (see Exec.zig). `value` is written
+/// verbatim as the config value (e.g. "pwsh.exe").
+pub fn setDefaultShell(self: *App, value: []const u8) void {
+    const alloc = self.core_app.alloc;
+
+    // resolveConfigFile creates the file (with the template) when it is
+    // missing, so the read below always sees a real file.
+    const path = self.resolveConfigFile() orelse return;
+    defer alloc.free(path);
+
+    const source = std.fs.cwd().readFileAlloc(
+        alloc,
+        path,
+        16 * 1024 * 1024,
+    ) catch |err| {
+        log.err("set default shell: failed to read config={s} err={}", .{ path, err });
+        return;
+    };
+    defer alloc.free(source);
+
+    const updated = setCommandInConfigText(alloc, source, value) catch |err| {
+        log.err("set default shell: failed to build config text err={}", .{err});
+        return;
+    };
+    defer alloc.free(updated);
+
+    // Write atomically so a failure mid-write can't truncate the user's
+    // config: write a sibling temp file, then rename over the original.
+    writeFileAtomic(alloc, path, updated) catch |err| {
+        log.err("set default shell: failed to write config={s} err={}", .{ path, err });
+        return;
+    };
+
+    log.info("set default shell: wrote command={s} to {s}", .{ value, path });
+
+    // Hard reload from disk so the new command applies. Same path as the
+    // gear "Reload config" entry / reload_config keybind.
+    self.core_app.performAction(self, .reload_config) catch |err| {
+        log.err("set default shell: reload failed: {}", .{err});
+    };
+}
+
+/// Write `data` to `path` atomically by writing to a temp file in the
+/// same directory and renaming it over the destination. Falls back to a
+/// direct write if a temp file cannot be created in that directory.
+fn writeFileAtomic(alloc: Allocator, path: []const u8, data: []const u8) !void {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+
+    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    defer dir.close();
+
+    const tmp_name = try std.fmt.allocPrint(alloc, "{s}.ghostty-tmp", .{base});
+    defer alloc.free(tmp_name);
+
+    {
+        const file = dir.createFile(tmp_name, .{ .truncate = true }) catch {
+            // Could not create a temp file (e.g. read-only dir quirk);
+            // fall back to a direct overwrite.
+            try dir.writeFile(.{ .sub_path = base, .data = data });
+            return;
+        };
+        defer file.close();
+        try file.writeAll(data);
+    }
+    errdefer dir.deleteFile(tmp_name) catch {};
+    try dir.rename(tmp_name, base);
+}
+
 /// Open the user config file in its default editor, falling back to
 /// notepad.exe when nothing is associated with the file (extensionless
 /// legacy `config` paths commonly have no "open" verb).
@@ -3112,4 +3250,98 @@ test "unit: notif ring skips holes keeping display indices contiguous" {
     try testing.expectEqual(@as(u32, 3), ring.at(0).?.*);
     try testing.expectEqual(@as(u32, 1), ring.at(1).?.*);
     try testing.expectEqual(@as(?*const u32, null), ring.at(2));
+}
+
+test "unit: set command appends when absent" {
+    const alloc = testing.allocator;
+    const src = "# Ghostty config\nwindow-show-sidebar = true\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings(
+        "# Ghostty config\nwindow-show-sidebar = true\ncommand = pwsh.exe\n",
+        out,
+    );
+}
+
+test "unit: set command appends a newline when file lacks a trailing one" {
+    const alloc = testing.allocator;
+    const src = "theme = dark"; // no trailing newline
+    const out = try setCommandInConfigText(alloc, src, "cmd.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("theme = dark\ncommand = cmd.exe\n", out);
+}
+
+test "unit: set command appends into an empty file" {
+    const alloc = testing.allocator;
+    const out = try setCommandInConfigText(alloc, "", "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("command = pwsh.exe\n", out);
+}
+
+test "unit: set command replaces an existing active line in place" {
+    const alloc = testing.allocator;
+    const src = "theme = dark\ncommand = cmd.exe\nfont-size = 12\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    // Replaced in place; surrounding lines untouched; no extra append.
+    try testing.expectEqualStrings(
+        "theme = dark\ncommand = pwsh.exe\nfont-size = 12\n",
+        out,
+    );
+}
+
+test "unit: set command tolerates whitespace around the key and equals" {
+    const alloc = testing.allocator;
+    const src = "  command   =   cmd.exe  \nfont-size = 12\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("command = pwsh.exe\nfont-size = 12\n", out);
+}
+
+test "unit: set command ignores commented and lookalike keys" {
+    const alloc = testing.allocator;
+    // A commented command line and a different key that contains the
+    // substring must NOT be treated as the active command; the value is
+    // appended instead.
+    const src = "# command = cmd.exe\ninitial-command = top\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings(
+        "# command = cmd.exe\ninitial-command = top\ncommand = pwsh.exe\n",
+        out,
+    );
+}
+
+test "unit: set command replaces only the first active line" {
+    const alloc = testing.allocator;
+    const src = "command = cmd.exe\ncommand = bash\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    // Only the first is rewritten; the duplicate is preserved verbatim
+    // (the parser uses the last, but minimal edits are the contract).
+    try testing.expectEqualStrings("command = pwsh.exe\ncommand = bash\n", out);
+}
+
+test "unit: set command preserves CRLF on untouched lines" {
+    const alloc = testing.allocator;
+    const src = "theme = dark\r\ncommand = cmd.exe\r\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    // The replaced line is normalized to "command = pwsh.exe" (LF); the
+    // other line keeps its CRLF. The match tolerates the trailing \r.
+    try testing.expectEqualStrings("theme = dark\r\ncommand = pwsh.exe\n", out);
+}
+
+test "unit: set command accepts an argv value verbatim" {
+    const alloc = testing.allocator;
+    const out = try setCommandInConfigText(
+        alloc,
+        "theme = dark\n",
+        "wsl.exe --cd ~ -d Ubuntu",
+    );
+    defer alloc.free(out);
+    try testing.expectEqualStrings(
+        "theme = dark\ncommand = wsl.exe --cd ~ -d Ubuntu\n",
+        out,
+    );
 }

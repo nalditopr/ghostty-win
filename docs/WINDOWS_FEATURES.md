@@ -66,6 +66,45 @@ The **gear icon** in the sidebar footer:
   - *Open config folder* — opens the containing folder in Explorer.
   - *Reload config* — applies config changes immediately (same code path as
     the `reload_config` keybind).
+  - *Set default shell...* — opens a picker (PowerShell / Command Prompt /
+    each installed WSL distribution) and makes that the shell every new tab
+    and split launches. See [Default Shell](#default-shell) below.
+
+## Default Shell
+
+By default, new terminal tabs and splits launch **`cmd.exe`** on Windows. The
+shell is controlled by the standard Ghostty
+[`command`](https://ghostty.org/docs/config/reference#command) config option,
+which is honored on Windows for every new terminal surface (new windows, tabs,
+and splits). Set it once and all default sessions use it:
+
+```ini
+# PowerShell 7+ (falls back to Windows PowerShell if pwsh isn't installed)
+command = pwsh.exe
+
+# Or classic Windows PowerShell
+command = powershell.exe
+
+# Or a WSL distribution
+command = wsl.exe --cd ~ -d Ubuntu
+```
+
+You can set it two ways:
+
+- **From the GUI** — right-click the gear ⚙ in the sidebar footer and choose
+  **Set default shell...**, then pick PowerShell, Command Prompt, or one of
+  your installed WSL distributions. This writes the `command` key into your
+  config file (updating the existing line if present, otherwise appending it,
+  and preserving everything else) and reloads the config, so it takes effect
+  for the next tab/split you open. Existing tabs keep their current shell.
+- **By editing the config** — add a `command = ...` line yourself and reload
+  (gear → *Reload config*, or the `reload_config` keybind).
+
+The value is a program name (looked up on `PATH`) optionally followed by
+arguments, exactly as the `command` option documents upstream. The
+**backend picker** (the `+`/`▾` new-session menu and the *Split ... With...*
+menu) still lets you launch a **one-off** PowerShell/cmd/WSL session for a
+single tab or split without changing the default.
 
 ## Terminal Right-Click Menu
 
@@ -122,15 +161,21 @@ Open a web browser inside a split, next to your terminals:
   is loaded on demand); opening a browser pane then shows
   **"WebView2 runtime unavailable"** in the pane instead of failing.
 
-## WSL Distributions (in progress)
+## WSL Distributions
 
-The build can enumerate your installed WSL distributions (name, WSL 1/2
-version, and which one is the default) directly from the registry, and knows
-how to launch a shell in one (`wsl.exe --cd ~ -d <Name>`). This backend
-(`src/os/wsl.zig`) is in place, but the **picker UI is still in progress** —
-there is no menu to select a distro yet. For now, set
-`command = wsl.exe --cd ~ -d Ubuntu` (or your distro) in your config to use
-WSL as your shell.
+The build enumerates your installed WSL distributions (name, WSL 1/2 version,
+and which one is the default) directly from the registry (`src/os/wsl.zig`),
+and launches a shell in one with `wsl.exe --cd ~ -d <Name>`. Installed distros
+appear in two places:
+
+- The **new-session backend picker** (right-click the `+`/`▾` new-session
+  button or row, or use a terminal's *Split ... With...* menu) lists each
+  distro for a one-off tab or split.
+- The gear's **Set default shell...** picker lists each distro to make it the
+  shell every new session uses (see [Default Shell](#default-shell)).
+
+You can also set `command = wsl.exe --cd ~ -d Ubuntu` (or your distro) directly
+in your config.
 
 ## Upcoming: Working-Directory Inheritance (OSC 7) + PowerShell Integration
 
@@ -190,6 +235,10 @@ window-show-sidebar = true
 
 # Sidebar width in unscaled pixels (clamped to 120–400; scaled by DPI)
 window-sidebar-width = 260
+
+# Default shell for new tabs/splits (defaults to cmd.exe on Windows).
+# Can also be set from the gear menu's "Set default shell..." entry.
+command = pwsh.exe
 ```
 
 Apply with the gear menu's *Reload config* or the `reload_config` keybind.
@@ -208,7 +257,7 @@ Apply with the gear menu's *Reload config* or the `reload_config` keybind.
 | Left-click entry | notifications pane | Jump to the source tab |
 | Left-click `Clear` | notifications pane | Empty the notification log |
 | Left-click gear ⚙ | sidebar footer | Open config file |
-| Right-click gear ⚙ | sidebar footer | Open config / Open config folder / Reload config |
+| Right-click gear ⚙ | sidebar footer | Open config / Open config folder / Reload config / Set default shell... |
 | Left-click globe 🌐 | sidebar footer | Open a browser split |
 | Right-click | terminal | Copy / Paste / Select All / Split Right / Split Down / New Tab / Open Browser Split |
 | `Shift`+right-click | terminal | Force the context menu when a program captures the mouse |
