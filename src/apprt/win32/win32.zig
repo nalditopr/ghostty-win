@@ -274,7 +274,9 @@ pub const WHEEL_DELTA: i16 = 120;
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOW: i32 = 5;
 pub const SW_MAXIMIZE: i32 = 3;
+pub const SW_SHOWMAXIMIZED: i32 = 3;
 pub const SW_RESTORE: i32 = 9;
+pub const SW_SHOWNORMAL: i32 = 1;
 
 // Font weight constants
 pub const FW_NORMAL: i32 = 400;
@@ -631,8 +633,40 @@ pub extern "user32" fn FlashWindowEx(
 
 // GetSystemMetrics — used for cascade-position bounds checks etc.
 // 0=SM_CXSCREEN, 1=SM_CYSCREEN.
+pub const SM_CXSCREEN: i32 = 0;
+pub const SM_CYSCREEN: i32 = 1;
+// Virtual screen bounds — the bounding box of all monitors. Used by
+// window-state restore to clamp a saved rect onto something visible.
+pub const SM_XVIRTUALSCREEN: i32 = 76;
+pub const SM_YVIRTUALSCREEN: i32 = 77;
+pub const SM_CXVIRTUALSCREEN: i32 = 78;
+pub const SM_CYVIRTUALSCREEN: i32 = 79;
 pub extern "user32" fn GetSystemMetrics(
     nIndex: i32,
+) callconv(.winapi) i32;
+
+// GetWindowPlacement / SetWindowPlacement — capture and restore the
+// window's *restored* (non-maximized) rect plus its show state, so a
+// maximized window still remembers the size it had before maximizing.
+// rcNormalPosition is in workarea coordinates (see MSDN), in physical
+// pixels under per-monitor DPI awareness.
+pub const WINDOWPLACEMENT = extern struct {
+    length: u32,
+    flags: u32,
+    showCmd: u32,
+    ptMinPosition: POINT,
+    ptMaxPosition: POINT,
+    rcNormalPosition: RECT,
+};
+
+pub extern "user32" fn GetWindowPlacement(
+    hWnd: HWND,
+    lpwndpl: *WINDOWPLACEMENT,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn SetWindowPlacement(
+    hWnd: HWND,
+    lpwndpl: *const WINDOWPLACEMENT,
 ) callconv(.winapi) i32;
 
 pub extern "shell32" fn ShellExecuteW(

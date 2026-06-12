@@ -13,6 +13,7 @@ const BrowserPane = @import("BrowserPane.zig");
 const Pane = @import("Pane.zig");
 const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
+const WindowState = @import("WindowState.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 
@@ -121,6 +122,19 @@ tracking_mouse: bool = false,
 /// Whether this window is a quick terminal (borderless popup, no tabs).
 is_quick_terminal: bool = false,
 
+/// Set during init() when restoring persisted state asked for a
+/// maximized window. Consumed when the first tab shows the window
+/// (ShowWindow uses SW_SHOWMAXIMIZED instead of SW_SHOW). Always false
+/// for quick terminals and non-first windows. Only the main window
+/// persists/restores geometry.
+restore_maximized: bool = false,
+
+/// True once this window has persisted at least one good (non-degenerate)
+/// placement during the session. Guards against a teardown-time
+/// GetWindowPlacement returning a minimized/zero rect overwriting the
+/// last good save. See savePlacement.
+saved_placement_ok: bool = false,
+
 /// Split divider drag state.
 dragging_split: bool = false,
 drag_split_handle: SplitTree(Pane).Node.Handle = .root,
@@ -204,14 +218,39 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     const style: u32 = if (options.is_quick_terminal) w32.WS_POPUP else w32.WS_OVERLAPPEDWINDOW;
     const ex_style: u32 = if (options.is_quick_terminal) w32.WS_EX_TOOLWINDOW else 0;
 
-    // Cascade non-quick-terminal windows: stack each new window 30px
-    // down/right of the most recently created window. Stops once the
-    // offset would push the window off the work area, then resets.
-    // Quick terminals are positioned by QuickTerminal.calculateRects.
+    // Window geometry. Defaults to a fixed 800x600 at the OS default
+    // position. Three cases, in priority order:
+    //   1. The FIRST non-quick-terminal window of the session restores
+    //      the saved size/position/maximized state (Windows Terminal
+    //      style). app.windows is still empty here because init() runs
+    //      before App appends the window to the list.
+    //   2. Subsequent windows cascade 30px down/right of the previous.
+    //   3. Quick terminals are positioned by QuickTerminal.calculateRects.
     const cascade_step: i32 = 30;
     var cx: i32 = w32.CW_USEDEFAULT;
     var cy: i32 = w32.CW_USEDEFAULT;
-    if (!options.is_quick_terminal and app.windows.items.len > 0) {
+    var cw: i32 = 800;
+    var ch: i32 = 600;
+    // Whether to maximize the window once it is first shown (set from
+    // restored state). Recorded on self so addTab() can apply it.
+    self.restore_maximized = false;
+    var have_restored = false;
+
+    const is_first_window = !options.is_quick_terminal and app.windows.items.len == 0;
+    if (is_first_window) {
+        if (self.restorePlacement()) |saved| {
+            // restorePlacement already clamped the rect onto the current
+            // virtual screen, so cx/cy/cw/ch are guaranteed visible.
+            cx = saved.x;
+            cy = saved.y;
+            cw = saved.width;
+            ch = saved.height;
+            self.restore_maximized = saved.maximized;
+            have_restored = true;
+        }
+    }
+
+    if (!options.is_quick_terminal and !have_restored and app.windows.items.len > 0) {
         // Find the previously created window's position and bump.
         const prev = app.windows.items[app.windows.items.len - 1];
         if (prev.hwnd) |ph| {
@@ -238,8 +277,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         style,
         cx,
         cy,
-        800,
-        600,
+        cw,
+        ch,
         null,
         null,
         app.hinstance,
@@ -303,6 +342,114 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // surface which triggers ShowWindow on the parent as needed.
     // Showing the parent before the terminal is ready can cause
     // timing issues with ConPTY.
+}
+
+/// Name of the persisted window-state file, under %LOCALAPPDATA%\ghostty.
+const WINDOW_STATE_FILE = "window-state";
+
+/// Build the absolute path to the window-state file. Mirrors the
+/// `update_check_at` convention used elsewhere in this runtime
+/// (%LOCALAPPDATA%\ghostty\...). Caller owns the returned slice.
+fn windowStatePath(alloc: std.mem.Allocator) ![]u8 {
+    const dir = try std.process.getEnvVarOwned(alloc, "LOCALAPPDATA");
+    defer alloc.free(dir);
+    return std.fs.path.join(alloc, &.{ dir, "ghostty", WINDOW_STATE_FILE });
+}
+
+/// Capture the current window placement and persist it. Called on
+/// WM_EXITSIZEMOVE (resize/move settle) and on close, so we never write
+/// on every pixel of a drag.
+///
+/// We persist the window's *restored* rect (GetWindowPlacement's
+/// rcNormalPosition) plus the maximized flag, so a maximized window still
+/// remembers the underlying size it un-maximizes to. Coordinates are
+/// physical pixels in workarea space (see WindowState.zig).
+///
+/// Only the main window participates: quick terminals manage their own
+/// geometry, and additional windows would clobber each other. Errors
+/// (missing dir, no permission) are swallowed — persistence is best
+/// effort and must never affect normal operation.
+pub fn savePlacement(self: *Window) void {
+    if (self.is_quick_terminal) return;
+    // Only the first window in the App's list owns the persisted state.
+    // Additional session windows cascade and do not save (avoids two
+    // windows fighting over one file).
+    if (self.app.windows.items.len == 0 or self.app.windows.items[0] != self) return;
+    const hwnd = self.hwnd orelse return;
+
+    var wp: w32.WINDOWPLACEMENT = undefined;
+    wp.length = @sizeOf(w32.WINDOWPLACEMENT);
+    if (w32.GetWindowPlacement(hwnd, &wp) == 0) return;
+
+    const r = wp.rcNormalPosition;
+    const state: WindowState.State = .{
+        .width = r.right - r.left,
+        .height = r.bottom - r.top,
+        .x = r.left,
+        .y = r.top,
+        // showCmd reflects the persisted (un-minimized) show state.
+        // SW_SHOWMAXIMIZED (3) and SW_MAXIMIZE (3) both mean maximized.
+        .maximized = wp.showCmd == w32.SW_SHOWMAXIMIZED,
+    };
+
+    // Reject a degenerate capture (e.g. a minimized window reporting a
+    // tiny/zero normal rect during teardown) so we never clobber a
+    // previously-good save with garbage.
+    if (!state.validate()) return;
+
+    const alloc = self.app.core_app.alloc;
+    const path = windowStatePath(alloc) catch return;
+    defer alloc.free(path);
+
+    // Ensure the parent dir exists, then write atomically-ish via
+    // truncate. The state is tiny so a partial write is implausible.
+    if (std.fs.path.dirname(path)) |parent| {
+        std.fs.cwd().makePath(parent) catch {};
+    }
+    const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
+    defer file.close();
+    var buf: [160]u8 = undefined;
+    const text = state.serialize(&buf) catch return;
+    file.writeAll(text) catch return;
+    self.saved_placement_ok = true;
+}
+
+/// Read and validate the persisted window state, clamped onto the
+/// current virtual screen so the restored window is always visible.
+/// Returns null when there is no state, it is corrupt, or the env is
+/// unavailable — callers then fall back to defaults. Best effort: any
+/// error path yields null.
+fn restorePlacement(self: *Window) ?WindowState.State {
+    const alloc = self.app.core_app.alloc;
+    const path = windowStatePath(alloc) catch return null;
+    defer alloc.free(path);
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    var buf: [512]u8 = undefined;
+    const n = file.readAll(&buf) catch return null;
+    var state = WindowState.State.parse(buf[0..n]) orelse return null;
+
+    // Clamp onto the current virtual screen (handles a removed monitor or
+    // an off-screen saved position). Physical pixels throughout.
+    const vx = w32.GetSystemMetrics(w32.SM_XVIRTUALSCREEN);
+    const vy = w32.GetSystemMetrics(w32.SM_YVIRTUALSCREEN);
+    const vw = w32.GetSystemMetrics(w32.SM_CXVIRTUALSCREEN);
+    const vh = w32.GetSystemMetrics(w32.SM_CYVIRTUALSCREEN);
+    // If the metrics are unavailable (0 span), skip clamping rather than
+    // collapsing the window.
+    if (vw > 0 and vh > 0) {
+        const adjusted = WindowState.clampToVirtualScreen(
+            .{ .x = state.x, .y = state.y, .width = state.width, .height = state.height },
+            .{ .x = vx, .y = vy, .width = vw, .height = vh },
+        );
+        state.x = adjusted.x;
+        state.y = adjusted.y;
+        state.width = adjusted.width;
+        state.height = adjusted.height;
+    }
+
+    return state;
 }
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
@@ -543,9 +690,12 @@ pub fn addTabWithCommand(
     if (self.tab_count == 1) {
         // First tab — show the parent window now that the terminal is ready.
         // Quick terminal windows are shown by QuickTerminal.animateIn() instead.
+        // If restored state asked for a maximized window, show it maximized
+        // so the OS uses the persisted restored rect as the un-maximize size.
         if (!self.is_quick_terminal) {
             if (self.hwnd) |h| {
-                _ = w32.ShowWindow(h, w32.SW_SHOW);
+                const cmd: i32 = if (self.restore_maximized) w32.SW_SHOWMAXIMIZED else w32.SW_SHOW;
+                _ = w32.ShowWindow(h, cmd);
                 _ = w32.UpdateWindow(h);
             }
         }
@@ -2623,9 +2773,17 @@ pub fn windowWndProc(
                     .browser => {},
                 };
             }
+            // Resize/move drag settled — persist the new geometry. This
+            // debounces saves: nothing is written during the live drag
+            // (WM_SIZE/WM_MOVE), only once on settle.
+            window.savePlacement();
             return 0;
         },
         w32.WM_CLOSE => {
+            // Capture final geometry before teardown. close() flips the
+            // closing flag and destroys the HWND, after which the rect is
+            // unrecoverable.
+            window.savePlacement();
             window.close();
             return 0;
         },
@@ -3041,4 +3199,13 @@ test "unit: distro menu label formats the default marker" {
         defer alloc.free(label);
         try testing.expectEqualStrings("Ubuntu-24.04 (default)", label);
     }
+}
+
+// Pull the persisted window-state module's unit tests (serialize/parse
+// round-trip, corrupt-input tolerance, off-screen clamp) into the test
+// binary. Window.zig uses WindowState's decls, but Zig only auto-includes
+// a referenced file's `test` blocks when the file itself is referenced
+// for testing — hence this explicit reference.
+test {
+    _ = WindowState;
 }
