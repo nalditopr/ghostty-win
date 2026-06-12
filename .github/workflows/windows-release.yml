@@ -16,8 +16,14 @@ jobs:
   release:
     name: Build installer & publish release
     runs-on: windows-latest
+    # Keep Zig's global cache on the same drive as the checkout (D:), or the
+    # build system asserts on a cross-drive relative path during configure.
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}\zig-global
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Cache Zig 0.15.2
         id: cache-zig
