@@ -11,11 +11,14 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const BrowserPane = @import("BrowserPane.zig");
+const Pane = @import("Pane.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
+const wv2 = @import("webview2.zig");
 
 const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
@@ -41,6 +44,11 @@ pub const TERMINAL_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyT
 /// Window class for the message-only HWND (WM_APP_WAKEUP, WM_TIMER).
 pub const MSG_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyMsg");
 
+/// Window class for browser pane host HWNDs (WebView2 + address bar).
+/// Must NOT be the terminal class: App.run skips TranslateMessage for
+/// the terminal class atom, which would break the address-bar Edit.
+pub const BROWSER_HOST_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyBrowserHost");
+
 /// The core application.
 core_app: *CoreApp,
 
@@ -59,6 +67,7 @@ hinstance: w32.HINSTANCE,
 class_atom: u16 = 0,
 terminal_class_atom: u16 = 0,
 msg_class_atom: u16 = 0,
+browser_host_class_atom: u16 = 0,
 
 /// List of active Window containers (tabbed windows).
 windows: std.ArrayList(*Window) = .empty,
@@ -104,6 +113,16 @@ notif_log_next: usize = 0,
 /// badge on the sidebar footer's bell icon.
 notif_unread: usize = 0,
 
+/// Shared WebView2 environment singleton. Created lazily by the first
+/// browser pane; all panes get controllers from the same environment.
+webview2_env: ?*wv2.ICoreWebView2Environment = null,
+webview2_env_state: enum { none, creating, ready, failed } = .none,
+
+/// Browser panes waiting on async environment creation. Each entry
+/// holds the in-flight pane ref taken in BrowserPane.startCreation;
+/// flushWebView2Pending hands it off via onEnvironment.
+webview2_pending: std.ArrayList(*BrowserPane) = .empty,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -113,6 +132,14 @@ pub fn init(
 
     const hinstance = w32.GetModuleHandleW(null) orelse
         return error.Win32Error;
+
+    // WebView2 requires COM in a single-threaded apartment on the UI
+    // thread. S_FALSE (1, already initialized) is fine; a hard failure
+    // only disables browser panes, so don't fail app startup.
+    const hr_coinit = w32.CoInitializeEx(null, w32.COINIT_APARTMENTTHREADED);
+    if (hr_coinit != 0 and hr_coinit != 1) {
+        log.warn("CoInitializeEx failed: 0x{x:0>8}", .{@as(u32, @bitCast(hr_coinit))});
+    }
 
     // Load the configuration for this application.
     const alloc = core_app.alloc;
@@ -214,6 +241,28 @@ pub fn init(
         _ = w32.UnregisterClassW(MSG_CLASS_NAME, self.hinstance);
     };
 
+    // Register the browser pane host class (WebView2 + address bar).
+    const bc = w32.WNDCLASSEXW{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &BrowserPane.hostWndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = BROWSER_HOST_CLASS_NAME,
+        .hIconSm = null,
+    };
+
+    self.browser_host_class_atom = w32.RegisterClassExW(&bc);
+    if (self.browser_host_class_atom == 0) return error.Win32Error;
+    errdefer if (self.browser_host_class_atom != 0) {
+        _ = w32.UnregisterClassW(BROWSER_HOST_CLASS_NAME, self.hinstance);
+    };
+
     // Create a message-only window for receiving WM_APP_WAKEUP.
     // HWND_MESSAGE makes it a message-only window (invisible, no rendering).
     self.msg_hwnd = w32.CreateWindowExW(
@@ -296,11 +345,30 @@ pub fn run(self: *App) !void {
                 }
             }
 
-            // Find the parent surface of this edit control
+            // Find the parent of this edit control and route by class:
+            // terminal-class parents (surface + search/palette popups)
+            // carry a *Surface in GWLP_USERDATA, browser-host parents a
+            // *BrowserPane. The atom check gates the casts — without it
+            // a key typed in the browser address bar would reinterpret
+            // a *BrowserPane as *Surface.
             const parent = w32.GetParent(msg.hwnd.?);
             if (parent) |p| {
+                const atom: u16 = @truncate(w32.GetClassLongW(p, w32.GCW_ATOM));
                 const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
-                if (userdata != 0) {
+                if (userdata != 0 and atom != 0 and atom == self.browser_host_class_atom) {
+                    const browser: *BrowserPane = @ptrFromInt(@as(usize, @bitCast(userdata)));
+                    if (browser.address_edit != null and browser.address_edit.? == msg.hwnd) {
+                        if (vk == w32.VK_RETURN) {
+                            browser.navigateFromAddressBar();
+                            continue;
+                        }
+                        if (vk == w32.VK_ESCAPE) {
+                            browser.focusWebView();
+                            continue;
+                        }
+                    }
+                }
+                if (userdata != 0 and atom != 0 and atom == self.terminal_class_atom) {
                     const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
                     if (surface.search_active and surface.search_edit == msg.hwnd) {
                         if (surface.handleSearchKey(vk)) continue;
@@ -332,8 +400,12 @@ pub fn run(self: *App) !void {
                             break :blk win.getActiveSurface();
                         }
                     }
-                    // Palette/search edits are children of a surface HWND.
+                    // Palette/search edits are children of a
+                    // terminal-class popup HWND; only that class
+                    // carries a *Surface in GWLP_USERDATA.
                     const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
+                    const pp_atom: u16 = @truncate(w32.GetClassLongW(pp, w32.GCW_ATOM));
+                    if (pp_atom == 0 or pp_atom != self.terminal_class_atom) break :blk null;
                     const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
                     if (ud == 0) break :blk null;
                     const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
@@ -405,11 +477,26 @@ pub fn terminate(self: *App) void {
     }
     self.windows.deinit(alloc);
 
+    // Browser panes still waiting on environment creation hold an
+    // in-flight pane ref; the windows above already dropped the tree
+    // refs, so handing these a null environment unrefs to zero and
+    // frees them.
+    for (self.webview2_pending.items) |browser| browser.onEnvironment(null);
+    self.webview2_pending.deinit(alloc);
+    if (self.webview2_env) |env| {
+        env.release();
+        self.webview2_env = null;
+    }
+
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
         self.bg_brush = null;
     }
 
+    if (self.browser_host_class_atom != 0) {
+        _ = w32.UnregisterClassW(BROWSER_HOST_CLASS_NAME, self.hinstance);
+        self.browser_host_class_atom = 0;
+    }
     if (self.msg_class_atom != 0) {
         _ = w32.UnregisterClassW(MSG_CLASS_NAME, self.hinstance);
         self.msg_class_atom = 0;
@@ -424,6 +511,7 @@ pub fn terminate(self: *App) void {
     }
 
     self.config.deinit();
+    w32.CoUninitialize();
 }
 
 /// Wake up the message loop from any thread by posting a message
@@ -534,7 +622,7 @@ pub fn performAction(
                     // Mark the tab in the sidebar unless the bell rang
                     // in the active tab of the foreground window, where
                     // the user already sees it.
-                    const tab_idx = parent_window.findTabIndex(rt_surface);
+                    const tab_idx = parent_window.findTabIndexOfSurface(rt_surface);
                     const active = if (tab_idx) |idx|
                         idx == parent_window.active_tab
                     else
@@ -840,7 +928,7 @@ pub fn performAction(
                     // active tab; the user may be looking elsewhere
                     // when the shell exits.
                     parent_window.setTabStatusForSurface(rt_surface, .exited);
-                    const title: []const u16 = if (parent_window.findTabIndex(rt_surface)) |idx|
+                    const title: []const u16 = if (parent_window.findTabIndexOfSurface(rt_surface)) |idx|
                         parent_window.tab_titles[idx][0..parent_window.tab_title_lens[idx]]
                     else
                         std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -1162,7 +1250,7 @@ pub fn performAction(
                         _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
                         _ = w32.SetForegroundWindow(hwnd);
                         // Make sure the tab containing this surface is active.
-                        if (win.findTabIndex(core_surface.rt_surface)) |idx| {
+                        if (win.findTabIndexOfSurface(core_surface.rt_surface)) |idx| {
                             if (idx != win.active_tab) win.selectTabIndex(idx);
                         }
                         // Focus the surface's child HWND.
@@ -1179,7 +1267,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const dir: SplitTree(Surface).Split.Direction = switch (value) {
+                    const dir: SplitTree(Pane).Split.Direction = switch (value) {
                         .left => .left,
                         .right => .right,
                         .up => .up,
@@ -1902,7 +1990,7 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
         if (w == window) break w;
     } else return false;
     if (win.closing) return false;
-    const idx = win.findTabIndex(surface) orelse return false;
+    const idx = win.findTabIndexOfSurface(surface) orelse return false;
 
     const win_hwnd = win.hwnd orelse return false;
     _ = w32.ShowWindow(win_hwnd, w32.SW_RESTORE);
@@ -2035,6 +2123,114 @@ pub fn forceForegroundWindow(hwnd: w32.HWND) void {
     } else {
         _ = w32.SetForegroundWindow(hwnd);
     }
+}
+
+// -----------------------------------------------------------------------
+// WebView2 environment singleton (browser panes)
+// -----------------------------------------------------------------------
+
+/// Hand a browser pane the shared WebView2 environment, creating it on
+/// first use. The pane already holds its in-flight ref (startCreation);
+/// onEnvironment consumes it on failure or carries it into controller
+/// creation. Must be called on the UI thread.
+pub fn requestWebView2Env(self: *App, browser: *BrowserPane) void {
+    const alloc = self.core_app.alloc;
+    switch (self.webview2_env_state) {
+        .ready, .failed => browser.onEnvironment(self.webview2_env),
+        .creating => self.webview2_pending.append(alloc, browser) catch {
+            browser.onEnvironment(null);
+        },
+        .none => {
+            self.webview2_pending.append(alloc, browser) catch {
+                browser.onEnvironment(null);
+                return;
+            };
+            self.createWebView2Env();
+        },
+    }
+}
+
+/// Kick off async creation of the shared WebView2 environment. Any
+/// failure (loader missing, user-data folder, OOM) marks the singleton
+/// failed and flushes the pending panes with a null environment.
+fn createWebView2Env(self: *App) void {
+    self.webview2_env_state = .creating;
+    const alloc = self.core_app.alloc;
+
+    const loader = wv2.loadLoader() catch |err| {
+        log.warn("WebView2Loader.dll unavailable, browser panes disabled: {}", .{err});
+        self.failWebView2Env();
+        return;
+    };
+
+    // User data folder: %LOCALAPPDATA%\ghostty\webview2. Must exist
+    // before environment creation.
+    const local = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch {
+        self.failWebView2Env();
+        return;
+    };
+    defer alloc.free(local);
+    const dir = std.fs.path.join(alloc, &.{ local, "ghostty", "webview2" }) catch {
+        self.failWebView2Env();
+        return;
+    };
+    defer alloc.free(dir);
+    std.fs.cwd().makePath(dir) catch |err| {
+        log.warn("failed to create WebView2 user data dir={s} err={}", .{ dir, err });
+        self.failWebView2Env();
+        return;
+    };
+    const dir_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, dir) catch {
+        self.failWebView2Env();
+        return;
+    };
+    defer alloc.free(dir_w);
+
+    const handler = wv2.EnvironmentCompletedHandler(App).create(
+        alloc,
+        self,
+        onWebView2EnvCreated,
+    ) catch {
+        self.failWebView2Env();
+        return;
+    };
+    loader.createEnvironment(null, dir_w.ptr, handler) catch {
+        handler.unref();
+        log.warn("CreateCoreWebView2EnvironmentWithOptions failed", .{});
+        self.failWebView2Env();
+        return;
+    };
+    handler.unref();
+}
+
+fn onWebView2EnvCreated(self: *App, error_code: wv2.HRESULT, env_opt: ?*wv2.ICoreWebView2Environment) void {
+    if (env_opt) |env| {
+        env.addRef();
+        self.webview2_env = env;
+        self.webview2_env_state = .ready;
+    } else {
+        log.warn("WebView2 environment creation failed hr=0x{x:0>8}", .{
+            @as(u32, @bitCast(error_code)),
+        });
+        self.webview2_env_state = .failed;
+    }
+    self.flushWebView2Pending();
+}
+
+fn failWebView2Env(self: *App) void {
+    self.webview2_env_state = .failed;
+    self.flushWebView2Pending();
+}
+
+/// Deliver the (possibly null) environment to every waiting pane. The
+/// list is detached first: onEnvironment can re-enter the allocator
+/// and, in principle, request paths that append again.
+fn flushWebView2Pending(self: *App) void {
+    const alloc = self.core_app.alloc;
+    var pending = self.webview2_pending;
+    self.webview2_pending = .empty;
+    defer pending.deinit(alloc);
+    for (pending.items) |browser| browser.onEnvironment(self.webview2_env);
 }
 
 /// Notify the core app of a tick.
@@ -2386,9 +2582,9 @@ fn surfaceWndProc(
         },
 
         w32.WM_SETFOCUS => {
-            // Update the active surface for this tab when a split pane gains focus.
+            // Update the active pane for this tab when a split pane gains focus.
             const tab = surface.parent_window.active_tab;
-            surface.parent_window.tab_active_surface[tab] = surface;
+            surface.parent_window.tab_active_pane[tab] = surface.pane;
             surface.handleFocus(true);
             return 0;
         },

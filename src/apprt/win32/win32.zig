@@ -830,6 +830,8 @@ pub extern "user32" fn SetFocus(
     hWnd: ?HWND,
 ) callconv(.winapi) ?HWND;
 
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+
 pub extern "user32" fn GetWindowTextW(
     hWnd: HWND,
     lpString: [*]u16,
@@ -1433,3 +1435,16 @@ pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;
 
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
+
+// -----------------------------------------------------------------------
+// COM initialization (required by WebView2)
+// -----------------------------------------------------------------------
+
+pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
+
+pub extern "ole32" fn CoInitializeEx(
+    pvReserved: ?*anyopaque,
+    dwCoInit: u32,
+) callconv(.winapi) i32;
+
+pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;

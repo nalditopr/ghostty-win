@@ -13,6 +13,7 @@ const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
 const App = @import("App.zig");
+const Pane = @import("Pane.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
@@ -144,31 +145,10 @@ palette_count: u16 = 0,
 /// Indices into palette_entries for the current filter.
 palette_filtered: [palette_entries.len]u16 = undefined,
 
-/// Reference count for SplitTree ownership. Starts at 0 because
-/// SplitTree.init() calls ref() to take initial ownership.
-ref_count: u32 = 0,
-
-/// SplitTree view protocol: increment reference count.
-pub fn ref(self: *Surface, alloc: Allocator) Allocator.Error!*Surface {
-    _ = alloc;
-    self.ref_count += 1;
-    return self;
-}
-
-/// SplitTree view protocol: decrement reference count.
-pub fn unref(self: *Surface, alloc: Allocator) void {
-    self.ref_count -= 1;
-    if (self.ref_count == 0) {
-        if (self.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
-        self.deinit();
-        alloc.destroy(self);
-    }
-}
-
-/// SplitTree view protocol: identity comparison.
-pub fn eql(self: *const Surface, other: *const Surface) bool {
-    return self == other;
-}
+/// The Pane that wraps this surface in its tab's SplitTree. Set by
+/// Pane.create immediately after Surface.init; valid for the surface's
+/// lifetime (the pane unrefs to zero only when it destroys us).
+pane: *Pane = undefined,
 
 /// Initialize a new Surface by creating a Win32 window and WGL context,
 /// then initialize the core terminal surface (fonts, renderer, PTY, IO).
@@ -1771,6 +1751,7 @@ const CTX_SELECT_ALL: usize = 9103;
 const CTX_SPLIT_RIGHT: usize = 9104;
 const CTX_SPLIT_DOWN: usize = 9105;
 const CTX_NEW_TAB: usize = 9106;
+const CTX_BROWSER_SPLIT: usize = 9107;
 
 /// Show the terminal context menu at the screen cursor and run the
 /// chosen command through the core binding-action path (the same
@@ -1792,6 +1773,8 @@ fn showContextMenu(self: *Surface) void {
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, L("Split Down"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_NEW_TAB, L("New Tab"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_BROWSER_SPLIT, L("Open Browser Split"));
 
     var pt: w32.POINT = undefined;
     if (w32.GetCursorPos_(&pt) == 0) return;
@@ -1808,6 +1791,14 @@ fn showContextMenu(self: *Surface) void {
     // The menu ran a modal message loop; the window may have started
     // closing (or the surface shutting down) while it was up.
     if (self.parent_window.closing or !self.core_surface_ready) return;
+
+    // Browser split is a window-level action with no core binding.
+    if (@as(usize, @intCast(cmd)) == CTX_BROWSER_SPLIT) {
+        self.parent_window.newBrowserSplit(.right) catch |err| {
+            log.err("failed to open browser split: {}", .{err});
+        };
+        return;
+    }
 
     const ba: input.Binding.Action = switch (@as(usize, @intCast(cmd))) {
         CTX_COPY => .{ .copy_to_clipboard = .mixed },

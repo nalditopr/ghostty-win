@@ -31,6 +31,7 @@ pub const HitTarget = union(enum) {
     new_session,
     bell_icon,
     gear_icon,
+    browser_icon,
     /// Display index into the notification log, 0 = newest.
     notif_entry: usize,
     notif_clear,
@@ -83,6 +84,16 @@ pub fn gearSlotRect(footer_top: i32, scale: f32) w32.RECT {
     return .{ .left = pad + icon + pad, .top = top, .right = pad + icon + pad + icon, .bottom = top + icon };
 }
 
+/// Icon slot rect for the browser globe (third slot), vertically
+/// centered in the footer.
+pub fn globeSlotRect(footer_top: i32, scale: f32) w32.RECT {
+    const pad = scaled(PAD_BASE, scale);
+    const icon = scaled(FOOTER_ICON_BASE, scale);
+    const top = footer_top + @divTrunc(footerHeight(scale) - icon, 2);
+    const left = (pad + icon) * 2 + pad;
+    return .{ .left = left, .top = top, .right = left + icon, .bottom = top + icon };
+}
+
 /// Hit-test an x coordinate against the drag-resize grab band, which
 /// spans [edge - band_w, edge) where `edge` is the sidebar's right
 /// edge. A hidden sidebar (edge <= 0) has no band.
@@ -125,6 +136,8 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
         if (x >= pad and x < pad + icon) return .bell_icon;
         const gear_left = pad + icon + pad;
         if (x >= gear_left and x < gear_left + icon) return .gear_icon;
+        const globe_left = gear_left + icon + pad;
+        if (x >= globe_left and x < globe_left + icon) return .browser_icon;
         return .none;
     }
 
@@ -516,6 +529,22 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
 
+        // Browser globe icon. Like the bell, U+1F310 relies on GDI
+        // font linking for the glyph.
+        var globe_rect = globeSlotRect(footer_top, win.scale);
+        _ = w32.SetTextColor(mem_dc, if (win.sidebar_hover == .browser_icon)
+            active_text_color
+        else
+            inactive_text_color);
+        const globe_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{1F310}");
+        _ = w32.DrawTextW(
+            mem_dc,
+            globe_char,
+            globe_char.len,
+            &globe_rect,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+        );
+
         // Unread badge: amber square at the bell's top-right corner.
         const unread = win.app.notif_unread;
         if (unread > 0) {
@@ -576,8 +605,9 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
 
 /// hitTest context used by the tests: scale 1.0, 400px tall, 220px
 /// wide. Derived geometry: footer_top=368, panel_h=160, panel_top=208
-/// (open), bell x in [8,32), gear x in [40,64), panel header y in
-/// [208,232) with Clear at x>=172, entry rows 40px from y=232.
+/// (open), bell x in [8,32), gear x in [40,64), globe x in [72,96),
+/// panel header y in [208,232) with Clear at x>=172, entry rows 40px
+/// from y=232.
 fn testCtx(tab_count: usize, panel_open: bool, notif_count: usize) HitCtx {
     return .{
         .item_h = 36,
@@ -644,6 +674,11 @@ test "sidebar hitTest: footer bell and gear slots" {
     try testing.expectEqual(@as(HitTarget, .gear_icon), hitTest(40, 368, ctx));
     try testing.expectEqual(@as(HitTarget, .gear_icon), hitTest(63, 368, ctx));
     try testing.expectEqual(@as(HitTarget, .none), hitTest(64, 368, ctx));
+    // Gap, then globe: x in [72, 96).
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(71, 368, ctx));
+    try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(72, 368, ctx));
+    try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(95, 399, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(96, 368, ctx));
 }
 
 test "sidebar hitTest: footer boundary clips the row area" {
@@ -708,13 +743,39 @@ test "sidebar footerHeight and panelHeight scale" {
 test "sidebar footer slots: hitTest x range matches the painted rects" {
     const bell = bellSlotRect(368, 1.0);
     const gear = gearSlotRect(368, 1.0);
+    const globe = globeSlotRect(368, 1.0);
     try testing.expectEqual(@as(i32, 8), bell.left);
     try testing.expectEqual(@as(i32, 32), bell.right);
     try testing.expectEqual(@as(i32, 40), gear.left);
     try testing.expectEqual(@as(i32, 64), gear.right);
+    try testing.expectEqual(@as(i32, 72), globe.left);
+    try testing.expectEqual(@as(i32, 96), globe.right);
     // Icons are vertically centered in the 32px footer.
     try testing.expectEqual(@as(i32, 372), bell.top);
     try testing.expectEqual(@as(i32, 396), bell.bottom);
+    try testing.expectEqual(@as(i32, 372), globe.top);
+    try testing.expectEqual(@as(i32, 396), globe.bottom);
+}
+
+test "sidebar hitTest: globe slot scales with DPI" {
+    // At 2.0 scale: pad=16, icon=48 — globe x in [144, 192),
+    // footer_top = 800 - 64 = 736.
+    const ctx: HitCtx = .{
+        .item_h = 72,
+        .tab_count = 2,
+        .client_h = 800,
+        .width = 440,
+        .scale = 2.0,
+        .panel_open = false,
+        .notif_count = 0,
+    };
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(143, 736, ctx));
+    try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(144, 736, ctx));
+    try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(191, 799, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(192, 736, ctx));
+    const globe = globeSlotRect(736, 2.0);
+    try testing.expectEqual(@as(i32, 144), globe.left);
+    try testing.expectEqual(@as(i32, 192), globe.right);
 }
 
 test "sidebar itemRect: first row spans the full width" {
