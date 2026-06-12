@@ -3962,3 +3962,130 @@ test "unit: default-shell menu ids match the reserved registry" {
 test {
     _ = WindowState;
 }
+
+// ---------------------------------------------------------------------------
+// Additional unit tests. Kept in their own section at the very end of
+// the file so concurrent Window.zig changes merge cleanly around them.
+// ---------------------------------------------------------------------------
+
+test "unit: workspace aggregate status of an empty workspace is normal" {
+    var ws: Workspace = .{};
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+    // Status slots past tab_count are ignored even when dirty.
+    ws.tab_status[0] = .exited;
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+}
+
+test "unit: workspace aggregate status all-normal stays normal" {
+    var ws: Workspace = .{};
+    ws.tab_count = 3;
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+}
+
+test "unit: workspace aggregate status exited beats bell" {
+    var ws: Workspace = .{};
+    ws.tab_count = 4;
+    ws.tab_status[1] = .bell;
+    try testing.expectEqual(TabStatus.bell, ws.aggregateStatus());
+    // Any exited tab wins regardless of position relative to the bell.
+    ws.tab_status[3] = .exited;
+    try testing.expectEqual(TabStatus.exited, ws.aggregateStatus());
+    ws.tab_status[3] = .normal;
+    ws.tab_status[0] = .exited;
+    try testing.expectEqual(TabStatus.exited, ws.aggregateStatus());
+    // Shrinking the live range back to one normal tab hides the rest.
+    ws.tab_status[0] = .normal;
+    ws.tab_count = 1;
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+}
+
+test "unit: tab arrays stress at workspace capacity" {
+    // Parallel arrays at the real MAX_TABS size: entry i of every array
+    // must keep describing the same logical tab through edge-position
+    // removes, a front re-insert, full-span moves, and an end swap.
+    var ids: [MAX_TABS]u16 = undefined;
+    var tags: [MAX_TABS]u32 = undefined;
+    const arrays = .{ &ids, &tags };
+    for (0..MAX_TABS) |i| {
+        ids[i] = @intCast(i);
+        tags[i] = @as(u32, @intCast(i)) + 1000;
+    }
+    var count: usize = MAX_TABS;
+
+    // Remove the first tab: everything shifts down one.
+    tabArraysRemove(arrays, count, 0);
+    count -= 1; // 63 live: 1..63
+    try testing.expectEqual(@as(u16, 1), ids[0]);
+    try testing.expectEqual(@as(u16, 63), ids[count - 1]);
+
+    // Remove the last tab (idx == count - 1): pure count decrement.
+    tabArraysRemove(arrays, count, count - 1);
+    count -= 1; // 62 live: 1..62
+    try testing.expectEqual(@as(u16, 62), ids[count - 1]);
+
+    // Re-insert at the front (gap at 0).
+    tabArraysInsertGap(arrays, count, 0);
+    ids[0] = 0;
+    tags[0] = 1000;
+    count += 1; // 63 live: 0..62
+
+    // Front-to-back then back-to-front across the whole span: a full
+    // round trip must be the identity permutation.
+    tabArraysMove(arrays, 0, count - 1);
+    tabArraysMove(arrays, count - 1, 0);
+    for (0..count) |i| {
+        try testing.expectEqual(@as(u16, @intCast(i)), ids[i]);
+    }
+
+    // Swap the two ends, then verify every parallel slot still
+    // describes the same logical tab.
+    tabArraysSwap(arrays, 0, count - 1);
+    try testing.expectEqual(@as(u16, 62), ids[0]);
+    try testing.expectEqual(@as(u16, 0), ids[count - 1]);
+    for (ids[0..count], tags[0..count]) |id, tag| {
+        try testing.expectEqual(@as(u32, id) + 1000, tag);
+    }
+}
+
+test "unit: window title cap=1 boundary" {
+    // cap=1 ASCII keeps a single byte (the fast path's smallest cut).
+    try testing.expectEqualStrings("a", capUtf8("abc", 1));
+    // cap=1 inside a 2-byte sequence backs up to empty.
+    try testing.expectEqualStrings("", capUtf8("\xC3\xA9x", 1));
+    // cap=1 after the lead byte of a 4-byte emoji backs up to empty.
+    try testing.expectEqualStrings("", capUtf8("\xF0\x9F\x98\x80", 1));
+}
+
+test "unit: picker boundary ids 9319 and 9320 resolve by raw value" {
+    // 9319 is the last distro slot and 9320 the browser entry; raw
+    // numeric IDs so a constant edit that shifts the boundary fails
+    // here even if the registry test is updated to match.
+    try testing.expectEqual(PickerSelection{ .distro = 9 }, pickerSelection(9319, 10));
+    try testing.expectEqual(PickerSelection.browser, pickerSelection(9320, 10));
+    // One short of a full menu: 9319 is then a stale ID.
+    try testing.expectEqual(PickerSelection.none, pickerSelection(9319, 9));
+}
+
+test "unit: default-shell distro ids at the reserved cap boundary" {
+    var buf: [512]u8 = undefined;
+    // The call site appends at most CAP - BASE distros, so the largest
+    // menu ID ever generated is DISTRO_CAP - 1. With a list filled to
+    // exactly that cap, the last in-range ID resolves and the cap ID
+    // (and anything above) does not.
+    const cap = DEFAULT_SHELL_DISTRO_CAP - DEFAULT_SHELL_DISTRO_BASE;
+    var distros: [cap]internal_os.wsl.Distro = undefined;
+    for (&distros) |*d| d.* = .{
+        .name = "Edge",
+        .guid = "{g}",
+        .is_default = false,
+        .version = 2,
+    };
+    try testing.expectEqualStrings(
+        "wsl.exe --cd ~ -d Edge",
+        defaultShellValue(DEFAULT_SHELL_DISTRO_CAP - 1, &distros, &buf).?,
+    );
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        defaultShellValue(DEFAULT_SHELL_DISTRO_CAP, &distros, &buf),
+    );
+}

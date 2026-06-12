@@ -1358,3 +1358,23 @@ test "unit: browser title cap worst-case expansion fits title_buf" {
     const len = try std.unicode.utf16LeToUtf8(buf[0 .. buf_len - 1], capped);
     try testing.expectEqual(max_units * 3, len);
 }
+
+test "unit: browser title cap=1 keeps one ascii unit" {
+    const input = [_]u16{ 'a', 'b' };
+    try testing.expectEqualSlices(u16, &.{'a'}, capUtf16(&input, 1));
+}
+
+test "unit: browser title cap=1 with a leading surrogate pair collapses to empty" {
+    // U+1F600 first: a cut at one unit would strand the high surrogate,
+    // so the result backs up to nothing rather than emit a malformed
+    // title.
+    const input = [_]u16{ 0xD83D, 0xDE00, 'a' };
+    try testing.expectEqualSlices(u16, &.{}, capUtf16(&input, 1));
+}
+
+test "unit: browser title exact fit including a trailing surrogate pair" {
+    // span.len == max_units takes the no-op path even when the final
+    // unit is the low half of a pair.
+    const input = [_]u16{ 'a', 0xD83D, 0xDE00 };
+    try testing.expectEqualSlices(u16, &input, capUtf16(&input, 3));
+}

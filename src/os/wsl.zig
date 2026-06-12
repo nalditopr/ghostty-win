@@ -506,6 +506,228 @@ test "wsl commandForDistro quoting edge cases" {
     }
 }
 
+test "wsl commandForDistro trailing backslash torture" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Backslash directly before an embedded quote at the end of the
+    // name: the run is doubled AND the quote escaped → \\\" inside.
+    {
+        const cmd = try commandForDistro(alloc, "dist\\\"");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"dist\\\\\\\"\"", cmd);
+    }
+
+    // Two trailing backslashes in a quoted name double to four so the
+    // closing quote survives.
+    {
+        const cmd = try commandForDistro(alloc, "a b\\\\");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"a b\\\\\\\\\"", cmd);
+    }
+
+    // Space followed by a single trailing backslash.
+    {
+        const cmd = try commandForDistro(alloc, " \\");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \" \\\\\"", cmd);
+    }
+
+    // A lone backslash with no whitespace/quote needs no quoting at all
+    // and is passed through verbatim.
+    {
+        const cmd = try commandForDistro(alloc, "\\");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \\", cmd);
+    }
+}
+
+test "wsl commandForDistro quote-heavy names" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A name that is just one double quote.
+    {
+        const cmd = try commandForDistro(alloc, "\"");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"\\\"\"", cmd);
+    }
+
+    // Two consecutive quotes, each escaped independently.
+    {
+        const cmd = try commandForDistro(alloc, "\"\"");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"\\\"\\\"\"", cmd);
+    }
+
+    // Quote mid-name plus trailing backslash: both rules at once.
+    {
+        const cmd = try commandForDistro(alloc, "a\"b\\");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"a\\\"b\\\\\"", cmd);
+    }
+
+    // Two backslashes before a mid-name quote: 2*2+1 = 5 backslashes.
+    {
+        const cmd = try commandForDistro(alloc, "a\\\\\"b");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"a\\\\\\\\\\\"b\"", cmd);
+    }
+}
+
+test "wsl commandForDistro tab handling" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A tab triggers quoting just like a space.
+    {
+        const cmd = try commandForDistro(alloc, "a\tb");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"a\tb\"", cmd);
+    }
+
+    // A name that is only a tab.
+    {
+        const cmd = try commandForDistro(alloc, "\t");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"\t\"", cmd);
+    }
+
+    // Tab followed by a quote: tab is not a backslash, so only the
+    // quote is escaped.
+    {
+        const cmd = try commandForDistro(alloc, "\t\"");
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d \"\t\\\"\"", cmd);
+    }
+}
+
+test "wsl commandForDistro max-length names" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Registry key names (and thus practical distro names) are capped at
+    // 255 characters. A plain max-length name is passed unquoted.
+    {
+        const long = "a" ** 255;
+        const cmd = try commandForDistro(alloc, long);
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings("wsl.exe --cd ~ -d " ++ long, cmd);
+        try testing.expectEqual(@as(usize, 18 + 255), cmd.len);
+    }
+
+    // Max-length name with a space and a trailing backslash exercises
+    // quoting + trailing-run doubling at the length limit.
+    {
+        const long = ("a" ** 253) ++ " \\";
+        const cmd = try commandForDistro(alloc, long);
+        defer alloc.free(cmd);
+        try testing.expectEqualStrings(
+            "wsl.exe --cd ~ -d \"" ++ ("a" ** 253) ++ " \\\\\"",
+            cmd,
+        );
+    }
+}
+
+test "wsl utf16 lone surrogate halves" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Lone high surrogate at end of input.
+    try testing.expectError(
+        error.DanglingSurrogateHalf,
+        utf16ToUtf8Alloc(alloc, &[_]u16{0xD800}),
+    );
+
+    // High surrogate followed by a non-surrogate.
+    try testing.expectError(
+        error.ExpectedSecondSurrogateHalf,
+        utf16ToUtf8Alloc(alloc, &[_]u16{ 0xD83D, 'a' }),
+    );
+
+    // Lone low surrogate.
+    try testing.expectError(
+        error.UnexpectedSecondSurrogateHalf,
+        utf16ToUtf8Alloc(alloc, &[_]u16{0xDE00}),
+    );
+
+    // Low-then-high (reversed pair).
+    try testing.expectError(
+        error.UnexpectedSecondSurrogateHalf,
+        utf16ToUtf8Alloc(alloc, &[_]u16{ 0xDE00, 0xD83D }),
+    );
+
+    // A surrogate pair split by an embedded NUL: trimNul cuts after the
+    // high half, leaving it dangling.
+    try testing.expectError(
+        error.DanglingSurrogateHalf,
+        utf16ToUtf8Alloc(alloc, &[_]u16{ 0xD83D, 0, 0xDE00 }),
+    );
+}
+
+test "wsl utf16 BMP boundary and astral chars" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // U+D7FF: last code point before the surrogate range.
+    {
+        const result = try utf16ToUtf8Alloc(alloc, &[_]u16{ 0xD7FF, 0 });
+        defer alloc.free(result);
+        try testing.expectEqualStrings("\u{D7FF}", result);
+    }
+
+    // U+E000: first code point after the surrogate range.
+    {
+        const result = try utf16ToUtf8Alloc(alloc, &[_]u16{ 0xE000, 0 });
+        defer alloc.free(result);
+        try testing.expectEqualStrings("\u{E000}", result);
+    }
+
+    // U+FFFD (replacement char) and U+FFFF (last BMP code unit) both
+    // round-trip; the converter does not reject noncharacters.
+    {
+        const result = try utf16ToUtf8Alloc(alloc, &[_]u16{ 0xFFFD, 0xFFFF, 0 });
+        defer alloc.free(result);
+        try testing.expectEqualStrings("\u{FFFD}\u{FFFF}", result);
+    }
+
+    // U+10000: the first astral code point (lowest surrogate pair).
+    {
+        const result = try utf16ToUtf8Alloc(alloc, &[_]u16{ 0xD800, 0xDC00, 0 });
+        defer alloc.free(result);
+        try testing.expectEqualStrings("\u{10000}", result);
+    }
+}
+
+test "wsl utf16EqlIgnoreCase non-ASCII stays case-sensitive" {
+    const testing = std.testing;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    // ASCII letters fold.
+    try testing.expect(utf16EqlIgnoreCase(L("A"), L("a")));
+    try testing.expect(utf16EqlIgnoreCase(L("Z"), L("z")));
+    try testing.expect(utf16EqlIgnoreCase(L("Ubuntu-22.04"), L("UBUNTU-22.04")));
+
+    // Latin-1 É (U+00C9) vs é (U+00E9): differ by 0x20 like ASCII case
+    // pairs, but they are non-ASCII so they must NOT fold.
+    try testing.expect(!utf16EqlIgnoreCase(L("É"), L("é")));
+
+    // Cyrillic А (U+0410) vs а (U+0430): also a 0x20 pair, also no fold.
+    try testing.expect(!utf16EqlIgnoreCase(L("А"), L("а")));
+
+    // Fullwidth Ａ (U+FF21) vs ａ (U+FF41): no fold.
+    try testing.expect(!utf16EqlIgnoreCase(L("Ａ"), L("ａ")));
+
+    // Characters just outside A-Z: '@' (0x40) vs '`' (0x60) and
+    // '[' (0x5B) vs '{' (0x7B) differ by 0x20 but must not fold.
+    try testing.expect(!utf16EqlIgnoreCase(&[_]u16{'@'}, &[_]u16{'`'}));
+    try testing.expect(!utf16EqlIgnoreCase(&[_]u16{'['}, &[_]u16{'{'}));
+
+    // Raw surrogate code units compare bitwise (no decoding involved).
+    try testing.expect(utf16EqlIgnoreCase(&[_]u16{0xD800}, &[_]u16{0xD800}));
+    try testing.expect(!utf16EqlIgnoreCase(&[_]u16{0xD800}, &[_]u16{0xD801}));
+}
+
 test "wsl list" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 

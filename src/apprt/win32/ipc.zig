@@ -96,6 +96,42 @@ pub const Request = struct {
     }
 };
 
+// Typed accessors over Request.args. Command-specific argument
+// validation (e.g. click's required integer "ref", fill's required
+// string "text") happens in the handlers via these; they live here so
+// the pure protocol tests can cover them without dragging in App.
+
+/// Read an optional u32 "id" field from the request args: the pane
+/// address used by navigate/eval/snapshot/click/fill.
+pub fn argId(req: *const Request) ?u32 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get("id") orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        else => null,
+    };
+}
+
+/// Read a required string field from the request args.
+pub fn argString(req: *const Request, key: []const u8) ?[]const u8 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Read an i64 field (the CDP backendNodeId `ref`) from the request args.
+pub fn argI64(req: *const Request, key: []const u8) ?i64 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+
 pub const ParseFailure = struct {
     /// Request id when it could be recovered from the malformed
     /// request, 0 otherwise.
@@ -929,6 +965,450 @@ test "ipc: response id round-trips through JSON" {
     );
     try testing.expect(parsed.value.object.get("ok").?.bool);
     try testing.expect(parsed.value.object.get("data").?.bool);
+}
+
+test "ipc: framer reassembles a request fed one byte at a time" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    const wire = "{\"id\":9,\"cmd\":\"eval\"}\r\n";
+    for (wire, 0..) |byte, i| {
+        try framer.feed(alloc, &.{byte});
+        if (i < wire.len - 1) try testing.expect(framer.next() == null);
+    }
+    try testing.expectEqualStrings("{\"id\":9,\"cmd\":\"eval\"}", framer.next().?);
+    try testing.expect(framer.next() == null);
+}
+
+test "ipc: framer accepts a line exactly at the cap" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    // max_line_bytes - 1 content bytes + "\n" buffers exactly
+    // max_line_bytes, the largest frame feed() admits.
+    const content = try alloc.alloc(u8, max_line_bytes - 1);
+    defer alloc.free(content);
+    @memset(content, 'x');
+    try framer.feed(alloc, content);
+    try testing.expect(framer.next() == null);
+    try framer.feed(alloc, "\n");
+    const line = framer.next().?;
+    try testing.expectEqual(max_line_bytes - 1, line.len);
+    try testing.expectEqual(@as(u8, 'x'), line[0]);
+    try testing.expectEqual(@as(u8, 'x'), line[line.len - 1]);
+    try testing.expect(framer.next() == null);
+}
+
+test "ipc: framer rejects one byte over the cap across feeds" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    // Fill to exactly the cap without a newline; the line can never be
+    // completed because even its own terminator pushes it over.
+    const half = try alloc.alloc(u8, max_line_bytes / 2);
+    defer alloc.free(half);
+    @memset(half, 'y');
+    try framer.feed(alloc, half);
+    try framer.feed(alloc, half);
+    try testing.expectError(error.MessageTooLong, framer.feed(alloc, "\n"));
+}
+
+test "ipc: framer cap applies to the pending line, not the connection" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    // Two back-to-back maximum-size lines: consuming the first must
+    // compact the buffer so the second doesn't trip the cap.
+    const content = try alloc.alloc(u8, max_line_bytes - 1);
+    defer alloc.free(content);
+    @memset(content, 'z');
+    try framer.feed(alloc, content);
+    try framer.feed(alloc, "\n");
+    try testing.expectEqual(max_line_bytes - 1, framer.next().?.len);
+    try framer.feed(alloc, content);
+    try framer.feed(alloc, "\n");
+    try testing.expectEqual(max_line_bytes - 1, framer.next().?.len);
+    try testing.expect(framer.next() == null);
+}
+
+test "ipc: framer mixes LF and CRLF endings in one chunk" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    try framer.feed(alloc, "a\nbb\r\n\nccc\r\n\r\n d \n");
+    try testing.expectEqualStrings("a", framer.next().?);
+    try testing.expectEqualStrings("bb", framer.next().?);
+    try testing.expectEqualStrings("", framer.next().?);
+    try testing.expectEqualStrings("ccc", framer.next().?);
+    try testing.expectEqualStrings("", framer.next().?);
+    try testing.expectEqualStrings(" d ", framer.next().?);
+    try testing.expect(framer.next() == null);
+}
+
+test "ipc: framer handles CRLF split across feeds" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    try framer.feed(alloc, "first\r");
+    try testing.expect(framer.next() == null);
+    try framer.feed(alloc, "\nsecond\n");
+    try testing.expectEqualStrings("first", framer.next().?);
+    try testing.expectEqualStrings("second", framer.next().?);
+    try testing.expect(framer.next() == null);
+}
+
+test "ipc: framer treats CR as data except immediately before LF" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    // Interior CR is payload; only the CR of a final CRLF is stripped,
+    // and at most one of them.
+    try framer.feed(alloc, "a\rb\nc\r\r\n\r\n");
+    try testing.expectEqualStrings("a\rb", framer.next().?);
+    try testing.expectEqualStrings("c\r", framer.next().?);
+    try testing.expectEqualStrings("", framer.next().?);
+    try testing.expect(framer.next() == null);
+}
+
+test "ipc: framer survives many messages through compaction" {
+    const alloc = testing.allocator;
+    var framer: LineFramer = .{};
+    defer framer.deinit(alloc);
+
+    var wire_buf: [32]u8 = undefined;
+    var expected_buf: [32]u8 = undefined;
+    for (0..200) |i| {
+        const wire = try std.fmt.bufPrint(&wire_buf, "{{\"id\":{d}}}\n", .{i});
+        // Split each message across two feeds so a partial tail sits in
+        // the buffer at every compaction.
+        try framer.feed(alloc, wire[0 .. wire.len / 2]);
+        try testing.expect(framer.next() == null);
+        try framer.feed(alloc, wire[wire.len / 2 ..]);
+        const expected = try std.fmt.bufPrint(&expected_buf, "{{\"id\":{d}}}", .{i});
+        try testing.expectEqualStrings(expected, framer.next().?);
+        try testing.expect(framer.next() == null);
+    }
+}
+
+test "ipc: parse accepts every command name" {
+    const alloc = testing.allocator;
+    inline for (@typeInfo(Command).@"enum".fields) |field| {
+        const line = try std.fmt.allocPrint(
+            alloc,
+            "{{\"id\":1,\"cmd\":\"{s}\"}}",
+            .{field.name},
+        );
+        defer alloc.free(line);
+        const result = try parseLine(alloc, line);
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(@field(Command, field.name), req.cmd);
+    }
+}
+
+test "ipc: parse id boundaries" {
+    const alloc = testing.allocator;
+    // id 0 is accepted (it doubles as the unrecoverable-id sentinel in
+    // responses, but the protocol does not reserve it).
+    {
+        const result = try parseLine(alloc, "{\"id\":0,\"cmd\":\"open\"}");
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(@as(u64, 0), req.id);
+    }
+    // Largest JSON integer std.json yields as .integer (i64 max).
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":9223372036854775807,\"cmd\":\"open\"}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(@as(u64, 9223372036854775807), req.id);
+    }
+    // Beyond i64: std.json yields .number_string, not .integer.
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":18446744073709551615,\"cmd\":\"open\"}",
+        );
+        try testing.expectEqual(ErrorCode.invalid_request, result.err.code);
+        try testing.expectEqual(@as(u64, 0), result.err.id);
+    }
+    // Fractional id.
+    {
+        const result = try parseLine(alloc, "{\"id\":1.5,\"cmd\":\"open\"}");
+        try testing.expectEqual(ErrorCode.invalid_request, result.err.code);
+    }
+    // Boolean id.
+    {
+        const result = try parseLine(alloc, "{\"id\":true,\"cmd\":\"open\"}");
+        try testing.expectEqual(ErrorCode.invalid_request, result.err.code);
+    }
+}
+
+test "ipc: parse duplicate keys is a parse error" {
+    // std.json's default duplicate_field_behavior is .@"error", which
+    // parseLine reports as parse_error; no object ever materializes, so
+    // the id cannot be recovered.
+    const result = try parseLine(
+        testing.allocator,
+        "{\"id\":1,\"id\":2,\"cmd\":\"open\"}",
+    );
+    try testing.expectEqual(ErrorCode.parse_error, result.err.code);
+    try testing.expectEqual(@as(u64, 0), result.err.id);
+}
+
+test "ipc: parse missing or malformed cmd preserves the recovered id" {
+    {
+        const result = try parseLine(testing.allocator, "{\"id\":9}");
+        try testing.expectEqual(ErrorCode.invalid_request, result.err.code);
+        try testing.expectEqual(@as(u64, 9), result.err.id);
+    }
+    {
+        const result = try parseLine(
+            testing.allocator,
+            "{\"id\":11,\"cmd\":42}",
+        );
+        try testing.expectEqual(ErrorCode.invalid_request, result.err.code);
+        try testing.expectEqual(@as(u64, 11), result.err.id);
+    }
+}
+
+test "ipc: parse tolerates unknown extra fields" {
+    const result = try parseLine(
+        testing.allocator,
+        "{\"id\":3,\"cmd\":\"click\",\"args\":{\"ref\":7,\"hover\":true},\"trace\":\"x\"}",
+    );
+    const req = result.ok;
+    defer req.destroy();
+    try testing.expectEqual(@as(u64, 3), req.id);
+    try testing.expectEqual(Command.click, req.cmd);
+    try testing.expectEqual(@as(i64, 7), argI64(req, "ref").?);
+    // Unknown args keys ride along untouched for the handler to ignore.
+    try testing.expect(req.args.object.get("hover").?.bool);
+}
+
+test "ipc: parse explicit null args" {
+    const result = try parseLine(
+        testing.allocator,
+        "{\"id\":2,\"cmd\":\"snapshot\",\"args\":null}",
+    );
+    const req = result.ok;
+    defer req.destroy();
+    try testing.expectEqual(std.json.Value.null, req.args);
+    // snapshot's optional pane address is simply absent.
+    try testing.expect(argId(req) == null);
+}
+
+test "ipc: click arg validation via argI64" {
+    const alloc = testing.allocator;
+    // Missing ref → null (App answers MissingRef).
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":1,\"cmd\":\"click\",\"args\":{}}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expect(argI64(req, "ref") == null);
+    }
+    // ref must be an integer, not a numeric string.
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":1,\"cmd\":\"click\",\"args\":{\"ref\":\"12\"}}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expect(argI64(req, "ref") == null);
+    }
+    // No args object at all.
+    {
+        const result = try parseLine(alloc, "{\"id\":1,\"cmd\":\"click\"}");
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expect(argI64(req, "ref") == null);
+    }
+    // Valid; argI64 passes any i64 through, including negatives.
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":1,\"cmd\":\"click\",\"args\":{\"ref\":-3}}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(@as(i64, -3), argI64(req, "ref").?);
+    }
+}
+
+test "ipc: fill arg validation via argI64 and argString" {
+    const alloc = testing.allocator;
+    // Missing text → null (App answers MissingText).
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":4,\"cmd\":\"fill\",\"args\":{\"ref\":7}}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(@as(i64, 7), argI64(req, "ref").?);
+        try testing.expect(argString(req, "text") == null);
+    }
+    // text must be a string.
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":4,\"cmd\":\"fill\",\"args\":{\"ref\":7,\"text\":42}}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expect(argString(req, "text") == null);
+    }
+    // Fully valid fill with non-ASCII text via a JSON unicode escape.
+    {
+        const result = try parseLine(
+            alloc,
+            "{\"id\":4,\"cmd\":\"fill\",\"args\":{\"ref\":7,\"text\":\"Col\\u00f3n\"}}",
+        );
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqualStrings("Colón", argString(req, "text").?);
+    }
+}
+
+test "ipc: argId validates the optional pane address" {
+    const alloc = testing.allocator;
+    const Case = struct { line: []const u8, expect: ?u32 };
+    const cases = [_]Case{
+        .{ .line = "{\"id\":1,\"cmd\":\"eval\",\"args\":{\"id\":0}}", .expect = 0 },
+        .{ .line = "{\"id\":1,\"cmd\":\"eval\",\"args\":{\"id\":4294967295}}", .expect = 4294967295 },
+        .{ .line = "{\"id\":1,\"cmd\":\"eval\",\"args\":{\"id\":4294967296}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"eval\",\"args\":{\"id\":-1}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"eval\",\"args\":{\"id\":\"3\"}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"eval\",\"args\":{}}", .expect = null },
+    };
+    for (cases) |case| {
+        const result = try parseLine(alloc, case.line);
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(case.expect, argId(req));
+    }
+}
+
+test "ipc: every error code has a JSON-safe message" {
+    const alloc = testing.allocator;
+    inline for (@typeInfo(ErrorCode).@"enum".fields) |field| {
+        const code: ErrorCode = @enumFromInt(field.value);
+        const msg = code.message();
+        try testing.expect(msg.len > 0);
+
+        // The message must survive serializeError → JSON parse intact
+        // (invalid_request's message contains embedded quotes).
+        const out = try serializeError(alloc, 1, msg);
+        defer alloc.free(out);
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            std.mem.trimRight(u8, out, "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+        try testing.expectEqualStrings(
+            msg,
+            parsed.value.object.get("error").?.string,
+        );
+        try testing.expect(!parsed.value.object.get("ok").?.bool);
+    }
+}
+
+test "ipc: serializeError escapes backslashes, control chars, and non-ASCII" {
+    const alloc = testing.allocator;
+    const msg = "path C:\\Users\\Colón\x01\ttab \"q\"";
+    const out = try serializeError(alloc, 6, msg);
+    defer alloc.free(out);
+
+    // Exactly one frame: the only newline byte is the trailing frame
+    // terminator, so the embedded control characters were escaped.
+    try testing.expectEqual(out.len - 1, std.mem.indexOfScalar(u8, out, '\n').?);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        std.mem.trimRight(u8, out, "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqualStrings(msg, parsed.value.object.get("error").?.string);
+    try testing.expectEqual(@as(i64, 6), parsed.value.object.get("id").?.integer);
+}
+
+test "ipc: serializeOk passes data through verbatim" {
+    const alloc = testing.allocator;
+    // data_json is already-serialized JSON: serializeOk must not
+    // re-escape its backslashes or unicode escapes.
+    const data = "{\"path\":\"C:\\\\Users\\\\Col\\u00f3n\",\"n\":[1,2]}";
+    const out = try serializeOk(alloc, 0, data);
+    defer alloc.free(out);
+    try testing.expectEqualStrings(
+        "{\"id\":0,\"ok\":true,\"data\":{\"path\":\"C:\\\\Users\\\\Col\\u00f3n\",\"n\":[1,2]}}\n",
+        out,
+    );
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        std.mem.trimRight(u8, out, "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "C:\\Users\\Colón",
+        parsed.value.object.get("data").?.object.get("path").?.string,
+    );
+}
+
+test "ipc: serialize preserves ids beyond i64 range" {
+    const alloc = testing.allocator;
+    const out = try serializeError(alloc, std.math.maxInt(u64), "x");
+    defer alloc.free(out);
+    try testing.expectEqualStrings(
+        "{\"id\":18446744073709551615,\"ok\":false,\"error\":\"x\"}\n",
+        out,
+    );
+}
+
+test "ipc: recoverable parse failures keep the id through serializeError" {
+    const alloc = testing.allocator;
+    // The id is recoverable here: well-formed envelope, bad command.
+    const result = try parseLine(alloc, "{\"id\":88,\"cmd\":\"explode\"}");
+    const failure = result.err;
+    try testing.expectEqual(@as(u64, 88), failure.id);
+    try testing.expectEqual(ErrorCode.unknown_command, failure.code);
+
+    // Serialize it the way Server.dispatchLine answers.
+    const out = try serializeError(alloc, failure.id, failure.code.message());
+    defer alloc.free(out);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        std.mem.trimRight(u8, out, "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 88), parsed.value.object.get("id").?.integer);
+    try testing.expect(!parsed.value.object.get("ok").?.bool);
+    try testing.expectEqualStrings(
+        ErrorCode.unknown_command.message(),
+        parsed.value.object.get("error").?.string,
+    );
 }
 
 // ---------------------------------------------------------------------------

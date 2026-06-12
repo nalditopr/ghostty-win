@@ -331,3 +331,406 @@ test "winsize: clamp respects a virtual screen with a negative origin" {
     try testing.expectEqual(saved.x, out.x);
     try testing.expectEqual(saved.y, out.y);
 }
+
+test "winsize: parse duplicate keys last occurrence wins" {
+    const testing = std.testing;
+    const text =
+        \\width=640
+        \\height=480
+        \\x=1
+        \\y=2
+        \\width=800
+        \\maximized=true
+        \\maximized=false
+        \\
+    ;
+    const out = State.parse(text) orelse return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 800), out.width);
+    try testing.expectEqual(@as(i32, 480), out.height);
+    try testing.expect(!out.maximized);
+}
+
+test "winsize: parse duplicate key with malformed last value poisons the field" {
+    const testing = std.testing;
+    // Pins current behavior: a later malformed duplicate RESETS the field
+    // to null (last-wins applies even when the last value is garbage), so
+    // the whole parse fails despite an earlier valid value.
+    const text =
+        \\width=800
+        \\height=600
+        \\x=1
+        \\y=2
+        \\width=corrupt
+        \\
+    ;
+    try testing.expect(State.parse(text) == null);
+}
+
+test "winsize: parse extreme numeric values" {
+    const testing = std.testing;
+    // i32 max parses fine but is rejected by validate (> 32767).
+    try testing.expect(State.parse("width=2147483647\nheight=600\nx=0\ny=0\n") == null);
+    // Overflowing i32 fails parseInt → field stays null → parse fails.
+    try testing.expect(State.parse("width=99999999999999999999\nheight=600\nx=0\ny=0\n") == null);
+    // x/y are NOT bounded by validate: extreme positions are accepted
+    // as-is (clampToVirtualScreen handles them at restore time).
+    const out = State.parse("width=800\nheight=600\nx=2147483647\ny=-2147483648\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), out.x);
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), out.y);
+}
+
+test "winsize: parse dimension boundaries at min_dim and 32767" {
+    const testing = std.testing;
+    // Exactly min_dim is accepted.
+    const at_min = State.parse("width=100\nheight=100\nx=0\ny=0\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 100), at_min.width);
+    // One below min_dim is rejected.
+    try testing.expect(State.parse("width=99\nheight=100\nx=0\ny=0\n") == null);
+    try testing.expect(State.parse("width=100\nheight=99\nx=0\ny=0\n") == null);
+    // Negative dimensions are rejected.
+    try testing.expect(State.parse("width=-500\nheight=600\nx=0\ny=0\n") == null);
+    try testing.expect(State.parse("width=800\nheight=-1\nx=0\ny=0\n") == null);
+    // Exactly 32767 is accepted; one above is rejected.
+    const at_max = State.parse("width=32767\nheight=32767\nx=0\ny=0\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 32767), at_max.height);
+    try testing.expect(State.parse("width=32768\nheight=600\nx=0\ny=0\n") == null);
+    try testing.expect(State.parse("width=800\nheight=32768\nx=0\ny=0\n") == null);
+}
+
+test "winsize: parse missing any single required key returns null" {
+    const testing = std.testing;
+    try testing.expect(State.parse("width=800\nheight=600\nx=1\n") == null); // no y
+    try testing.expect(State.parse("width=800\nheight=600\ny=2\n") == null); // no x
+    try testing.expect(State.parse("width=800\nx=1\ny=2\n") == null); // no height
+    try testing.expect(State.parse("height=600\nx=1\ny=2\n") == null); // no width
+}
+
+test "winsize: parse CRLF and lone-CR line endings" {
+    const testing = std.testing;
+    // CRLF (a user editing the file in Notepad).
+    const crlf = State.parse("width=800\r\nheight=600\r\nx=10\r\ny=20\r\nmaximized=1\r\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 800), crlf.width);
+    try testing.expectEqual(@as(i32, 20), crlf.y);
+    try testing.expect(crlf.maximized);
+    // Lone CR separators also tokenize (tokenizeAny on "\r\n").
+    const cr = State.parse("width=800\rheight=600\rx=10\ry=20\r") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 600), cr.height);
+    // Mixed endings with blank lines.
+    const mixed = State.parse("width=800\n\r\nheight=600\rx=10\r\n\ny=20") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 10), mixed.x);
+}
+
+test "winsize: parse trailing garbage and same-line junk" {
+    const testing = std.testing;
+    // Garbage lines after valid content are ignored (no '=' → skipped;
+    // unknown key with '=' → ignored), including a value containing '='.
+    const out = State.parse("width=800\nheight=600\nx=1\ny=2\n\xff\xfe binary junk\ntrailing=garbage=here\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 800), out.width);
+    // Junk after the value on the SAME line poisons that field.
+    try testing.expect(State.parse("width=800 junk\nheight=600\nx=1\ny=2\n") == null);
+    // A second '=' inside a required value poisons it too.
+    try testing.expect(State.parse("width=800=600\nheight=600\nx=1\ny=2\n") == null);
+}
+
+test "winsize: parse unicode junk" {
+    const testing = std.testing;
+    // Unicode lookalike key ('í') is an unknown key → required width missing.
+    try testing.expect(State.parse("w\xc3\xaddth=800\nheight=600\nx=1\ny=2\n") == null);
+    // Fullwidth digits are not ASCII digits → parseInt fails.
+    try testing.expect(State.parse("width=\xef\xbc\x98\xef\xbc\x90\xef\xbc\x90\nheight=600\nx=1\ny=2\n") == null);
+    // A UTF-8 BOM glues onto the first key → that key is not recognized.
+    try testing.expect(State.parse("\xef\xbb\xbfwidth=800\nheight=600\nx=1\ny=2\n") == null);
+    // Emoji garbage on separate lines does not disturb valid keys.
+    const out = State.parse("\xf0\x9f\xa6\x80\xf0\x9f\xa6\x80\nwidth=800\nheight=600\nx=1\ny=2\n\xf0\x9f\x92\xa5=42\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 800), out.width);
+}
+
+test "winsize: parse maximized value variants" {
+    const testing = std.testing;
+    const base = "width=800\nheight=600\nx=1\ny=2\n";
+    const cases = [_]struct { line: []const u8, want: bool }{
+        .{ .line = "maximized=true", .want = true },
+        .{ .line = "maximized=1", .want = true },
+        .{ .line = "maximized=TRUE", .want = false }, // case-sensitive
+        .{ .line = "maximized=yes", .want = false },
+        .{ .line = "maximized=0", .want = false },
+        .{ .line = "maximized=", .want = false },
+        .{ .line = "maximized = true ", .want = true }, // whitespace trimmed
+    };
+    inline for (cases) |case| {
+        const out = State.parse(base ++ case.line ++ "\n") orelse return error.ParseFailed;
+        try testing.expectEqual(case.want, out.maximized);
+    }
+}
+
+test "winsize: parse numeric quirks (digit separator, leading plus)" {
+    const testing = std.testing;
+    // Pins std.fmt.parseInt tolerance inherited by the format: Zig-style
+    // '_' digit separators and an explicit '+' sign are accepted.
+    const out = State.parse("width=1_024\nheight=+768\nx=+0\ny=-0\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 1024), out.width);
+    try testing.expectEqual(@as(i32, 768), out.height);
+    try testing.expectEqual(@as(i32, 0), out.x);
+    try testing.expectEqual(@as(i32, 0), out.y);
+}
+
+test "winsize: clamp keeps rects flush at each screen edge unchanged" {
+    const testing = std.testing;
+    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const cases = [_]Rect{
+        .{ .x = 0, .y = 100, .width = 800, .height = 600 }, // left flush
+        .{ .x = 100, .y = 0, .width = 800, .height = 600 }, // top flush
+        .{ .x = 1120, .y = 100, .width = 800, .height = 600 }, // right flush
+        .{ .x = 100, .y = 480, .width = 800, .height = 600 }, // bottom flush
+        .{ .x = 1120, .y = 480, .width = 800, .height = 600 }, // corner flush
+        .{ .x = 0, .y = 0, .width = 1920, .height = 1080 }, // fills screen
+    };
+    for (cases) |saved| {
+        const out = clampToVirtualScreen(saved, screen);
+        try testing.expectEqual(saved.x, out.x);
+        try testing.expectEqual(saved.y, out.y);
+        try testing.expectEqual(saved.width, out.width);
+        try testing.expectEqual(saved.height, out.height);
+    }
+}
+
+test "winsize: clamp nudges a 1px overhang in each direction" {
+    const testing = std.testing;
+    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const cases = [_]struct { saved: Rect, want_x: i32, want_y: i32 }{
+        // 1px off the left → snapped to x=0.
+        .{ .saved = .{ .x = -1, .y = 100, .width = 800, .height = 600 }, .want_x = 0, .want_y = 100 },
+        // 1px off the top → snapped to y=0.
+        .{ .saved = .{ .x = 100, .y = -1, .width = 800, .height = 600 }, .want_x = 100, .want_y = 0 },
+        // 1px off the right → snapped to right-flush.
+        .{ .saved = .{ .x = 1121, .y = 100, .width = 800, .height = 600 }, .want_x = 1120, .want_y = 100 },
+        // 1px off the bottom → snapped to bottom-flush.
+        .{ .saved = .{ .x = 100, .y = 481, .width = 800, .height = 600 }, .want_x = 100, .want_y = 480 },
+    };
+    for (cases) |case| {
+        const out = clampToVirtualScreen(case.saved, screen);
+        try testing.expectEqual(case.want_x, out.x);
+        try testing.expectEqual(case.want_y, out.y);
+        // Size always preserved here (rect fits the screen).
+        try testing.expectEqual(@as(i32, 800), out.width);
+        try testing.expectEqual(@as(i32, 600), out.height);
+    }
+}
+
+test "winsize: clamp boundary between partially visible and fully off-screen" {
+    const testing = std.testing;
+    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+
+    // Left edge exactly at screen.right() → zero overlap → centered.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 1920, .y = 100, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 560), out.x); // (1920-800)/2
+        try testing.expectEqual(@as(i32, 240), out.y); // (1080-600)/2
+    }
+    // One pixel of overlap on the right → nudged, not centered.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 1919, .y = 100, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 1120), out.x);
+        try testing.expectEqual(@as(i32, 100), out.y);
+    }
+    // Right edge exactly at screen.x → zero overlap → centered.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = -800, .y = 100, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 560), out.x);
+        try testing.expectEqual(@as(i32, 240), out.y);
+    }
+    // One pixel of overlap on the left → snapped to x=0.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = -799, .y = 100, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 0), out.x);
+        try testing.expectEqual(@as(i32, 100), out.y);
+    }
+    // Top edge exactly at screen.bottom() → zero overlap → centered.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 100, .y = 1080, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 560), out.x);
+        try testing.expectEqual(@as(i32, 240), out.y);
+    }
+}
+
+test "winsize: clamp degenerate zero- and negative-size rects grow to min_dim" {
+    const testing = std.testing;
+    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+
+    // Zero-size rect with an on-screen origin: still "intersects" by the
+    // point-overlap rule? No — a zero-size rect at (500,500) has
+    // right()==x, but x < screen.right() and right() > screen.x both
+    // hold, so it intersects and keeps its origin, growing to min_dim.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 500, .y = 500, .width = 0, .height = 0 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 500), out.x);
+        try testing.expectEqual(@as(i32, 500), out.y);
+        try testing.expectEqual(State.min_dim, out.width);
+        try testing.expectEqual(State.min_dim, out.height);
+    }
+    // Zero-size rect exactly at the screen origin: right()==screen.x so
+    // the overlap test fails → treated as fully off-screen → centered.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 910), out.x); // (1920-100)/2
+        try testing.expectEqual(@as(i32, 490), out.y); // (1080-100)/2
+        try testing.expectEqual(State.min_dim, out.width);
+        try testing.expectEqual(State.min_dim, out.height);
+    }
+    // Negative size is normalized up to min_dim as well.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 500, .y = 500, .width = -50, .height = -50 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 500), out.x);
+        try testing.expectEqual(@as(i32, 500), out.y);
+        try testing.expectEqual(State.min_dim, out.width);
+        try testing.expectEqual(State.min_dim, out.height);
+    }
+}
+
+test "winsize: clamp full matrix on a negative-origin virtual screen" {
+    const testing = std.testing;
+    // Secondary monitors left of and above the primary: the virtual
+    // screen origin is (-1920,-1080), spanning to (1920,1080).
+    const screen = Rect{ .x = -1920, .y = -1080, .width = 3840, .height = 2160 };
+
+    // Fully visible at negative coordinates → unchanged.
+    {
+        const saved = Rect{ .x = -1800, .y = -1000, .width = 800, .height = 600 };
+        const out = clampToVirtualScreen(saved, screen);
+        try testing.expectEqual(saved.x, out.x);
+        try testing.expectEqual(saved.y, out.y);
+    }
+    // 1px off the (negative) left edge → snapped to screen.x.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = -1921, .y = 100, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, -1920), out.x);
+        try testing.expectEqual(@as(i32, 100), out.y);
+    }
+    // Fully off the left → centered on the (negative-origin) screen.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = -2721, .y = 100, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, -400), out.x); // -1920 + (3840-800)/2
+        try testing.expectEqual(@as(i32, -300), out.y); // -1080 + (2160-600)/2
+    }
+}
+
+test "winsize: clamp oversized rect fully off-screen centers at screen size" {
+    const testing = std.testing;
+    const screen = Rect{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const out = clampToVirtualScreen(
+        .{ .x = 5000, .y = 5000, .width = 4000, .height = 3000 },
+        screen,
+    );
+    // Shrunk to the screen and centered → exactly fills it.
+    try testing.expectEqual(@as(i32, 0), out.x);
+    try testing.expectEqual(@as(i32, 0), out.y);
+    try testing.expectEqual(@as(i32, 1280), out.width);
+    try testing.expectEqual(@as(i32, 720), out.height);
+}
+
+test "winsize: clamp rect larger than the screen on one axis only" {
+    const testing = std.testing;
+    const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    // Too wide: width clamped to screen, x snapped to 0, y untouched.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 100, .y = 100, .width = 4000, .height = 500 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 0), out.x);
+        try testing.expectEqual(@as(i32, 100), out.y);
+        try testing.expectEqual(@as(i32, 1920), out.width);
+        try testing.expectEqual(@as(i32, 500), out.height);
+    }
+    // Too tall: height clamped to screen, y snapped to 0, x untouched.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 100, .y = 100, .width = 500, .height = 4000 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 100), out.x);
+        try testing.expectEqual(@as(i32, 0), out.y);
+        try testing.expectEqual(@as(i32, 500), out.width);
+        try testing.expectEqual(@as(i32, 1080), out.height);
+    }
+}
+
+test "winsize: clamp virtual screen smaller than min_dim" {
+    const testing = std.testing;
+    // Pathological screen smaller than the minimum window size: the
+    // result can never exceed the screen, so min_dim loses.
+    const screen = Rect{ .x = 0, .y = 0, .width = 50, .height = 50 };
+    // Fully off-screen → centered, sized to the whole tiny screen.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 200, .y = 200, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 0), out.x);
+        try testing.expectEqual(@as(i32, 0), out.y);
+        try testing.expectEqual(@as(i32, 50), out.width);
+        try testing.expectEqual(@as(i32, 50), out.height);
+    }
+    // Overlapping → still clamped to fill the tiny screen.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 10, .y = 10, .width = 800, .height = 600 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 0), out.x);
+        try testing.expectEqual(@as(i32, 0), out.y);
+        try testing.expectEqual(@as(i32, 50), out.width);
+        try testing.expectEqual(@as(i32, 50), out.height);
+    }
+    // A small visible rect is grown toward min_dim, capped at the
+    // screen, and re-clamped into it.
+    {
+        const out = clampToVirtualScreen(
+            .{ .x = 10, .y = 10, .width = 20, .height = 20 },
+            screen,
+        );
+        try testing.expectEqual(@as(i32, 0), out.x);
+        try testing.expectEqual(@as(i32, 0), out.y);
+        try testing.expectEqual(@as(i32, 50), out.width);
+        try testing.expectEqual(@as(i32, 50), out.height);
+    }
+}

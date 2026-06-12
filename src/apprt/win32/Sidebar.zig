@@ -1082,3 +1082,478 @@ test "sidebar edgeBandWidth: scales with DPI" {
     try testing.expectEqual(@as(i32, 8), edgeBandWidth(1.5));
     try testing.expectEqual(@as(i32, 10), edgeBandWidth(2.0));
 }
+
+// ---------------------------------------------------------------------------
+// Scale-matrix tests: the same boundary assertions at 1.0/1.25/1.5/2.0.
+// ---------------------------------------------------------------------------
+
+/// Expected pixel value of each scaled metric at the matrix scales,
+/// hard-coded independently of `scaled()` so a rounding regression
+/// there (e.g. trunc instead of round) fails these tests.
+const ScaleGeom = struct {
+    scale: f32,
+    pad: i32,
+    icon: i32,
+    close: i32,
+    dd: i32,
+    header: i32,
+    entry: i32,
+    clear_w: i32,
+    band: i32,
+    item_h: i32,
+    footer_h: i32,
+    drag: i32,
+};
+
+const scale_matrix = [_]ScaleGeom{
+    .{ .scale = 1.0, .pad = 8, .icon = 24, .close = 20, .dd = 24, .header = 24, .entry = 40, .clear_w = 48, .band = 5, .item_h = 36, .footer_h = 32, .drag = 5 },
+    .{ .scale = 1.25, .pad = 10, .icon = 30, .close = 25, .dd = 30, .header = 30, .entry = 50, .clear_w = 60, .band = 6, .item_h = 45, .footer_h = 40, .drag = 6 },
+    .{ .scale = 1.5, .pad = 12, .icon = 36, .close = 30, .dd = 36, .header = 36, .entry = 60, .clear_w = 72, .band = 8, .item_h = 54, .footer_h = 48, .drag = 8 },
+    .{ .scale = 2.0, .pad = 16, .icon = 48, .close = 40, .dd = 48, .header = 48, .entry = 80, .clear_w = 96, .band = 10, .item_h = 72, .footer_h = 64, .drag = 10 },
+};
+
+/// hitTest context at a matrix scale: `rows_h` rows worth of client
+/// height above the footer plus the footer strip itself, so
+/// footer_top == rows_h * item_h exactly.
+fn matrixCtx(g: ScaleGeom, ws_count: usize, rows_h: i32, width: i32, panel_open: bool, notif_count: usize) HitCtx {
+    return .{
+        .item_h = g.item_h,
+        .workspace_count = ws_count,
+        .client_h = rows_h * g.item_h + g.footer_h,
+        .width = width,
+        .scale = g.scale,
+        .panel_open = panel_open,
+        .notif_count = notif_count,
+    };
+}
+
+test "sidebar scale matrix: table matches the scaled helpers" {
+    for (scale_matrix) |g| {
+        try testing.expectEqual(g.item_h, itemHeight(g.scale));
+        try testing.expectEqual(g.footer_h, footerHeight(g.scale));
+        try testing.expectEqual(g.band, edgeBandWidth(g.scale));
+        try testing.expectEqual(g.entry, notifEntryHeight(g.scale));
+        try testing.expectEqual(g.pad, scaled(PAD_BASE, g.scale));
+        try testing.expectEqual(g.icon, scaled(FOOTER_ICON_BASE, g.scale));
+        try testing.expectEqual(g.close, scaled(CLOSE_BASE, g.scale));
+        try testing.expectEqual(g.dd, scaled(DROPDOWN_BASE, g.scale));
+        try testing.expectEqual(g.header, scaled(NOTIF_HEADER_BASE, g.scale));
+        try testing.expectEqual(g.clear_w, scaled(NOTIF_CLEAR_W_BASE, g.scale));
+    }
+}
+
+test "sidebar dragThreshold: scales with DPI across the matrix" {
+    for (scale_matrix) |g| {
+        try testing.expectEqual(g.drag, dragThreshold(g.scale));
+    }
+    // 5px at 1.0 to match the tab bar's threshold; 7.5 at 1.5 rounds
+    // half away from zero to 8, never truncating below the 1.0 value.
+    try testing.expectEqual(@as(i32, 5), dragThreshold(1.0));
+    try testing.expectEqual(@as(i32, 8), dragThreshold(1.5));
+}
+
+test "sidebar hitTest matrix: row body vs close band at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 3, 6, width, false, 0);
+        const cl = width - g.pad - g.close;
+        const cr = width - g.pad;
+        for (0..3) |row| {
+            const top = @as(i32, @intCast(row)) * g.item_h;
+            const ys = [_]i32{ top, top + g.item_h - 1 };
+            for (ys) |y| {
+                try testing.expectEqual(HitTarget{ .workspace = row }, hitTest(0, y, ctx));
+                try testing.expectEqual(HitTarget{ .workspace = row }, hitTest(cl - 1, y, ctx));
+                try testing.expectEqual(HitTarget{ .row_close = row }, hitTest(cl, y, ctx));
+                try testing.expectEqual(HitTarget{ .row_close = row }, hitTest(cr - 1, y, ctx));
+                try testing.expectEqual(HitTarget{ .workspace = row }, hitTest(cr, y, ctx));
+                try testing.expectEqual(HitTarget{ .workspace = row }, hitTest(width - 1, y, ctx));
+            }
+        }
+        // Last row's close band vs the new-session dropdown right below:
+        // one pixel down at the same x flips row_close -> dropdown.
+        const last_y = 3 * g.item_h - 1;
+        try testing.expectEqual(HitTarget{ .row_close = 2 }, hitTest(cr - 1, last_y, ctx));
+        try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(cr - 1, last_y + 1, ctx));
+    }
+}
+
+test "sidebar rowCloseRect: paint rect equals the hit band at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 4, 8, width, false, 0);
+        for (0..4) |row| {
+            const r = rowCloseRect(row, width, g.item_h, g.scale);
+            // x extents match hitTest's close band exactly.
+            try testing.expectEqual(width - g.pad - g.close, r.left);
+            try testing.expectEqual(width - g.pad, r.right);
+            // Square, vertically centered in the row.
+            const row_rect = itemRect(row, width, g.item_h);
+            try testing.expectEqual(g.close, r.right - r.left);
+            try testing.expectEqual(g.close, r.bottom - r.top);
+            try testing.expectEqual(row_rect.top + @divTrunc(g.item_h - g.close, 2), r.top);
+            // Every painted x hits the close target; both neighbors miss.
+            const mid_y = row_rect.top + @divTrunc(g.item_h, 2);
+            var x = r.left;
+            while (x < r.right) : (x += 1) {
+                try testing.expectEqual(HitTarget{ .row_close = row }, hitTest(x, mid_y, ctx));
+            }
+            try testing.expectEqual(HitTarget{ .workspace = row }, hitTest(r.left - 1, mid_y, ctx));
+            try testing.expectEqual(HitTarget{ .workspace = row }, hitTest(r.right, mid_y, ctx));
+        }
+    }
+}
+
+test "sidebar hitTest matrix: new session vs dropdown at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 2, 6, width, false, 0);
+        const dl = width - g.pad - g.dd;
+        const dr = width - g.pad;
+        const top = 2 * g.item_h;
+        const ys = [_]i32{ top, top + g.item_h - 1 };
+        for (ys) |y| {
+            try testing.expectEqual(@as(HitTarget, .new_session), hitTest(0, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .new_session), hitTest(dl - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(dl, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(dr - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .new_session), hitTest(dr, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .new_session), hitTest(width - 1, y, ctx));
+        }
+        // One pixel above the row at the dropdown's right edge is the
+        // last row's close band (the close band nests inside the wider
+        // dropdown band's x-range).
+        try testing.expectEqual(HitTarget{ .row_close = 1 }, hitTest(dr - 1, top - 1, ctx));
+        // The dropdown's LEFT edge x on the row above is row BODY:
+        // dd > close at every scale, so that x is left of the close band.
+        try testing.expect(g.dd > g.close);
+        try testing.expectEqual(HitTarget{ .workspace = 1 }, hitTest(dl, top - 1, ctx));
+        // One pixel below the row is dead space.
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(dr - 1, top + g.item_h, ctx));
+    }
+}
+
+test "sidebar newSessionDropdownRect: paint rect equals the hit band at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        for ([_]usize{ 0, 1, 5, 16 }) |ws_count| {
+            const rows_h: i32 = @intCast(ws_count + 3);
+            const ctx = matrixCtx(g, ws_count, rows_h, width, false, 0);
+            const r = newSessionDropdownRect(ws_count, width, g.item_h, g.scale);
+            try testing.expectEqual(width - g.pad - g.dd, r.left);
+            try testing.expectEqual(width - g.pad, r.right);
+            try testing.expectEqual(g.dd, r.right - r.left);
+            try testing.expectEqual(g.dd, r.bottom - r.top);
+            const row_rect = itemRect(ws_count, width, g.item_h);
+            try testing.expectEqual(row_rect.top + @divTrunc(g.item_h - g.dd, 2), r.top);
+            // Every painted x hits the dropdown; both neighbors are body.
+            const mid_y = row_rect.top + @divTrunc(g.item_h, 2);
+            var x = r.left;
+            while (x < r.right) : (x += 1) {
+                try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(x, mid_y, ctx));
+            }
+            try testing.expectEqual(@as(HitTarget, .new_session), hitTest(r.left - 1, mid_y, ctx));
+            try testing.expectEqual(@as(HitTarget, .new_session), hitTest(r.right, mid_y, ctx));
+        }
+    }
+}
+
+test "sidebar hitTest matrix: footer slot boundaries at every scale" {
+    for (scale_matrix) |g| {
+        const ctx = matrixCtx(g, 2, 6, 300, false, 0);
+        const footer_top = ctx.client_h - g.footer_h;
+        const bell_l = g.pad;
+        const gear_l = g.pad + g.icon + g.pad;
+        const globe_l = (g.pad + g.icon) * 2 + g.pad;
+        // The slots span the full strip height: same answers at the
+        // first and last footer pixel rows.
+        const ys = [_]i32{ footer_top, ctx.client_h - 1 };
+        for (ys) |y| {
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(bell_l - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(bell_l, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(bell_l + g.icon - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(bell_l + g.icon, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(gear_l - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .gear_icon), hitTest(gear_l, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .gear_icon), hitTest(gear_l + g.icon - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(gear_l + g.icon, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(globe_l - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(globe_l, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(globe_l + g.icon - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(globe_l + g.icon, y, ctx));
+        }
+        // One pixel above the footer is row space (past the rows here),
+        // and the first y past the client is dead.
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(bell_l, footer_top - 1, ctx));
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(bell_l, ctx.client_h, ctx));
+    }
+}
+
+test "sidebar footer slot rects: paint geometry equals the hit bands at every scale" {
+    for (scale_matrix) |g| {
+        const ctx = matrixCtx(g, 2, 6, 300, false, 0);
+        const footer_top = ctx.client_h - g.footer_h;
+        const bell = bellSlotRect(footer_top, g.scale);
+        const gear = gearSlotRect(footer_top, g.scale);
+        const globe = globeSlotRect(footer_top, g.scale);
+        const slots = [_]struct { r: w32.RECT, hit: HitTarget }{
+            .{ .r = bell, .hit = .bell_icon },
+            .{ .r = gear, .hit = .gear_icon },
+            .{ .r = globe, .hit = .browser_icon },
+        };
+        for (slots) |slot| {
+            // Square icon, vertically centered in the footer strip.
+            try testing.expectEqual(g.icon, slot.r.right - slot.r.left);
+            try testing.expectEqual(g.icon, slot.r.bottom - slot.r.top);
+            try testing.expectEqual(footer_top + @divTrunc(g.footer_h - g.icon, 2), slot.r.top);
+            // Every painted x hits the slot; both x neighbors miss.
+            var x = slot.r.left;
+            while (x < slot.r.right) : (x += 1) {
+                try testing.expectEqual(slot.hit, hitTest(x, footer_top, ctx));
+            }
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(slot.r.left - 1, footer_top, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(slot.r.right, footer_top, ctx));
+        }
+        // Slots are disjoint left-to-right with a pad-wide gap.
+        try testing.expectEqual(bell.right + g.pad, gear.left);
+        try testing.expectEqual(gear.right + g.pad, globe.left);
+    }
+}
+
+test "sidebar hitTest matrix: rows, panel, footer vertical precedence at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 16, 10, width, true, 4);
+        const footer_top = ctx.client_h - g.footer_h;
+        const panel_top = footer_top - panelHeight(ctx.client_h);
+
+        // Just above the panel is still a workspace row.
+        const row_above: usize = @intCast(@divTrunc(panel_top - 1, g.item_h));
+        try testing.expect(row_above < 16);
+        try testing.expectEqual(HitTarget{ .workspace = row_above }, hitTest(10, panel_top - 1, ctx));
+
+        // First panel pixel is the header (x=10 is left of Clear).
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(10, panel_top, ctx));
+
+        // Last pixel above the footer is the last visible (clipped)
+        // entry; the footer takes over exactly at footer_top.
+        const e0 = panel_top + g.header;
+        const last_idx: usize = @intCast(@divTrunc(footer_top - 1 - e0, g.entry));
+        try testing.expect(last_idx < 4);
+        try testing.expectEqual(HitTarget{ .notif_entry = last_idx }, hitTest(10, footer_top - 1, ctx));
+        try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(g.pad, footer_top, ctx));
+
+        // A row whose rect starts inside the open panel is not hittable
+        // as a workspace even though its itemRect is inside the client...
+        const covered = row_above + 1;
+        const covered_rect = itemRect(covered, width, g.item_h);
+        try testing.expect(covered_rect.top >= panel_top);
+        try testing.expect(std.meta.activeTag(hitTest(10, covered_rect.top, ctx)) != .workspace);
+
+        // ...but with the panel closed the same pixel is that row again.
+        const ctx_closed = matrixCtx(g, 16, 10, width, false, 0);
+        try testing.expectEqual(HitTarget{ .workspace = covered }, hitTest(10, covered_rect.top, ctx_closed));
+    }
+}
+
+test "sidebar hitTest matrix: footer clips overflowing rows at every scale" {
+    for (scale_matrix) |g| {
+        // 16 rows would need 16*item_h of height; only 10 fit above the
+        // footer at this client height.
+        const ctx = matrixCtx(g, 16, 10, 300, false, 0);
+        const footer_top = ctx.client_h - g.footer_h;
+        try testing.expectEqual(HitTarget{ .workspace = 9 }, hitTest(g.pad, footer_top - 1, ctx));
+        try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(g.pad, footer_top, ctx));
+        // Row 10's rect starts exactly at footer_top: fully clipped.
+        const r10 = itemRect(10, 300, g.item_h);
+        try testing.expectEqual(footer_top, r10.top);
+        try testing.expect(std.meta.activeTag(hitTest(g.pad, r10.top, ctx)) != .workspace);
+    }
+}
+
+test "sidebar hitTest matrix: panel header and Clear boundaries at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 3, 10, width, true, 2);
+        const footer_top = ctx.client_h - g.footer_h;
+        const panel_top = footer_top - panelHeight(ctx.client_h);
+        const clear_l = width - g.clear_w;
+        const header_ys = [_]i32{ panel_top, panel_top + g.header - 1 };
+        for (header_ys) |y| {
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(0, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(clear_l - 1, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .notif_clear), hitTest(clear_l, y, ctx));
+            try testing.expectEqual(@as(HitTarget, .notif_clear), hitTest(width - 1, y, ctx));
+        }
+        // First entry pixel below the header: the Clear x hits entry 0.
+        try testing.expectEqual(HitTarget{ .notif_entry = 0 }, hitTest(clear_l, panel_top + g.header, ctx));
+        // Zero notifications: entry space is inert, Clear still hittable.
+        const ctx0 = matrixCtx(g, 3, 10, width, true, 0);
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(10, panel_top + g.header, ctx0));
+        try testing.expectEqual(@as(HitTarget, .notif_clear), hitTest(width - 1, panel_top, ctx0));
+    }
+}
+
+test "sidebar hitTest matrix: notif entry boundaries and count clamp at every scale" {
+    for (scale_matrix) |g| {
+        const ctx = matrixCtx(g, 3, 10, 300, true, 3);
+        const footer_top = ctx.client_h - g.footer_h;
+        const panel_top = footer_top - panelHeight(ctx.client_h);
+        const e0 = panel_top + g.header;
+        // Entries stack newest-first, entry_h tall, below the header.
+        try testing.expectEqual(HitTarget{ .notif_entry = 0 }, hitTest(10, e0, ctx));
+        try testing.expectEqual(HitTarget{ .notif_entry = 0 }, hitTest(10, e0 + g.entry - 1, ctx));
+        try testing.expectEqual(HitTarget{ .notif_entry = 1 }, hitTest(10, e0 + g.entry, ctx));
+        try testing.expectEqual(HitTarget{ .notif_entry = 2 }, hitTest(10, e0 + 2 * g.entry, ctx));
+        // idx == notif_count is dead panel space. The slot must still be
+        // above the footer here so the clamp (not the footer) decides.
+        const e3 = e0 + 3 * g.entry;
+        try testing.expect(e3 < footer_top);
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(10, e3, ctx));
+        // With a deep log, the partially clipped entry is hittable up to
+        // the last pixel above the footer.
+        const ctx_full = matrixCtx(g, 3, 10, 300, true, 99);
+        const last_idx: usize = @intCast(@divTrunc(footer_top - 1 - e0, g.entry));
+        try testing.expectEqual(HitTarget{ .notif_entry = last_idx }, hitTest(10, footer_top - 1, ctx_full));
+        try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(g.pad, footer_top, ctx_full));
+    }
+}
+
+test "sidebar hitTest matrix: edge band boundaries and overlap at every scale" {
+    for (scale_matrix) |g| {
+        const widths = [_]i32{ 300, scaled(@intCast(MIN_WIDTH), g.scale), scaled(@intCast(MAX_WIDTH), g.scale) };
+        for (widths) |w| {
+            // The resize band spans [width-band, width).
+            try testing.expect(!hitTestEdge(w - g.band - 1, w, g.band));
+            try testing.expect(hitTestEdge(w - g.band, w, g.band));
+            try testing.expect(hitTestEdge(w - 1, w, g.band));
+            try testing.expect(!hitTestEdge(w, w, g.band));
+            // The close and dropdown bands end at w-pad and pad >= band
+            // at every scale, so the Window-level edge-first precedence
+            // can never shadow a close/dropdown click.
+            try testing.expect(g.pad >= g.band);
+            try testing.expect(rowCloseRect(0, w, g.item_h, g.scale).right <= w - g.band);
+            try testing.expect(newSessionDropdownRect(1, w, g.item_h, g.scale).right <= w - g.band);
+            // Inside the band, hitTest itself still reports the row body
+            // (running hitTestEdge first is the caller's responsibility).
+            const ctx = matrixCtx(g, 2, 6, w, false, 0);
+            try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(w - g.band, 0, ctx));
+        }
+    }
+}
+
+test "sidebar hitTest matrix: zero workspaces at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 0, 6, width, false, 0);
+        // Row 0 is the "+ New workspace" row, with its dropdown band.
+        try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, 0, ctx));
+        try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, g.item_h - 1, ctx));
+        try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(width - g.pad - 1, 0, ctx));
+        // No workspace rows or close bands anywhere below it.
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(10, g.item_h, ctx));
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(width - g.pad - 1, g.item_h, ctx));
+        // The footer is still live.
+        try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(g.pad, ctx.client_h - 1, ctx));
+    }
+}
+
+test "sidebar hitTest matrix: sixteen workspaces row math at every scale" {
+    for (scale_matrix) |g| {
+        const width: i32 = 300;
+        const ctx = matrixCtx(g, 16, 20, width, false, 0);
+        // All 16 rows (the MAX_WORKSPACES cap) hit at their rect bounds.
+        for (0..16) |i| {
+            const r = itemRect(i, width, g.item_h);
+            try testing.expectEqual(HitTarget{ .workspace = i }, hitTest(10, r.top, ctx));
+            try testing.expectEqual(HitTarget{ .workspace = i }, hitTest(10, r.bottom - 1, ctx));
+            try testing.expectEqual(HitTarget{ .row_close = i }, hitTest(width - g.pad - 1, r.top, ctx));
+        }
+        // Row 16 is the "+ New workspace" row; row 17 is dead space.
+        try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, 16 * g.item_h, ctx));
+        try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(width - g.pad - 1, 16 * g.item_h, ctx));
+        try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 17 * g.item_h, ctx));
+        // Rows stack exactly: row 16 starts where row 15 ends.
+        try testing.expectEqual(itemRect(15, width, g.item_h).bottom, itemRect(16, width, g.item_h).top);
+    }
+}
+
+test "sidebar hitTest matrix: bands respond at MIN and MAX widths at every scale" {
+    for (scale_matrix) |g| {
+        // Window.sidebarWidth clamps the unscaled width then scales it
+        // with the same rounding, so these are the physical extremes.
+        const widths = [_]i32{ scaled(@intCast(MIN_WIDTH), g.scale), scaled(@intCast(MAX_WIDTH), g.scale) };
+        for (widths) |w| {
+            const ctx = matrixCtx(g, 2, 10, w, true, 1);
+            const footer_top = ctx.client_h - g.footer_h;
+            const panel_top = footer_top - panelHeight(ctx.client_h);
+            // Close band on row 0.
+            try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(w - g.pad - g.close - 1, 0, ctx));
+            try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(w - g.pad - g.close, 0, ctx));
+            try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(w - g.pad, 0, ctx));
+            // Dropdown band on the new-workspace row (row 2).
+            try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(w - g.pad - 1, 2 * g.item_h, ctx));
+            // Clear button right-aligned to this width.
+            try testing.expectEqual(@as(HitTarget, .notif_clear), hitTest(w - 1, panel_top, ctx));
+            try testing.expectEqual(@as(HitTarget, .none), hitTest(w - g.clear_w - 1, panel_top, ctx));
+            // Controls stay strictly inside the strip even at MIN width.
+            try testing.expect(rowCloseRect(0, w, g.item_h, g.scale).left > 0);
+            try testing.expect(newSessionDropdownRect(2, w, g.item_h, g.scale).left > 0);
+            try testing.expect(w - g.clear_w > 0);
+            try testing.expect(globeSlotRect(footer_top, g.scale).right <= w);
+        }
+    }
+}
+
+test "sidebar hitTest: non-positive item height is none everywhere" {
+    var ctx = testCtx(3, false, 0);
+    ctx.item_h = 0;
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 0, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 100, ctx));
+    // Even the footer is dead when the row math is degenerate.
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(8, 380, ctx));
+    ctx.item_h = -36;
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 0, ctx));
+}
+
+test "sidebar hitTest: tiny client heights collapse to the footer" {
+    // client_h smaller than the footer: footer_top < 0, every in-client
+    // y is footer space and only x picks a slot.
+    var ctx = testCtx(3, false, 0);
+    ctx.client_h = 10;
+    try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(8, 0, ctx));
+    try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(31, 9, ctx));
+    try testing.expectEqual(@as(HitTarget, .gear_icon), hitTest(40, 5, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(100, 5, ctx));
+    // No workspace row is reachable: y past the client is dead too.
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 10, ctx));
+    // client_h == footer height exactly: same collapse.
+    ctx.client_h = 32;
+    try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(8, 0, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 32, ctx));
+    // An open panel cannot resurface rows: the footer test runs first.
+    ctx.panel_open = true;
+    ctx.notif_count = 5;
+    ctx.client_h = 10;
+    try testing.expectEqual(@as(HitTarget, .bell_icon), hitTest(8, 0, ctx));
+}
+
+test "sidebar hitTest: zero scale degenerates to none without crashing" {
+    // scale 0 zeroes every scaled metric: no footer strip, a zero-height
+    // header, and zero-height entries. The entry_h guard returns none
+    // instead of dividing by zero.
+    const ctx: HitCtx = .{
+        .item_h = 36, // rows still laid out; only the scaled chrome is zero
+        .workspace_count = 2,
+        .client_h = 400,
+        .width = 220,
+        .scale = 0.0,
+        .panel_open = true,
+        .notif_count = 3,
+    };
+    const panel_top = 400 - panelHeight(400);
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, panel_top, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 399, ctx));
+    // Rows above the panel still resolve.
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(10, 0, ctx));
+}

@@ -2378,34 +2378,14 @@ fn ipcFindBrowser(self: *App, id: ?u32) ?*BrowserPane {
 }
 
 /// Read an optional u32 "id" field from the request args.
-fn ipcArgId(req: *const ipc.Request) ?u32 {
-    if (req.args != .object) return null;
-    const v = req.args.object.get("id") orelse return null;
-    return switch (v) {
-        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
-        else => null,
-    };
-}
+/// (Pure logic lives in ipc.zig so the protocol tests cover it.)
+const ipcArgId = ipc.argId;
 
 /// Read a required string field from the request args.
-fn ipcArgString(req: *const ipc.Request, key: []const u8) ?[]const u8 {
-    if (req.args != .object) return null;
-    const v = req.args.object.get(key) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
-}
+const ipcArgString = ipc.argString;
 
 /// Read an i64 field (the CDP backendNodeId `ref`) from the request args.
-fn ipcArgI64(req: *const ipc.Request, key: []const u8) ?i64 {
-    if (req.args != .object) return null;
-    const v = req.args.object.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| i,
-        else => null,
-    };
-}
+const ipcArgI64 = ipc.argI64;
 
 /// open {url, [target: "split"|"tab"]} → create a browser pane in the
 /// target window, navigate to url, reply with its assigned id.
@@ -3352,4 +3332,147 @@ test "unit: set command accepts an argv value verbatim" {
         "theme = dark\ncommand = wsl.exe --cd ~ -d Ubuntu\n",
         out,
     );
+}
+
+test "unit: notif ring filled exactly to capacity keeps every entry" {
+    var ring: NotifRing(u32, 4) = .{};
+    ring.push(1);
+    ring.push(2);
+    ring.push(3);
+    ring.push(4);
+    // next has wrapped back to slot 0 but nothing is lost yet.
+    try testing.expectEqual(@as(usize, 0), ring.next);
+    try testing.expectEqual(@as(usize, 4), ring.count());
+    try testing.expectEqual(@as(u32, 4), ring.at(0).?.*);
+    try testing.expectEqual(@as(u32, 1), ring.at(3).?.*);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(4));
+    // The very next push is the first to drop the oldest entry.
+    ring.push(5);
+    try testing.expectEqual(@as(usize, 4), ring.count());
+    try testing.expectEqual(@as(u32, 5), ring.at(0).?.*);
+    try testing.expectEqual(@as(u32, 2), ring.at(3).?.*);
+}
+
+test "unit: notif ring cap=1 degenerate keeps only the newest" {
+    var ring: NotifRing(u32, 1) = .{};
+    try testing.expectEqual(@as(usize, 0), ring.count());
+    ring.push(1);
+    try testing.expectEqual(@as(usize, 1), ring.count());
+    try testing.expectEqual(@as(u32, 1), ring.at(0).?.*);
+    ring.push(2);
+    try testing.expectEqual(@as(usize, 1), ring.count());
+    try testing.expectEqual(@as(u32, 2), ring.at(0).?.*);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(1));
+    // Unread counts pushes (2), not live slots (1), and resets once.
+    try testing.expectEqual(@as(usize, 2), ring.unread);
+    try testing.expect(ring.markRead());
+    try testing.expect(!ring.markRead());
+}
+
+test "unit: notif ring push after clear restarts from a wrapped state" {
+    var ring: NotifRing(u32, 4) = .{};
+    var i: u32 = 1;
+    while (i <= 6) : (i += 1) ring.push(i); // leaves next mid-ring (2)
+    ring.clear();
+    try testing.expectEqual(@as(usize, 0), ring.next);
+    ring.push(7);
+    ring.push(8);
+    try testing.expectEqual(@as(usize, 2), ring.count());
+    try testing.expectEqual(@as(u32, 8), ring.at(0).?.*);
+    try testing.expectEqual(@as(u32, 7), ring.at(1).?.*);
+    try testing.expectEqual(@as(?*const u32, null), ring.at(2));
+    try testing.expectEqual(@as(usize, 2), ring.unread);
+}
+
+test "unit: set command replaces the key on a final line without a newline" {
+    const alloc = testing.allocator;
+    const src = "theme = dark\ncommand = cmd.exe"; // EOF right after the value
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    // Replaced in place — no duplicate appended, and the file's missing
+    // trailing newline is preserved as-is.
+    try testing.expectEqualStrings("theme = dark\ncommand = pwsh.exe", out);
+}
+
+test "unit: set command CRLF key at EOF without a final LF" {
+    const alloc = testing.allocator;
+    // The last line ends in a bare \r (no \n); the \r must not defeat
+    // the key match.
+    const src = "theme = dark\r\ncommand = cmd.exe\r";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("theme = dark\r\ncommand = pwsh.exe", out);
+}
+
+test "unit: set command commented key followed by real key replaces the real one" {
+    const alloc = testing.allocator;
+    const src = "# command = old.exe\ncommand = cmd.exe\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("# command = old.exe\ncommand = pwsh.exe\n", out);
+}
+
+test "unit: set command matches when the old value contains equals" {
+    const alloc = testing.allocator;
+    // The key is the text before the FIRST '='; later '=' belong to the
+    // value and must not break the match.
+    const src = "command = env FOO=bar bash\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("command = pwsh.exe\n", out);
+}
+
+test "unit: set command writes a new value containing equals verbatim" {
+    const alloc = testing.allocator;
+    const out = try setCommandInConfigText(alloc, "theme = dark\n", "cmd.exe /c set X=1");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("theme = dark\ncommand = cmd.exe /c set X=1\n", out);
+}
+
+test "unit: set command appends to an only-comments file" {
+    const alloc = testing.allocator;
+    const src = "# one\n# command = nope\n# three\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings(
+        "# one\n# command = nope\n# three\ncommand = pwsh.exe\n",
+        out,
+    );
+}
+
+test "unit: set command ignores a command line without equals" {
+    const alloc = testing.allocator;
+    // No '=' means no key: the line is preserved and a real entry is
+    // appended instead.
+    const src = "command\n";
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("command\ncommand = pwsh.exe\n", out);
+}
+
+test "unit: set command preserves very long lines byte for byte" {
+    const alloc = testing.allocator;
+    // A line far beyond any fixed buffer (16 KiB) must survive
+    // unmodified, both before and after the replaced key.
+    const long_len = 16 * 1024;
+    const long = try alloc.alloc(u8, long_len);
+    defer alloc.free(long);
+    @memset(long, 'x');
+    long[0] = '#';
+    long[1] = ' ';
+    const src = try std.fmt.allocPrint(
+        alloc,
+        "{s}\ncommand = cmd.exe\n{s}\n",
+        .{ long, long },
+    );
+    defer alloc.free(src);
+    const out = try setCommandInConfigText(alloc, src, "pwsh.exe");
+    defer alloc.free(out);
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "{s}\ncommand = pwsh.exe\n{s}\n",
+        .{ long, long },
+    );
+    defer alloc.free(expected);
+    try testing.expectEqualStrings(expected, out);
 }
