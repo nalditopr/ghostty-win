@@ -1,8 +1,11 @@
 name: Windows Release
 
+# Tags use the win-vX.Y.Z form: Ghostty's build.zig panics on a checked-out
+# exact tag named vX.Y.Z unless it matches its internal version, and win-v*
+# is the fork's sanctioned format. v* stays accepted for the old tags.
 on:
   push:
-    tags: ['v*']
+    tags: ['win-v*', 'v*']
   workflow_dispatch:
     inputs:
       version:
@@ -51,7 +54,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:GITHUB_REF -like 'refs/tags/*') {
-              $v = $env:GITHUB_REF -replace 'refs/tags/v?', ''
+              $v = $env:GITHUB_REF -replace 'refs/tags/(win-)?v?', ''
           } else {
               $v = '${{ github.event.inputs.version }}'
           }
