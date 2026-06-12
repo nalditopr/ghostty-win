@@ -1206,6 +1206,19 @@ pub extern "user32" fn DestroyMenu(
     hMenu: HMENU,
 ) callconv(.winapi) i32;
 
+/// Search the standard executable search path (app dir, system dirs,
+/// PATH) for a file. Returns the required path length in characters
+/// (excluding the NUL) or 0 if not found.
+/// https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-searchpathw
+pub extern "kernel32" fn SearchPathW(
+    lpPath: ?[*:0]const u16,
+    lpFileName: [*:0]const u16,
+    lpExtension: ?[*:0]const u16,
+    nBufferLength: u32,
+    lpBuffer: ?[*]u16,
+    lpFilePart: ?*?[*:0]u16,
+) callconv(.winapi) u32;
+
 // -----------------------------------------------------------------------
 // Global hotkey API
 // -----------------------------------------------------------------------

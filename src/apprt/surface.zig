@@ -169,6 +169,30 @@ pub fn shouldInheritWorkingDirectory(context: NewSurfaceContext, config: *const 
     };
 }
 
+/// Same as `newConfig` but with an optional per-surface command
+/// override (e.g. a WSL distro or alternate shell picked for a single
+/// tab). The argv slice is duplicated into the clone's arena so the
+/// caller's memory may be freed once this returns; null leaves the
+/// configured command untouched.
+pub fn newConfigWithCommand(
+    app: *const App,
+    config: *const Config,
+    context: NewSurfaceContext,
+    command: ?[]const []const u8,
+) Allocator.Error!Config {
+    var copy = try newConfig(app, config, context);
+    errdefer copy.deinit();
+
+    if (command) |argv| {
+        const alloc = copy._arena.?.allocator();
+        const copied = try alloc.alloc([:0]const u8, argv.len);
+        for (argv, 0..) |arg, i| copied[i] = try alloc.dupeZ(u8, arg);
+        copy.command = .{ .direct = copied };
+    }
+
+    return copy;
+}
+
 /// Returns a new config for a surface for the given app that should be
 /// used for any new surfaces. The resulting config should be deinitialized
 /// after the surface is initialized.

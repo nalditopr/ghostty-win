@@ -152,11 +152,15 @@ pane: *Pane = undefined,
 
 /// Initialize a new Surface by creating a Win32 window and WGL context,
 /// then initialize the core terminal surface (fonts, renderer, PTY, IO).
+/// `command` optionally overrides the configured command for this one
+/// surface (the new-session backend picker); the argv is copied so the
+/// caller's memory may be freed after this returns.
 pub fn init(
     self: *Surface,
     app: *App,
     parent: *Window,
     context: apprt.surface.NewSurfaceContext,
+    command: ?[]const []const u8,
 ) !void {
     self.* = .{
         .app = app,
@@ -259,8 +263,14 @@ pub fn init(
     try app.core_app.addSurface(self);
     errdefer app.core_app.deleteSurface(self);
 
-    // Create a config copy for this surface.
-    var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
+    // Create a config copy for this surface, applying the per-surface
+    // command override if one was requested.
+    var config = try apprt.surface.newConfigWithCommand(
+        app.core_app,
+        &app.config,
+        context,
+        command,
+    );
     defer config.deinit();
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,

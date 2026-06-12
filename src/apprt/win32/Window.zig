@@ -6,6 +6,7 @@ const Window = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const internal_os = @import("../../os/main.zig");
 
 const App = @import("App.zig");
 const BrowserPane = @import("BrowserPane.zig");
@@ -401,13 +402,25 @@ fn findHandle(self: *Window, tab_idx: usize, pane: *Pane) ?SplitTree(Pane).Node.
 /// Add a new tab surface to this window. The surface is created,
 /// initialized, and inserted at the position dictated by config.
 pub fn addTab(self: *Window) !*Surface {
+    return self.addTabWithCommand(null, null);
+}
+
+/// Like addTab, but optionally overrides the command the new tab runs
+/// (the new-session backend picker) and its initial title. The argv
+/// and title are copied as needed, so the caller's memory may be freed
+/// once this returns. Null command/title behave exactly like addTab.
+pub fn addTabWithCommand(
+    self: *Window,
+    command: ?[]const []const u8,
+    title: ?[]const u8,
+) !*Surface {
     if (self.closing) return error.WindowClosing;
     if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
     self.cancelTabRename();
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.init(self.app, self, .tab);
+    try surface.init(self.app, self, .tab, command);
     // After surface.init succeeds, wrap it in a Pane and create the
     // SplitTree which takes ownership via ref(). If this fails, we
     // manually clean up.
@@ -444,10 +457,20 @@ pub fn addTab(self: *Window) !*Surface {
     self.tab_status[pos] = .normal;
     self.tab_count += 1;
 
-    // Set default title.
+    // Set the initial title: the picked backend name when given (so the
+    // sidebar row is identifiable before the shell's OSC title arrives),
+    // otherwise the default. Truncated to the title buffer; an invalid
+    // UTF-8 title falls back to the default.
     const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
     @memcpy(self.tab_titles[pos][0..default_title.len], default_title);
     self.tab_title_lens[pos] = @intCast(default_title.len);
+    if (title) |t| {
+        const wlen = std.unicode.utf8ToUtf16Le(
+            &self.tab_titles[pos],
+            t[0..@min(t.len, 255)],
+        ) catch 0;
+        if (wlen > 0) self.tab_title_lens[pos] = @intCast(@min(wlen, 255));
+    }
 
     if (self.tab_count == 1) {
         // First tab — show the parent window now that the terminal is ready.
@@ -872,7 +895,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Pane).Split.Direction) !void
         new_surface.deinit();
         alloc.destroy(new_surface);
     }
-    try new_surface.init(self.app, self, .split);
+    try new_surface.init(self.app, self, .split, null);
 
     // Create a single-node tree for the new surface's pane. The block
     // scopes the pane errdefer to the window between Pane.create and
@@ -1637,11 +1660,26 @@ const GEAR_CTX_OPEN_CONFIG: usize = 9201;
 const GEAR_CTX_OPEN_FOLDER: usize = 9202;
 const GEAR_CTX_RELOAD: usize = 9203;
 
+// New-session backend picker command IDs (right-click on the sidebar
+// "+ New session" row or the tab bar "+" button). Installed WSL distros
+// are appended at NEW_SESSION_DISTRO_BASE + index.
+const NEW_SESSION_DEFAULT: usize = 9300;
+const NEW_SESSION_PWSH: usize = 9301;
+const NEW_SESSION_CMD: usize = 9302;
+const NEW_SESSION_DISTRO_BASE: usize = 9310;
+
 /// Handle a right-button click in the tab bar region.
 /// Shows a context menu for the clicked tab.
 fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
     if (!self.tab_bar_visible) return;
     if (y >= self.tabBarHeight()) return;
+
+    // Right-click on the "+" button opens the new-session backend
+    // picker instead of the tab context menu.
+    if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
+        self.showNewSessionMenu(x, y);
+        return;
+    }
 
     // Hit-test to find which tab was right-clicked.
     var clicked_tab: ?usize = null;
@@ -1792,9 +1830,118 @@ fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
             self.showGearContextMenu(x, y);
             return;
         },
+        .new_session => {
+            self.showNewSessionMenu(x, y);
+            return;
+        },
         else => null,
     };
     self.showTabContextMenu(clicked_tab, x, y);
+}
+
+/// True if pwsh.exe (PowerShell 7+) is on the executable search path.
+fn havePwsh() bool {
+    var buf: [512]u16 = undefined;
+    const n = w32.SearchPathW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("pwsh.exe"),
+        null,
+        buf.len,
+        &buf,
+        null,
+    );
+    return n > 0 and n < buf.len;
+}
+
+/// Show the new-session backend picker at client coordinates (x, y):
+/// "Default" / "PowerShell" / "Command Prompt" plus each installed WSL
+/// distribution (Windows Terminal style). The selection opens a new tab
+/// running that backend, titled after it.
+fn showNewSessionMenu(self: *Window, x: i32, y: i32) void {
+    const alloc = self.app.core_app.alloc;
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, NEW_SESSION_DEFAULT, std.unicode.utf8ToUtf16LeStringLiteral("Default"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, NEW_SESSION_PWSH, std.unicode.utf8ToUtf16LeStringLiteral("PowerShell"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, NEW_SESSION_CMD, std.unicode.utf8ToUtf16LeStringLiteral("Command Prompt"));
+
+    // Enumerate installed distros at menu-open (a cheap registry read)
+    // so new installs show up without restarting. Freed after the menu
+    // closes; selections copy what they need.
+    const distros: []internal_os.wsl.Distro = internal_os.wsl.list(alloc) catch &.{};
+    defer internal_os.wsl.free(alloc, distros);
+
+    if (distros.len > 0) {
+        _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+        for (distros, 0..) |distro, i| {
+            // Label: "Name" or "Name (default)" for the distro wsl.exe
+            // launches without -d.
+            const label = if (distro.is_default)
+                std.fmt.allocPrint(alloc, "{s} (default)", .{distro.name}) catch continue
+            else
+                distro.name;
+            defer if (distro.is_default) alloc.free(label);
+
+            const label_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, label) catch continue;
+            defer alloc.free(label_w);
+            _ = w32.AppendMenuW(
+                menu,
+                w32.MF_STRING,
+                NEW_SESSION_DISTRO_BASE + i,
+                label_w.ptr,
+            );
+        }
+    }
+
+    // Convert client coords to screen coords for the popup.
+    var pt = w32.POINT{ .x = x, .y = y };
+    if (self.hwnd) |h| _ = w32.ClientToScreen(h, &pt);
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        self.hwnd.?,
+        null,
+    );
+
+    // The modal menu loop dispatches arbitrary messages; re-check
+    // before acting.
+    if (self.closing) return;
+    const cmd_id: usize = @intCast(cmd);
+    switch (cmd_id) {
+        NEW_SESSION_DEFAULT => {
+            _ = self.addTab() catch |err| {
+                log.err("failed to create new tab: {}", .{err});
+            };
+        },
+        NEW_SESSION_PWSH => {
+            const argv: []const []const u8 = if (havePwsh())
+                &.{"pwsh.exe"}
+            else
+                &.{"powershell.exe"};
+            _ = self.addTabWithCommand(argv, "PowerShell") catch |err| {
+                log.err("failed to create PowerShell tab: {}", .{err});
+            };
+        },
+        NEW_SESSION_CMD => {
+            _ = self.addTabWithCommand(&.{"cmd.exe"}, "cmd") catch |err| {
+                log.err("failed to create cmd tab: {}", .{err});
+            };
+        },
+        else => {
+            if (cmd_id < NEW_SESSION_DISTRO_BASE) return;
+            const idx = cmd_id - NEW_SESSION_DISTRO_BASE;
+            if (idx >= distros.len) return;
+            const distro = distros[idx];
+            const argv = [_][]const u8{ "wsl.exe", "--cd", "~", "-d", distro.name };
+            _ = self.addTabWithCommand(&argv, distro.name) catch |err| {
+                log.err("failed to create WSL tab for {s}: {}", .{ distro.name, err });
+            };
+        },
+    }
 }
 
 /// Show the settings (gear) context menu at client coordinates (x, y).
