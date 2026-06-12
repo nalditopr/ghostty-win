@@ -36,3 +36,7 @@ dist/windows/ghostty-windows-x64-*.zip
 
 # Zig 0.16+ package cache (lands here when build deps resolve outside .zig-cache)
 zig-pkg/
+
+# Windows installer build artifacts (produced by dist/windows/release.ps1)
+dist/windows/_staging/
+dist/windows/output/
