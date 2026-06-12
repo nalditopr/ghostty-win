@@ -116,7 +116,13 @@ if ($SkipBuild) {
     Write-Host 'Building ghostty (ReleaseFast)...' -ForegroundColor Cyan
     Push-Location $RepoRoot
     try {
-        & $ZigExe build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
+        # When building from an exact git tag, Ghostty's build.zig requires the
+        # tag to match its declared version. Pass an explicit semantic version
+        # to bypass that check (and stamp the build) whenever $Version is a
+        # plain a.b.c; otherwise let the build derive it from git.
+        $zigArgs = @('build', '-Dapp-runtime=win32', '-Dtarget=x86_64-windows-gnu', '-Doptimize=ReleaseFast')
+        if ($Version -match '^\d+\.\d+\.\d+$') { $zigArgs += "-Dversion-string=$Version" }
+        & $ZigExe @zigArgs
         if ($LASTEXITCODE -ne 0) {
             Fail "zig build failed with exit code $LASTEXITCODE"
         }
