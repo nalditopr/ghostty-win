@@ -1,0 +1,41 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test (x86_64-windows-gnu)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig 0.15.2
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Build (win32 apprt)
+        run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+
+      # The full test suite has known environment-specific failures in
+      # cli.ssh-cache.DiskCache on the gnu test binary, and some tests pull in
+      # the GTK apprt at comptime. Run the win32-relevant filters instead.
+      - name: Test (win32 feature suites)
+        run: |
+          zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter=sidebar
+          zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter=wsl
+          zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter=win-pwd
+          zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu "-Dtest-filter=unit: "

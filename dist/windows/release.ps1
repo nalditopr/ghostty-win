@@ -46,10 +46,21 @@ $ErrorActionPreference = 'Stop'
 # from any current working directory.
 $ScriptDir = $PSScriptRoot
 $RepoRoot  = (Resolve-Path (Join-Path $ScriptDir '..\..')).Path
-$ZigExe    = 'C:\Users\ReyColónValero\claude\tools\zig-x86_64-windows-0.15.2\zig.exe'
-# WebView2Loader.dll staged from the Microsoft.Web.WebView2 NuGet package
-# (build/native/x64). See Fail message below for how to (re)fetch it.
-$WebView2LoaderSource = 'C:\Users\ReyColónValero\claude\ghostty-staging\WebView2Loader.dll'
+# Prefer the pinned local toolchain; fall back to `zig` on PATH (CI uses the
+# latter via mlugg/setup-zig). Override with $env:ZIG.
+$ZigExe = if ($env:ZIG) { $env:ZIG }
+          elseif (Test-Path 'C:\Users\ReyColónValero\claude\tools\zig-x86_64-windows-0.15.2\zig.exe') { 'C:\Users\ReyColónValero\claude\tools\zig-x86_64-windows-0.15.2\zig.exe' }
+          else { 'zig' }
+# WebView2Loader.dll from the Microsoft.Web.WebView2 NuGet package
+# (build/native/x64). Search order: $env:WEBVIEW2LOADER_PATH, the dll beside
+# this script, the dll in zig-out\bin, then the local dev staging copy.
+$WebView2LoaderSource = @(
+    $env:WEBVIEW2LOADER_PATH,
+    (Join-Path $ScriptDir 'WebView2Loader.dll'),
+    (Join-Path $RepoRoot 'zig-out\bin\WebView2Loader.dll'),
+    'C:\Users\ReyColónValero\claude\ghostty-staging\WebView2Loader.dll'
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $WebView2LoaderSource) { $WebView2LoaderSource = 'WebView2Loader.dll' }
 $StageDir  = Join-Path $ScriptDir '_staging'
 $IssFile   = Join-Path $ScriptDir 'installer.iss'
 $OutputDir = Join-Path $ScriptDir 'output'
