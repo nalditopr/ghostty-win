@@ -83,6 +83,16 @@ drag_start_x: i16 = 0,
 /// Whether the drag has exceeded the threshold and is active.
 drag_active: bool = false,
 
+/// Sidebar row drag state: which session row is being dragged
+/// (-1 = none). Mirrors drag_tab but tracks the cursor along Y to
+/// reorder session rows. Reorders live via moveTabTo on each move.
+sidebar_drag_row: isize = -1,
+/// Starting Y position of the sidebar row drag, in client pixels.
+sidebar_drag_start_y: i32 = 0,
+/// Whether the sidebar row drag has exceeded the threshold and is
+/// reordering (distinguishes a click-to-select from a drag).
+sidebar_drag_active: bool = false,
+
 /// Inline tab rename: Edit control HWND, font, and target tab index.
 rename_edit: ?w32.HWND = null,
 rename_font: ?*anyopaque = null,
@@ -943,6 +953,14 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
         self.drag_active = false;
         _ = w32.ReleaseCapture();
     }
+    // Clear any in-progress sidebar row drag (e.g. a goto_tab keybind
+    // fired mid-drag). handleSidebarClick sets this AFTER its own
+    // selectTabIndex call, so the click-then-drag path is unaffected.
+    if (self.sidebar_drag_row >= 0) {
+        self.sidebar_drag_row = -1;
+        self.sidebar_drag_active = false;
+        _ = w32.ReleaseCapture();
+    }
     if (self.active_tab < self.tab_count) {
         var it = self.tab_trees[self.active_tab].iterator();
         while (it.next()) |entry| {
@@ -1192,6 +1210,32 @@ fn endSidebarDrag(self: *Window) void {
     if (!self.dragging_sidebar) return;
     self.dragging_sidebar = false;
     _ = w32.ReleaseCapture();
+}
+
+/// End an in-progress sidebar row drag-reorder, releasing capture if
+/// one was held. Idempotent: a no-op when no row drag is active.
+fn endSidebarRowDrag(self: *Window) void {
+    if (self.sidebar_drag_row < 0) return;
+    self.sidebar_drag_row = -1;
+    self.sidebar_drag_active = false;
+    _ = w32.ReleaseCapture();
+}
+
+/// Compute the target row index for a sidebar row drag at client y.
+/// Mirrors the tab bar's midpoint rule: the slot whose midpoint the
+/// cursor has passed. Clamped to the valid session row range.
+fn sidebarDragTarget(self: *const Window, y: i32) usize {
+    if (self.tab_count == 0) return 0;
+    const item_h = Sidebar.itemHeight(self.scale);
+    if (item_h <= 0) return 0;
+    var target: usize = 0;
+    for (0..self.tab_count) |i| {
+        const slot_top: i32 = @as(i32, @intCast(i)) * item_h;
+        const slot_mid = slot_top + @divTrunc(item_h, 2);
+        if (y >= slot_mid) target = i;
+    }
+    if (target >= self.tab_count) target = self.tab_count - 1;
+    return target;
 }
 
 /// Create a new split in the active tab. Splits inherit the source
@@ -2034,6 +2078,19 @@ const TAB_CTX_NEW_TAB: usize = 9004;
 const GEAR_CTX_OPEN_CONFIG: usize = 9201;
 const GEAR_CTX_OPEN_FOLDER: usize = 9202;
 const GEAR_CTX_RELOAD: usize = 9203;
+// Opens a second popup that writes `command = <choice>` into the user
+// config (the default-shell picker). 9410+ avoids every taken range
+// (9001-9004/9101-9107/9201-9203/9300-9322/9400 close-pane).
+const GEAR_CTX_SET_DEFAULT_SHELL: usize = 9410;
+
+// Default-shell picker command IDs (the second popup opened by
+// "Set default shell..."). Each writes the chosen program/argv to the
+// `command` config key. Installed WSL distros are appended at
+// DEFAULT_SHELL_DISTRO_BASE + index, capped below the next reserved ID.
+const DEFAULT_SHELL_PWSH: usize = 9411;
+const DEFAULT_SHELL_CMD: usize = 9412;
+const DEFAULT_SHELL_DISTRO_BASE: usize = 9420;
+const DEFAULT_SHELL_DISTRO_CAP: usize = 9450;
 
 // Backend picker command IDs (right-click on the sidebar "+ New
 // session" row or the tab bar "+" button opens it targeting a new
@@ -2214,7 +2271,17 @@ fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
     if (self.closing) return;
     switch (self.sidebarHitTest(x, y)) {
         .none => {},
-        .item => |i| self.selectTabIndex(i),
+        .item => |i| {
+            // Select immediately (like the tab bar) and start tracking
+            // a potential drag-reorder. selectTabIndex clears any stale
+            // drag state, so set ours afterward.
+            self.selectTabIndex(i);
+            self.sidebar_drag_row = @intCast(i);
+            self.sidebar_drag_start_y = y;
+            self.sidebar_drag_active = false;
+            if (self.hwnd) |h| _ = w32.SetCapture(h);
+        },
+        .row_close => |i| self.closeTabByIndex(i),
         .new_session => {
             _ = self.addTab() catch |err| {
                 log.err("failed to create new tab: {}", .{err});
@@ -2412,6 +2479,8 @@ fn showGearContextMenu(self: *Window, x: i32, y: i32) void {
     _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_OPEN_CONFIG, std.unicode.utf8ToUtf16LeStringLiteral("Open config"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_OPEN_FOLDER, std.unicode.utf8ToUtf16LeStringLiteral("Open config folder"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_RELOAD, std.unicode.utf8ToUtf16LeStringLiteral("Reload config"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, GEAR_CTX_SET_DEFAULT_SHELL, std.unicode.utf8ToUtf16LeStringLiteral("Set default shell..."));
 
     // Convert client coords to screen coords for the popup.
     var pt = w32.POINT{ .x = x, .y = y };
@@ -2440,8 +2509,97 @@ fn showGearContextMenu(self: *Window, x: i32, y: i32) void {
         ) catch |err| {
             log.err("failed to reload config: {}", .{err});
         },
+        // Open the default-shell picker anchored where the gear menu
+        // was. A second popup keeps this off the modal stack of the
+        // first (TrackPopupMenuEx has already returned).
+        GEAR_CTX_SET_DEFAULT_SHELL => self.showDefaultShellMenu(x, y),
         else => {},
     }
+}
+
+/// Resolve a default-shell picker command ID and the distro count that
+/// was shown to the config value to write (e.g. "pwsh.exe" or
+/// "wsl.exe --cd ~ -d Ubuntu"), or null when the menu was dismissed or
+/// the ID is out of range. Pure mapping so it can be unit-tested; the
+/// distro value is written into `distro_buf` and the slice returned
+/// points into it.
+fn defaultShellValue(
+    cmd_id: usize,
+    distros: []const internal_os.wsl.Distro,
+    distro_buf: []u8,
+) ?[]const u8 {
+    switch (cmd_id) {
+        DEFAULT_SHELL_PWSH => return if (havePwsh()) "pwsh.exe" else "powershell.exe",
+        DEFAULT_SHELL_CMD => return "cmd.exe",
+        else => {},
+    }
+    if (cmd_id < DEFAULT_SHELL_DISTRO_BASE) return null;
+    const idx = cmd_id - DEFAULT_SHELL_DISTRO_BASE;
+    if (idx >= distros.len) return null;
+    // wsl.exe needs the distro selected explicitly so the default shell
+    // is deterministic regardless of the WSL default.
+    return std.fmt.bufPrint(
+        distro_buf,
+        "wsl.exe --cd ~ -d {s}",
+        .{distros[idx].name},
+    ) catch null;
+}
+
+/// Show the default-shell picker at client coordinates (x, y):
+/// "PowerShell" / "Command Prompt" / each installed WSL distribution.
+/// The chosen backend is written to the `command` config key (via
+/// App.setDefaultShell), which the default-tab path already honors, and
+/// the config is reloaded so it takes effect for new tabs/splits.
+fn showDefaultShellMenu(self: *Window, x: i32, y: i32) void {
+    if (self.closing or self.is_quick_terminal) return;
+    const alloc = self.app.core_app.alloc;
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, DEFAULT_SHELL_PWSH, std.unicode.utf8ToUtf16LeStringLiteral("PowerShell"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, DEFAULT_SHELL_CMD, std.unicode.utf8ToUtf16LeStringLiteral("Command Prompt"));
+
+    // Enumerate installed distros at menu-open (mirrors showBackendMenu).
+    const all_distros: []internal_os.wsl.Distro = internal_os.wsl.list(alloc) catch &.{};
+    defer internal_os.wsl.free(alloc, all_distros);
+    const distros = all_distros[0..@min(
+        all_distros.len,
+        DEFAULT_SHELL_DISTRO_CAP - DEFAULT_SHELL_DISTRO_BASE,
+    )];
+
+    if (distros.len > 0) {
+        _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+        for (distros, 0..) |distro, i| {
+            const label = distroMenuLabel(alloc, distro.name, distro.is_default) catch continue;
+            defer alloc.free(label);
+            const label_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, label) catch continue;
+            defer alloc.free(label_w);
+            _ = w32.AppendMenuW(
+                menu,
+                w32.MF_STRING,
+                DEFAULT_SHELL_DISTRO_BASE + i,
+                label_w.ptr,
+            );
+        }
+    }
+
+    var pt = w32.POINT{ .x = x, .y = y };
+    if (self.hwnd) |h| _ = w32.ClientToScreen(h, &pt);
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        self.hwnd.?,
+        null,
+    );
+
+    if (self.closing) return;
+
+    var distro_buf: [512]u8 = undefined;
+    const value = defaultShellValue(@intCast(cmd), distros, &distro_buf) orelse return;
+    self.app.setDefaultShell(value);
 }
 
 /// Handle mouse movement over the sidebar for hover effects.
@@ -2846,6 +3004,10 @@ pub fn windowWndProc(
                 window.endSidebarDrag();
                 return 0;
             }
+            if (window.sidebar_drag_row >= 0) {
+                window.endSidebarRowDrag();
+                return 0;
+            }
             if (window.drag_tab >= 0) {
                 window.drag_tab = -1;
                 window.drag_active = false;
@@ -2930,6 +3092,27 @@ pub fn windowWndProc(
                 }
                 return 0;
             }
+            // Handle sidebar row drag-reorder.
+            if (window.sidebar_drag_row >= 0) {
+                const dy = if (y > window.sidebar_drag_start_y)
+                    y - window.sidebar_drag_start_y
+                else
+                    window.sidebar_drag_start_y - y;
+                const threshold = Sidebar.dragThreshold(window.scale);
+                if (!window.sidebar_drag_active and dy > threshold) {
+                    window.sidebar_drag_active = true;
+                }
+                if (window.sidebar_drag_active and window.tab_count > 1) {
+                    const from: usize = @intCast(window.sidebar_drag_row);
+                    const target = window.sidebarDragTarget(y);
+                    if (target != from) {
+                        window.moveTabTo(from, target);
+                        window.sidebar_drag_row = @intCast(target);
+                        if (window.hwnd) |h| _ = w32.UpdateWindow(h);
+                    }
+                }
+                return 0;
+            }
             if (window.hitTestSidebarEdge(x)) {
                 // Over the resize band: suppress row hover so the
                 // band reads as a grab edge, not a row.
@@ -2981,10 +3164,12 @@ pub fn windowWndProc(
         },
         w32.WM_CAPTURECHANGED => {
             // Capture stolen (e.g. a menu or modal opened mid-drag):
-            // end the sidebar edge drag so the override stops tracking
-            // the mouse. Re-entry from our own ReleaseCapture is a
-            // no-op via the dragging_sidebar guard.
+            // end the sidebar edge drag and any row drag-reorder so they
+            // stop tracking the mouse. Re-entry from our own
+            // ReleaseCapture is a no-op via the dragging_sidebar /
+            // sidebar_drag_row guards.
             window.endSidebarDrag();
+            window.endSidebarRowDrag();
             return 0;
         },
         w32.WM_ACTIVATE => {
@@ -3199,6 +3384,69 @@ test "unit: distro menu label formats the default marker" {
         defer alloc.free(label);
         try testing.expectEqualStrings("Ubuntu-24.04 (default)", label);
     }
+}
+
+test "unit: default-shell value maps the fixed shells" {
+    var buf: [512]u8 = undefined;
+    const distros: []const internal_os.wsl.Distro = &.{};
+
+    // cmd is deterministic.
+    try testing.expectEqualStrings(
+        "cmd.exe",
+        defaultShellValue(DEFAULT_SHELL_CMD, distros, &buf).?,
+    );
+
+    // pwsh resolves to one of the two PowerShell exes depending on
+    // whether PowerShell 7 is installed on the test host.
+    const pwsh = defaultShellValue(DEFAULT_SHELL_PWSH, distros, &buf).?;
+    try testing.expect(
+        std.mem.eql(u8, pwsh, "pwsh.exe") or
+            std.mem.eql(u8, pwsh, "powershell.exe"),
+    );
+}
+
+test "unit: default-shell value formats the distro argv" {
+    var buf: [512]u8 = undefined;
+    const distros: []const internal_os.wsl.Distro = &.{
+        .{ .name = "Ubuntu", .guid = "{x}", .is_default = true, .version = 2 },
+        .{ .name = "Debian", .guid = "{y}", .is_default = false, .version = 2 },
+    };
+    try testing.expectEqualStrings(
+        "wsl.exe --cd ~ -d Ubuntu",
+        defaultShellValue(DEFAULT_SHELL_DISTRO_BASE, distros, &buf).?,
+    );
+    try testing.expectEqualStrings(
+        "wsl.exe --cd ~ -d Debian",
+        defaultShellValue(DEFAULT_SHELL_DISTRO_BASE + 1, distros, &buf).?,
+    );
+}
+
+test "unit: default-shell value ignores dismissal and out-of-range ids" {
+    var buf: [512]u8 = undefined;
+    const distros: []const internal_os.wsl.Distro = &.{
+        .{ .name = "Ubuntu", .guid = "{x}", .is_default = true, .version = 2 },
+    };
+    // Dismissal (0) and ids in gaps / past the distro count.
+    try testing.expectEqual(@as(?[]const u8, null), defaultShellValue(0, distros, &buf));
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        defaultShellValue(DEFAULT_SHELL_DISTRO_BASE - 1, distros, &buf),
+    );
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        defaultShellValue(DEFAULT_SHELL_DISTRO_BASE + 1, distros, &buf),
+    );
+}
+
+test "unit: default-shell menu ids match the reserved registry" {
+    // 9410 set-default entry, 9411/9412 shells, 9420+ distros capped at
+    // 9450 (see the menu ID comment block). A change here risks a
+    // collision with another menu's IDs.
+    try testing.expectEqual(@as(usize, 9410), GEAR_CTX_SET_DEFAULT_SHELL);
+    try testing.expectEqual(@as(usize, 9411), DEFAULT_SHELL_PWSH);
+    try testing.expectEqual(@as(usize, 9412), DEFAULT_SHELL_CMD);
+    try testing.expectEqual(@as(usize, 9420), DEFAULT_SHELL_DISTRO_BASE);
+    try testing.expectEqual(@as(usize, 9450), DEFAULT_SHELL_DISTRO_CAP);
 }
 
 // Pull the persisted window-state module's unit tests (serialize/parse

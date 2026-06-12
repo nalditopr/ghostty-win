@@ -19,6 +19,8 @@ const NOTIF_ENTRY_BASE: i32 = 40;
 const NOTIF_CLEAR_W_BASE: i32 = 48;
 const BADGE_BASE: i32 = 14;
 const DROPDOWN_BASE: i32 = 24;
+const CLOSE_BASE: i32 = 20;
+const DRAG_THRESHOLD_BASE: i32 = 5;
 
 /// Sidebar width clamp bounds in unscaled pixels, applied to both the
 /// `window-sidebar-width` config value and the drag-resize override.
@@ -29,6 +31,9 @@ pub const MAX_WIDTH: u32 = 400;
 pub const HitTarget = union(enum) {
     none,
     item: usize,
+    /// The close 'x' glyph at the right edge of session row `index`.
+    /// Hit-tested ahead of `.item` within the row; revealed on hover.
+    row_close: usize,
     new_session,
     /// The dropdown chevron zone at the right edge of the
     /// "+ New session" row (opens the backend picker).
@@ -60,6 +65,13 @@ pub fn edgeBandWidth(scale: f32) i32 {
 /// Height of the footer strip (bell/gear icons) at the given DPI scale.
 pub fn footerHeight(scale: f32) i32 {
     return scaled(FOOTER_H_BASE, scale);
+}
+
+/// Pixel distance the cursor must move from the press point before a
+/// row press becomes a drag-reorder (vs. a click-to-select), at the
+/// given DPI scale. Matches the tab bar's 5px threshold at 1.0.
+pub fn dragThreshold(scale: f32) i32 {
+    return scaled(DRAG_THRESHOLD_BASE, scale);
 }
 
 /// Height of the notifications panel: ~40% of the client height.
@@ -164,7 +176,16 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
     }
 
     const row: usize = @intCast(@divTrunc(y, ctx.item_h));
-    if (row < ctx.tab_count) return .{ .item = row };
+    if (row < ctx.tab_count) {
+        // Close 'x' band: like the dropdown chevron, the zone spans the
+        // full row height for a forgiving click; only x decides. It
+        // takes priority over the row body. The band matches
+        // rowCloseRect's x-range so paint and hit-test agree.
+        const pad = scaled(PAD_BASE, ctx.scale);
+        const cw = scaled(CLOSE_BASE, ctx.scale);
+        if (x >= ctx.width - pad - cw and x < ctx.width - pad) return .{ .row_close = row };
+        return .{ .item = row };
+    }
     if (row == ctx.tab_count) {
         // Dropdown chevron: like the footer slots, the zone spans the
         // full row height for a forgiving click; only x decides.
@@ -180,6 +201,19 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
 pub fn itemRect(index: usize, width: i32, item_h: i32) w32.RECT {
     const top = @as(i32, @intCast(index)) * item_h;
     return .{ .left = 0, .top = top, .right = width, .bottom = top + item_h };
+}
+
+/// Painted rect of the close 'x' glyph for session row `index`: a
+/// square, vertically centered in the row and right-aligned to the
+/// text pad. Mirrors the tab bar's close button placement. Ending at
+/// width-pad keeps it left of the drag-resize edge band (pad >= band
+/// width at any scale), which is hit-tested first.
+pub fn rowCloseRect(index: usize, width: i32, item_h: i32, scale: f32) w32.RECT {
+    const pad = scaled(PAD_BASE, scale);
+    const cw = scaled(CLOSE_BASE, scale);
+    const row = itemRect(index, width, item_h);
+    const top = row.top + @divTrunc(item_h - cw, 2);
+    return .{ .left = width - pad - cw, .top = top, .right = width - pad, .bottom = top + cw };
 }
 
 /// Painted rect of the "+ New session" dropdown chevron: a square,
@@ -283,7 +317,14 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     for (0..win.tab_count) |i| {
         var row = itemRect(i, sidebar_w, item_h);
         const is_active = (i == win.active_tab);
-        const is_hovered = switch (win.sidebar_hover) {
+        // The row reads as hovered when the cursor is over its body or
+        // its close 'x'; the close glyph itself only appears in either
+        // case (mirrors the tab bar revealing 'x' on hover).
+        const close_hovered = switch (win.sidebar_hover) {
+            .row_close => |h| h == i,
+            else => false,
+        };
+        const is_hovered = close_hovered or switch (win.sidebar_hover) {
             .item => |h| h == i,
             else => false,
         };
@@ -351,10 +392,15 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
 
         if (text_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
+            // Reserve room for the close 'x' when it is shown so the
+            // title ellipsizes instead of running under the glyph
+            // (the tab bar reserves close_btn_w the same way).
+            const cw = scaled(CLOSE_BASE, win.scale);
+            const text_right = if (is_hovered) sidebar_w - pad - cw else sidebar_w - pad;
             var text_rect = w32.RECT{
                 .left = accent_w + pad + dot_w,
                 .top = row.top,
-                .right = sidebar_w - pad,
+                .right = text_right,
                 .bottom = row.bottom,
             };
             _ = w32.DrawTextW(
@@ -363,6 +409,21 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
                 @intCast(text_len),
                 &text_rect,
                 w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+            );
+        }
+
+        // Close 'x' — revealed on row hover, like the tab bar. Red when
+        // the cursor is specifically over the glyph.
+        if (is_hovered) {
+            _ = w32.SetTextColor(mem_dc, if (close_hovered) exited_color else inactive_text_color);
+            const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
+            var close_rect = rowCloseRect(i, sidebar_w, item_h, win.scale);
+            _ = w32.DrawTextW(
+                mem_dc,
+                x_char,
+                1,
+                &close_rect,
+                w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
             );
         }
     }
@@ -678,6 +739,66 @@ test "sidebar hitTest: row boundary belongs to the lower row" {
     try testing.expectEqual(HitTarget{ .item = 1 }, hitTest(10, 36, testCtx(3, false, 0)));
 }
 
+test "sidebar hitTest: row close band takes priority over the row body" {
+    // Close 'x' band: x in [width-pad-cw, width-pad) = [192, 212) at
+    // the test geometry (pad=8, cw=20). The rest of the row is body,
+    // including the strip right of the band (x>=212) and left of it.
+    const ctx = testCtx(3, false, 0);
+    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(191, 0, ctx));
+    try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(192, 0, ctx));
+    try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(211, 35, ctx));
+    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(212, 0, ctx));
+    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(219, 0, ctx));
+}
+
+test "sidebar hitTest: close band is per-row" {
+    const ctx = testCtx(3, false, 0);
+    try testing.expectEqual(HitTarget{ .row_close = 1 }, hitTest(200, 36, ctx));
+    try testing.expectEqual(HitTarget{ .row_close = 2 }, hitTest(200, 2 * 36, ctx));
+    // No close band on the "+ New session" row — that x is the chevron.
+    try testing.expectEqual(@as(HitTarget, .new_session_dropdown), hitTest(200, 3 * 36, ctx));
+}
+
+test "sidebar rowCloseRect: square right-aligned and centered in the row" {
+    // Row 1 spans y [36,72); a 20px square centered there is y [44,64),
+    // right-aligned to the text pad at x [192,212) (pad=8, cw=20).
+    const r = rowCloseRect(1, 220, 36, 1.0);
+    try testing.expectEqual(@as(i32, 192), r.left);
+    try testing.expectEqual(@as(i32, 212), r.right);
+    try testing.expectEqual(@as(i32, 44), r.top);
+    try testing.expectEqual(@as(i32, 64), r.bottom);
+}
+
+test "sidebar rowCloseRect: scales with DPI and agrees with hitTest" {
+    // At 2.0 scale, width 440: pad=16, cw=40 — close x in [384, 424).
+    const ctx: HitCtx = .{
+        .item_h = 72,
+        .tab_count = 2,
+        .client_h = 800,
+        .width = 440,
+        .scale = 2.0,
+        .panel_open = false,
+        .notif_count = 0,
+    };
+    const r = rowCloseRect(0, 440, 72, 2.0);
+    try testing.expectEqual(@as(i32, 384), r.left);
+    try testing.expectEqual(@as(i32, 424), r.right);
+    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(383, 0, ctx));
+    try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(384, 0, ctx));
+    try testing.expectEqual(HitTarget{ .row_close = 0 }, hitTest(423, 71, ctx));
+    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(424, 0, ctx));
+}
+
+test "sidebar rowCloseRect clears the resize edge band" {
+    // WM_LBUTTONDOWN tests the edge band before the sidebar, so the
+    // close 'x' must end at or left of the band at any scale.
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 1.75, 2.0 };
+    for (scales) |s| {
+        const r = rowCloseRect(0, 300, itemHeight(s), s);
+        try testing.expect(r.right <= 300 - edgeBandWidth(s));
+    }
+}
+
 test "sidebar hitTest: new session row directly below sessions" {
     const ctx = testCtx(3, false, 0);
     try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, 3 * 36, ctx));
@@ -698,8 +819,13 @@ test "sidebar hitTest: new session dropdown chevron band" {
 
 test "sidebar hitTest: dropdown band only exists on the new session row" {
     const ctx = testCtx(3, false, 0);
-    // The same x on a session row is still that item.
-    try testing.expectEqual(HitTarget{ .item = 0 }, hitTest(200, 0, ctx));
+    // An x in the chevron band on a session row is not the dropdown:
+    // it is either the row body or (in the close band) the close 'x',
+    // never .new_session_dropdown.
+    const body = hitTest(160, 0, ctx);
+    try testing.expectEqual(HitTarget{ .item = 0 }, body);
+    const close = hitTest(200, 0, ctx);
+    try testing.expectEqual(HitTarget{ .row_close = 0 }, close);
     // And below the new-session row it stays none.
     try testing.expectEqual(@as(HitTarget, .none), hitTest(200, 4 * 36, ctx));
 }
