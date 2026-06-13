@@ -23,6 +23,10 @@ const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const toggle_quick_terminal = @import("toggle_quick_terminal.zig");
 const browser = @import("browser.zig");
+const workspace = @import("workspace.zig");
+const tab = @import("tab.zig");
+const send = @import("send.zig");
+const notify = @import("notify.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -84,6 +88,18 @@ pub const Action = enum {
 
     // Use IPC to drive the running Ghostty's WebView2 browser panes.
     browser,
+
+    // Use IPC to manage the running Ghostty's sidebar workspaces.
+    workspace,
+
+    // Use IPC to manage the running Ghostty's per-workspace tabs.
+    tab,
+
+    // Use IPC to write text to a running Ghostty terminal pane.
+    send,
+
+    // Use IPC to set/clear a pane's notification ring (attention).
+    notify,
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -167,6 +183,10 @@ pub const Action = enum {
             .@"new-window" => try new_window.run(alloc),
             .@"toggle-quick-terminal" => try toggle_quick_terminal.run(alloc),
             .browser => try browser.run(alloc),
+            .workspace => try workspace.run(alloc),
+            .tab => try tab.run(alloc),
+            .send => try send.run(alloc),
+            .notify => try notify.run(alloc),
         };
     }
 
@@ -210,6 +230,10 @@ pub const Action = enum {
                 .@"new-window" => new_window.Options,
                 .@"toggle-quick-terminal" => toggle_quick_terminal.Options,
                 .browser => browser.Options,
+                .workspace => workspace.Options,
+                .tab => tab.Options,
+                .send => send.Options,
+                .notify => notify.Options,
             };
         }
     }

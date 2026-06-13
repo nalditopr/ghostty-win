@@ -2148,12 +2148,54 @@ pub fn stopQuitTimer(self: *App) void {
 /// Show a Windows balloon notification via Shell_NotifyIconW.
 /// Creates a temporary tray icon, shows the balloon, then removes
 /// the icon after a short delay.
+/// Sentinel an agent emits via OSC 9 to toggle this pane's attention
+/// ring without a desktop balloon. We piggyback on OSC 9 (the desktop
+/// notification channel, which already routes a pane→apprt message on
+/// every platform) rather than adding a private OSC to the shared
+/// terminal parser, keeping the feature contained to the Win32 apprt.
+///
+///   set:   printf '\033]9;@ghostty-attention:ring\033\\'
+///   clear: printf '\033]9;@ghostty-attention:clear\033\\'
+///
+/// (`\033\\` is ST; BEL `\a` works too.) PowerShell:
+///   $e=[char]27; Write-Host "$e]9;@ghostty-attention:ring$e\" -NoNewline
+const ATTENTION_OSC_PREFIX = "@ghostty-attention:";
+
+/// Parse an OSC 9 notification body for the attention sentinel. Returns
+/// true ("ring"), false ("clear"), or null when the body is an ordinary
+/// notification (the caller then shows a normal balloon). Pure so the
+/// wire format is unit-testable. Surrounding ASCII whitespace is trimmed
+/// so a shell that pads the sequence still matches.
+pub fn parseAttentionOsc(body: []const u8) ?bool {
+    const trimmed = std.mem.trim(u8, body, &std.ascii.whitespace);
+    if (!std.mem.startsWith(u8, trimmed, ATTENTION_OSC_PREFIX)) return null;
+    const verb = trimmed[ATTENTION_OSC_PREFIX.len..];
+    if (std.mem.eql(u8, verb, "ring")) return true;
+    if (std.mem.eql(u8, verb, "clear")) return false;
+    return null;
+}
+
 fn showDesktopNotification(
     self: *App,
     target: apprt.Target,
     value: apprt.Action.Value(.desktop_notification),
 ) void {
     const hwnd = self.msg_hwnd orelse return;
+
+    // Intercept the attention sentinel before doing any balloon work: an
+    // agent's `OSC 9 ; @ghostty-attention:ring` sets/clears the ring on
+    // its own pane and produces neither a balloon nor a log entry. Only a
+    // surface target carries a pane to ring.
+    if (parseAttentionOsc(value.body)) |on| {
+        switch (target) {
+            .app => {},
+            .surface => |core_surface| {
+                const rt = core_surface.rt_surface;
+                rt.parent_window.setAttentionForSurface(rt, on);
+            },
+        }
+        return;
+    }
 
     // Record which surface notified so a click on the balloon can jump
     // back to it. Slots rotate; if all are in flight the oldest balloon
@@ -2263,10 +2305,11 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
 // Agent IPC (`ghostty +browser ...`)
 // ---------------------------------------------------------------------------
 
-/// Start the named-pipe IPC server on pipe ghostty-browser-<pid>. The
-/// pipe thread parses requests and posts each to msg_hwnd; this UI
-/// thread drives the browser in msgWndProc. Failure (e.g. a stale pipe)
-/// leaves ipc_server null — the CLI is then unavailable but the app runs.
+/// Start the named-pipe IPC server on pipe ghostty-ipc-<pid>. The pipe
+/// thread parses requests and posts each to msg_hwnd; this UI thread
+/// drives the browser/workspace/tab/send commands in msgWndProc. Failure
+/// (e.g. a stale pipe) leaves ipc_server null — the CLI is then
+/// unavailable but the app runs.
 fn startIpcServer(self: *App) void {
     const alloc = self.core_app.alloc;
     var name_buf: [64]u8 = undefined;
@@ -2280,8 +2323,29 @@ fn startIpcServer(self: *App) void {
 /// Pipe-thread callback: hand the parsed request to the UI thread. On a
 /// PostMessageW failure (msg_hwnd gone, queue full) the request would
 /// otherwise leak, so destroy it here. ctx is the *App.
+///
+/// `workspace-new --worktree` is the one verb that does real work HERE,
+/// on the pipe thread, before the UI ever sees it: it shells out to `git
+/// worktree add`, which touches the filesystem (and can block on a large
+/// repo). Running it on the message loop would freeze the UI, so we do it
+/// off-loop, stash the resolved path on the request, and only then
+/// PostMessage. A git failure is answered straight from here (the
+/// server's senders are thread-safe) and the request is dropped without
+/// reaching the UI, so no empty workspace is ever created.
 fn ipcCallback(ctx: ?*anyopaque, req: *ipc.Request) void {
     const self: *App = @ptrCast(@alignCast(ctx.?));
+
+    if (req.cmd == .@"workspace-new") {
+        if (ipc.argString(req, "worktree")) |branch| {
+            if (!self.ipcPrepareWorktree(req, branch)) {
+                // ipcPrepareWorktree already answered the client with the
+                // git error (or a validation error); drop the request.
+                req.destroy();
+                return;
+            }
+        }
+    }
+
     const hwnd = self.msg_hwnd orelse {
         req.destroy();
         return;
@@ -2289,6 +2353,164 @@ fn ipcCallback(ctx: ?*anyopaque, req: *ipc.Request) void {
     if (w32.PostMessageW(hwnd, WM_APP_IPC_REQUEST, 0, @bitCast(@intFromPtr(req))) == 0) {
         req.destroy();
     }
+}
+
+/// Pipe-thread helper for `workspace-new --worktree <branch> [--repo P]`.
+/// Validates the branch, resolves the repo (the request's "repo" arg, or
+/// the client's "cwd" arg — the app's own cwd is meaningless to the
+/// agent), runs `git -C <repo> worktree add <repo>/.worktrees/<branch>
+/// [-b <branch>]`, and on success stashes the resolved worktree path on
+/// `req.worktree_path` for the UI handler. Returns true to proceed to the
+/// UI, false after having sent the client an error (no workspace is
+/// created). Runs entirely on the pipe thread.
+fn ipcPrepareWorktree(self: *App, req: *ipc.Request, branch: []const u8) bool {
+    const server = self.ipc_server orelse return false;
+    const alloc = self.core_app.alloc;
+
+    const validated = ipc.validateBranch(branch) catch |err| {
+        server.sendError(req.id, @errorName(err)) catch {};
+        return false;
+    };
+
+    // Resolve the repo root: explicit --repo wins, else the client's cwd
+    // (sent in the request because the app's cwd is its own, not the
+    // agent's). Without either we cannot locate a repository.
+    const repo = ipc.argString(req, "repo") orelse
+        ipc.argString(req, "cwd") orelse {
+        server.sendError(req.id, "no repository: pass --repo or run from inside a git repo") catch {};
+        return false;
+    };
+
+    const path = ipc.worktreePath(alloc, repo, validated) catch {
+        server.sendError(req.id, "out of memory") catch {};
+        return false;
+    };
+    // From here `path` is owned locally; on every early return free it,
+    // and on success transfer ownership to req.worktree_path.
+    var path_owned = true;
+    defer if (path_owned) alloc.free(path);
+
+    self.runGitWorktreeAdd(req.id, repo, path, validated) catch |err| switch (err) {
+        // The git child ran and reported a usable stderr message;
+        // runGitWorktreeAdd already answered the client.
+        error.GitFailed => return false,
+        // Couldn't even launch git, or some local failure.
+        else => {
+            server.sendError(req.id, @errorName(err)) catch {};
+            return false;
+        },
+    };
+
+    req.worktree_path = path;
+    path_owned = false; // ownership moved to the request
+    return true;
+}
+
+/// Run `git -C <repo> worktree add <path> -b <branch>`, falling back to
+/// no `-b` (attach an existing branch) when git reports the branch
+/// already exists. On a git error other than that, answer client request
+/// `id` with git's own stderr (trimmed) and return error.GitFailed.
+/// Returns normally only when a worktree now exists at `path`. Pipe-thread
+/// only.
+fn runGitWorktreeAdd(
+    self: *App,
+    id: u64,
+    repo: []const u8,
+    path: []const u8,
+    branch: []const u8,
+) !void {
+    const server = self.ipc_server orelse return error.GitFailed;
+    const alloc = self.core_app.alloc;
+
+    // First attempt: create a new branch (-b). The common case.
+    const first = try self.runGit(
+        alloc,
+        &.{ "git", "-C", repo, "worktree", "add", path, "-b", branch },
+    );
+    defer {
+        alloc.free(first.stdout);
+        alloc.free(first.stderr);
+    }
+    if (first.ok) return;
+
+    // If the branch already exists, git refuses -b; retry attaching the
+    // existing branch (no -b). git phrases this as "a branch named '...'
+    // already exists" (newer) or "...already exists" (older).
+    if (std.mem.indexOf(u8, first.stderr, "already exists") != null) {
+        const second = try self.runGit(
+            alloc,
+            &.{ "git", "-C", repo, "worktree", "add", path, branch },
+        );
+        defer {
+            alloc.free(second.stdout);
+            alloc.free(second.stderr);
+        }
+        if (second.ok) return;
+        server.sendError(id, gitMessage(second.stderr)) catch {};
+        return error.GitFailed;
+    }
+
+    server.sendError(id, gitMessage(first.stderr)) catch {};
+    return error.GitFailed;
+}
+
+/// One git child invocation. Captures stdout+stderr, returns whether it
+/// exited 0 along with the owned output buffers (caller frees both).
+const GitResult = struct {
+    ok: bool,
+    stdout: []u8,
+    stderr: []u8,
+};
+
+fn runGit(self: *App, alloc: Allocator, argv: []const []const u8) !GitResult {
+    _ = self;
+    var child = std.process.Child.init(argv, alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    var stdout: std.ArrayList(u8) = .empty;
+    errdefer stdout.deinit(alloc);
+    var stderr: std.ArrayList(u8) = .empty;
+    errdefer stderr.deinit(alloc);
+
+    try child.spawn();
+    // collectOutput reads both pipes to EOF (8 MiB cap is far beyond any
+    // git worktree message) before wait, so a chatty child can't deadlock.
+    try child.collectOutput(alloc, &stdout, &stderr, 8 * 1024 * 1024);
+    const term = try child.wait();
+
+    const ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    return .{
+        .ok = ok,
+        .stdout = try stdout.toOwnedSlice(alloc),
+        .stderr = try stderr.toOwnedSlice(alloc),
+    };
+}
+
+/// Distill git's stderr into a single-line client error message. git
+/// often prints a progress line ("Preparing worktree ...") before the
+/// actual failure, so prefer the first line tagged "fatal:" or "error:"
+/// (the useful reason); fall back to the first non-empty line, then a
+/// generic message when stderr is empty. Trimmed and capped.
+fn gitMessage(stderr: []const u8) []const u8 {
+    var first_nonempty: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (line.len == 0) continue;
+        if (first_nonempty == null) first_nonempty = line;
+        if (std.mem.startsWith(u8, line, "fatal:") or
+            std.mem.startsWith(u8, line, "error:"))
+        {
+            return line[0..@min(line.len, 512)];
+        }
+    }
+    if (first_nonempty) |line| return line[0..@min(line.len, 512)];
+    return "git worktree add failed";
 }
 
 /// Handle one IPC request on the UI thread (from WM_APP_IPC_REQUEST).
@@ -2323,6 +2545,39 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         .fill => self.ipcFill(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
+        // Workspace / tab / keystroke scripting. These all complete
+        // synchronously on this UI thread and send their own ok reply;
+        // a returned error is named to the client here.
+        .@"workspace-list" => self.ipcWorkspaceList(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"workspace-new" => self.ipcWorkspaceNew(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"workspace-select" => self.ipcWorkspaceSelect(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"workspace-close" => self.ipcWorkspaceClose(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"tab-list" => self.ipcTabList(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"tab-new" => self.ipcTabNew(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"tab-select" => self.ipcTabSelect(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"tab-close" => self.ipcTabClose(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .send => self.ipcSend(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .notify => self.ipcNotify(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
     }
 }
 
@@ -2338,6 +2593,13 @@ const IpcError = error{
     MissingText,
     UnknownId,
     UrlTooLong,
+    MissingIndex,
+    UnknownWorkspace,
+    UnknownTab,
+    NotATerminal,
+    QuickTerminal,
+    MissingAction,
+    BadAction,
 };
 
 /// Resolve the IPC target window: the foreground Ghostty window if one
@@ -2479,6 +2741,297 @@ fn ipcFill(self: *App, req: *ipc.Request) anyerror!void {
     const text = ipcArgString(req, "text") orelse return IpcError.MissingText;
     const browser = self.ipcFindBrowser(ipcArgId(req)) orelse return IpcError.UnknownId;
     browser.fillForIpc(req.id, ref, text);
+}
+
+// ---------------------------------------------------------------------------
+// Agent IPC: workspace / tab / keystroke scripting
+// ---------------------------------------------------------------------------
+//
+// These mutate the same single-UI-thread model the browser verbs do (they
+// run on the GUI thread via WM_APP_IPC_REQUEST) and reply synchronously.
+// Workspace/tab indices are window-local: every handler operates on the
+// IPC target window (foreground Ghostty window, else the first live one).
+// The Window mutators (addTab/selectTabIndex/closeWorkspace/...) all act on
+// the *active* workspace, so handlers that target a non-active workspace
+// select it first (selectWorkspace is a no-op when already active).
+
+/// Read an optional u32 index field ("index"/"workspace"/"tab").
+const ipcArgU32 = ipc.argU32;
+
+/// Read an optional bool field (send's "enter").
+const ipcArgBool = ipc.argBool;
+
+/// Resolve the workspace addressed by an optional "workspace" arg in the
+/// target window, defaulting to the active workspace when absent. Returns
+/// the window, the workspace pointer, and its index. UnknownWorkspace if
+/// an explicit index is out of range; NoWindow if no window exists.
+const IpcWorkspaceTarget = struct {
+    window: *Window,
+    ws: *Window.Workspace,
+    ws_idx: usize,
+};
+
+fn ipcResolveWorkspace(self: *App, req: *ipc.Request) IpcError!IpcWorkspaceTarget {
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    const ws_idx: usize = if (ipcArgU32(req, "workspace")) |w| w else window.active_workspace;
+    if (ws_idx >= window.workspace_count) return IpcError.UnknownWorkspace;
+    return .{
+        .window = window,
+        .ws = &window.workspaces[ws_idx],
+        .ws_idx = ws_idx,
+    };
+}
+
+/// Append a JSON string for a UTF-16 slice (a workspace name or tab
+/// title), escaping via std.json so embedded quotes/control chars are
+/// safe. Lossy on invalid UTF-16 (each bad unit becomes U+FFFD), which
+/// only affects display text, never protocol framing.
+fn ipcWriteJsonUtf16(
+    self: *App,
+    w: *std.ArrayList(u8),
+    utf16: []const u16,
+) !void {
+    const alloc = self.core_app.alloc;
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, utf16) catch
+        try alloc.dupe(u8, "");
+    defer alloc.free(utf8);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.json.Stringify.value(utf8, .{}, &aw.writer);
+    try w.appendSlice(alloc, aw.written());
+}
+
+/// workspace-list → [{index, name, active, tab_count}] for the target
+/// window's workspaces.
+fn ipcWorkspaceList(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    const alloc = self.core_app.alloc;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.append(alloc, '[');
+    for (window.workspaces[0..window.workspace_count], 0..) |*ws, i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.writer(alloc).print("{{\"index\":{d},\"name\":", .{i});
+        try self.ipcWriteJsonUtf16(&buf, ws.name[0..ws.name_len]);
+        try buf.writer(alloc).print(
+            ",\"active\":{},\"tab_count\":{d}}}",
+            .{ i == window.active_workspace, ws.tab_count },
+        );
+    }
+    try buf.append(alloc, ']');
+    server.sendOk(req.id, buf.items) catch {};
+}
+
+/// workspace-new {[name], [worktree], [repo], [cwd]} → create a workspace
+/// (a sidebar row with one tab), optionally renaming it, and reply with
+/// its index.
+///
+/// When the request carried a `worktree` branch, the pipe thread already
+/// ran `git worktree add` and stashed the resolved path on
+/// `req.worktree_path` (see ipcCallback/ipcPrepareWorktree). Here we just
+/// bind that path to the new workspace so its tabs spawn inside the
+/// worktree, and default the workspace name to the branch when no
+/// explicit --name was given. A plain workspace-new (no worktree) keeps
+/// the current behavior.
+fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    if (window.is_quick_terminal) return IpcError.QuickTerminal;
+
+    const idx: usize = if (req.worktree_path) |path| blk: {
+        // newWorkspaceWithDir binds the cwd before the first tab spawns
+        // and collapses the slot on failure (returning null), so we never
+        // report an index for an empty workspace.
+        break :blk window.newWorkspaceWithDir(path) orelse return IpcError.NoWindow;
+    } else blk: {
+        const before = window.workspace_count;
+        window.newWorkspace();
+        // newWorkspace collapses the slot if its first tab fails to spawn,
+        // so confirm a workspace was actually added before reporting one.
+        if (window.workspace_count <= before) return IpcError.NoWindow;
+        break :blk window.workspace_count - 1;
+    };
+
+    // Name precedence: explicit --name wins; otherwise a worktree
+    // workspace is named after its branch (the agent-friendly default).
+    if (ipcArgString(req, "name")) |name| {
+        if (name.len > 0) window.setWorkspaceName(idx, name);
+    } else if (ipcArgString(req, "worktree")) |branch| {
+        if (branch.len > 0) window.setWorkspaceName(idx, branch);
+    }
+
+    var data_buf: [32]u8 = undefined;
+    const data = std.fmt.bufPrint(&data_buf, "{{\"index\":{d}}}", .{idx}) catch
+        return error.NoSpaceLeft;
+    server.sendOk(req.id, data) catch {};
+}
+
+/// workspace-select {index} → switch the target window to workspace
+/// `index`.
+fn ipcWorkspaceSelect(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    const idx = ipcArgU32(req, "index") orelse return IpcError.MissingIndex;
+    if (idx >= window.workspace_count) return IpcError.UnknownWorkspace;
+    window.selectWorkspace(idx);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// workspace-close {index} → close workspace `index` in the target
+/// window. Closing the last workspace closes the window.
+fn ipcWorkspaceClose(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    const idx = ipcArgU32(req, "index") orelse return IpcError.MissingIndex;
+    if (idx >= window.workspace_count) return IpcError.UnknownWorkspace;
+    window.closeWorkspace(idx);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// tab-list {[workspace]} → [{index, title, active}] for the addressed
+/// (or active) workspace of the target window.
+fn ipcTabList(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveWorkspace(req);
+    const ws = target.ws;
+    const alloc = self.core_app.alloc;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.append(alloc, '[');
+    for (0..ws.tab_count) |i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.writer(alloc).print("{{\"index\":{d},\"title\":", .{i});
+        try self.ipcWriteJsonUtf16(&buf, ws.tab_titles[i][0..ws.tab_title_lens[i]]);
+        try buf.writer(alloc).print(
+            ",\"active\":{}}}",
+            .{i == ws.active_tab},
+        );
+    }
+    try buf.append(alloc, ']');
+    server.sendOk(req.id, buf.items) catch {};
+}
+
+/// tab-new {[workspace], [command]} → add a tab to the addressed (or
+/// active) workspace and reply with its index. With `command` the tab
+/// runs that shell (split on spaces); without it the tab inherits the
+/// active pane's backend (matching the "+" new-tab UX). The Window tab
+/// mutators act on the active workspace, so a non-active target workspace
+/// is selected first.
+fn ipcTabNew(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveWorkspace(req);
+    const window = target.window;
+    if (window.is_quick_terminal) return IpcError.QuickTerminal;
+
+    if (target.ws_idx != window.active_workspace) window.selectWorkspace(target.ws_idx);
+
+    if (ipcArgString(req, "command")) |command_str| {
+        const alloc = self.core_app.alloc;
+        // Split the command string on ASCII whitespace into an argv the
+        // surface deep-copies; an empty/whitespace-only command falls
+        // through to the inherit path.
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(alloc);
+        var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
+        while (it.next()) |tok| try argv.append(alloc, tok);
+        if (argv.items.len > 0) {
+            _ = try window.addTabWithCommand(argv.items, null);
+        } else {
+            _ = try window.addTabInherit();
+        }
+    } else {
+        _ = try window.addTabInherit();
+    }
+
+    // addTab* inserts per config (current/end) and selects the new tab,
+    // so the active tab index is the new tab's index.
+    const idx = window.activeWorkspace().active_tab;
+    var data_buf: [32]u8 = undefined;
+    const data = std.fmt.bufPrint(&data_buf, "{{\"index\":{d}}}", .{idx}) catch
+        return error.NoSpaceLeft;
+    server.sendOk(req.id, data) catch {};
+}
+
+/// tab-select {index, [workspace]} → make tab `index` active in the
+/// addressed (or active) workspace. selectTabIndex acts on the active
+/// workspace, so a non-active target is selected first.
+fn ipcTabSelect(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveWorkspace(req);
+    const idx = ipcArgU32(req, "index") orelse return IpcError.MissingIndex;
+    if (idx >= target.ws.tab_count) return IpcError.UnknownTab;
+
+    if (target.ws_idx != target.window.active_workspace)
+        target.window.selectWorkspace(target.ws_idx);
+    target.window.selectTabIndex(idx);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// tab-close {index, [workspace]} → close tab `index` in the addressed
+/// (or active) workspace. closeTabInWorkspace handles non-active
+/// workspaces and the last-tab/last-workspace collapse paths.
+fn ipcTabClose(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveWorkspace(req);
+    const idx = ipcArgU32(req, "index") orelse return IpcError.MissingIndex;
+    if (idx >= target.ws.tab_count) return IpcError.UnknownTab;
+    target.window.closeTabInWorkspaceForIpc(target.ws_idx, idx);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// send {text, [workspace], [tab], [enter]} → write `text` to the child
+/// PTY of the active pane of the addressed (or active) workspace's
+/// addressed (or active) tab, exactly as typed input would, optionally
+/// appending a carriage return (`enter`). Browser panes have no PTY and
+/// answer NotATerminal.
+fn ipcSend(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const text = ipcArgString(req, "text") orelse return IpcError.MissingText;
+    const target = try self.ipcResolveWorkspace(req);
+    const ws = target.ws;
+
+    const tab_idx: usize = if (ipcArgU32(req, "tab")) |t| t else ws.active_tab;
+    if (tab_idx >= ws.tab_count) return IpcError.UnknownTab;
+
+    const pane = ws.tab_active_pane[tab_idx];
+    const surface = pane.surface() orelse return IpcError.NotATerminal;
+
+    const enter = ipcArgBool(req, "enter") orelse false;
+    try surface.ipcSendText(text, enter);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// notify {action: "ring"|"clear", [workspace], [tab]} → set or clear the
+/// notification-ring attention flag on the active pane of the addressed
+/// (or active) workspace's addressed (or active) tab. The explicit,
+/// reliable counterpart to the attention OSC: an agent that can't emit an
+/// escape (or a wrapper script) rings the pane it runs in via
+/// `ghostty +notify ring`. Browser panes have no terminal surface and
+/// answer NotATerminal. Targeting the currently visible+focused pane is
+/// accepted but the ring overlay won't draw on it (you'd be ringed around
+/// what you're looking at); the cross-level sidebar/tab dots still update.
+fn ipcNotify(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const action = ipcArgString(req, "action") orelse return IpcError.MissingAction;
+    const on = if (std.mem.eql(u8, action, "ring"))
+        true
+    else if (std.mem.eql(u8, action, "clear"))
+        false
+    else
+        return IpcError.BadAction;
+
+    const target = try self.ipcResolveWorkspace(req);
+    const ws = target.ws;
+    const tab_idx: usize = if (ipcArgU32(req, "tab")) |t| t else ws.active_tab;
+    if (tab_idx >= ws.tab_count) return IpcError.UnknownTab;
+
+    const pane = ws.tab_active_pane[tab_idx];
+    const surface = pane.surface() orelse return IpcError.NotATerminal;
+    target.window.setAttentionForSurface(surface, on);
+    server.sendOk(req.id, null) catch {};
 }
 
 /// Append an entry to the sidebar notification log, bump the unread
@@ -3171,6 +3724,29 @@ fn msgWndProc(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "unit: parseAttentionOsc recognizes the ring/clear sentinel" {
+    // ring → true, clear → false.
+    try testing.expectEqual(@as(?bool, true), parseAttentionOsc("@ghostty-attention:ring"));
+    try testing.expectEqual(@as(?bool, false), parseAttentionOsc("@ghostty-attention:clear"));
+    // Surrounding ASCII whitespace (a padded shell sequence) is trimmed.
+    try testing.expectEqual(@as(?bool, true), parseAttentionOsc("  @ghostty-attention:ring\n"));
+    try testing.expectEqual(@as(?bool, false), parseAttentionOsc("\t@ghostty-attention:clear "));
+}
+
+test "unit: parseAttentionOsc ignores ordinary notifications and bad verbs" {
+    // An ordinary OSC 9 notification body is not the sentinel → null
+    // (the caller shows a normal balloon).
+    try testing.expectEqual(@as(?bool, null), parseAttentionOsc("Build finished"));
+    try testing.expectEqual(@as(?bool, null), parseAttentionOsc(""));
+    // Right prefix, unknown verb → null (don't toggle on garbage).
+    try testing.expectEqual(@as(?bool, null), parseAttentionOsc("@ghostty-attention:"));
+    try testing.expectEqual(@as(?bool, null), parseAttentionOsc("@ghostty-attention:blink"));
+    try testing.expectEqual(@as(?bool, null), parseAttentionOsc("@ghostty-attention:ring extra"));
+    // A body that merely contains the prefix mid-string is not a match
+    // (must be at the start after trimming).
+    try testing.expectEqual(@as(?bool, null), parseAttentionOsc("see @ghostty-attention:ring"));
+}
 
 test "unit: notif ring push and newest-first indexing" {
     var ring: NotifRing(u32, 4) = .{};

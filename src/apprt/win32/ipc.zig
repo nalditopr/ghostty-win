@@ -1,8 +1,10 @@
-//! Named-pipe IPC server core for agent-scriptable browser control
-//! (`ghostty +browser open|eval|snapshot|click ...`).
+//! Named-pipe IPC server core for agent-scriptable control of a running
+//! Ghostty instance: browser panes (`ghostty +browser ...`) plus the
+//! workspace/tab/keystroke scripting API (`ghostty +workspace|+tab|+send
+//! ...`).
 //!
 //! Wire protocol: newline-delimited JSON over a message-type named pipe
-//! at \\.\pipe\ghostty-browser-<pid>.
+//! at \\.\pipe\ghostty-ipc-<pid>.
 //!
 //!   request:  {"id":1,"cmd":"open","args":{"url":"https://..."}}\n
 //!   response: {"id":1,"ok":true,"data":...}\n
@@ -48,15 +50,34 @@ const log = std.log.scoped(.win32_ipc);
 /// is a protocol violation and drops the connection.
 pub const max_line_bytes: usize = 1024 * 1024;
 
-/// Commands the browser IPC understands. The server core only validates
-/// the name; execution lives with the callback owner (App).
+/// Commands the agent IPC understands. The server core only validates
+/// the name; execution lives with the callback owner (App). The first
+/// group drives browser panes; the second is the workspace/tab/keystroke
+/// scripting API (the cmux socket-API equivalent).
 pub const Command = enum {
+    // Browser pane control.
     open,
     navigate,
     eval,
     snapshot,
     click,
     fill,
+
+    // Workspace / tab / keystroke scripting.
+    @"workspace-list",
+    @"workspace-new",
+    @"workspace-select",
+    @"workspace-close",
+    @"tab-list",
+    @"tab-new",
+    @"tab-select",
+    @"tab-close",
+    send,
+
+    // Notification ring: set/clear the per-pane "needs attention"
+    // indicator (the agent-waiting ring). Args: {action:"ring"|"clear",
+    // [workspace], [tab]}.
+    notify,
 };
 
 /// Protocol-level failures that map to error responses.
@@ -88,9 +109,18 @@ pub const Request = struct {
     cmd: Command,
     /// The request's "args" object, or `.null` when absent.
     args: std.json.Value,
+    /// Side channel for work done on the pipe thread before the request
+    /// reaches the UI thread: `workspace-new --worktree` runs `git
+    /// worktree add` off-loop (so a slow git can't stall the message
+    /// pump), then stashes the resolved worktree path here for the UI
+    /// handler to bind to the new workspace. Heap-allocated with `gpa`,
+    /// owned by the Request, freed in destroy(). Null for every other
+    /// request (and for a plain `workspace-new` with no worktree).
+    worktree_path: ?[]u8 = null,
 
     pub fn destroy(self: *Request) void {
         const gpa = self.gpa;
+        if (self.worktree_path) |p| gpa.free(p);
         self.arena.deinit();
         gpa.destroy(self);
     }
@@ -130,6 +160,120 @@ pub fn argI64(req: *const Request, key: []const u8) ?i64 {
         .integer => |i| i,
         else => null,
     };
+}
+
+/// Read an optional u32 field by name: the workspace/tab indices used by
+/// the workspace/tab/send commands. Out-of-range or non-integer values
+/// (negative, fractional, beyond u32, a string) yield null so handlers
+/// can answer a clean error. Distinct from `argId`, which is hard-wired
+/// to the browser pane address key "id".
+pub fn argU32(req: *const Request, key: []const u8) ?u32 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        else => null,
+    };
+}
+
+/// Read an optional bool field by name (e.g. send's "enter"). A missing
+/// field or any non-bool value yields null; handlers default it.
+pub fn argBool(req: *const Request, key: []const u8) ?bool {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Worktree-path construction (pure; used by workspace-new --worktree)
+// ---------------------------------------------------------------------------
+
+/// Failures from validating a git branch name destined for a worktree
+/// directory under <repo>/.worktrees/.
+pub const WorktreeError = error{
+    /// The branch name is empty or only separators/whitespace.
+    EmptyBranch,
+    /// The branch name would escape the .worktrees directory: it contains
+    /// a path separator, a drive/volume marker, or a ".." traversal
+    /// component. Branches like "feature/x" are common in git, but we
+    /// flatten them in worktreePath; an explicit path-traversal attempt
+    /// ("../x", "a/../../b") is rejected outright rather than flattened so
+    /// a hostile branch name can never write outside .worktrees.
+    UnsafeBranch,
+    /// The branch name is longer than the directory-name budget.
+    BranchTooLong,
+};
+
+/// Hard cap on a sanitized worktree directory name (well under any
+/// filesystem component limit; keeps the joined path bounded).
+pub const max_worktree_name: usize = 128;
+
+/// Reject a branch name that must never become a directory name because
+/// it could escape <repo>/.worktrees/. Run BEFORE sanitization on the
+/// raw, caller-supplied branch so traversal can't be laundered into a
+/// safe-looking name. Rules:
+///   * empty (after trimming ASCII whitespace) → EmptyBranch
+///   * contains any '/' or '\\' path separator → UnsafeBranch
+///     (git allows slashes in branches, but we keep one flat directory
+///     under .worktrees and refuse to create nested dirs from the name)
+///   * a ".." component, or a leading/trailing/standalone ".." → Unsafe
+///   * a ':' (Windows drive/ADS marker) → UnsafeBranch
+/// On success returns the trimmed branch slice (a subslice of `branch`).
+pub fn validateBranch(branch: []const u8) WorktreeError![]const u8 {
+    const trimmed = std.mem.trim(u8, branch, &std.ascii.whitespace);
+    if (trimmed.len == 0) return error.EmptyBranch;
+    if (std.mem.eql(u8, trimmed, "..") or std.mem.eql(u8, trimmed, "."))
+        return error.UnsafeBranch;
+    for (trimmed) |ch| {
+        switch (ch) {
+            '/', '\\', ':' => return error.UnsafeBranch,
+            else => {},
+        }
+    }
+    // A literal ".." anywhere is traversal even without a separator on
+    // either side (defense in depth; the separator check above already
+    // catches "../").
+    if (std.mem.indexOf(u8, trimmed, "..") != null) return error.UnsafeBranch;
+    if (trimmed.len > max_worktree_name) return error.BranchTooLong;
+    return trimmed;
+}
+
+/// Turn a (validated) branch name into a safe directory-name component:
+/// every byte that isn't ASCII alphanumeric, '-', '_', or '.' becomes
+/// '-'. validateBranch has already rejected separators and traversal, so
+/// this only normalizes display-hostile bytes (spaces, punctuation) into
+/// a tidy folder name. Writes into `buf` and returns the written slice;
+/// the caller sizes buf >= max_worktree_name.
+pub fn sanitizeBranchName(branch: []const u8, buf: []u8) []u8 {
+    std.debug.assert(buf.len >= branch.len);
+    for (branch, 0..) |ch, i| {
+        buf[i] = switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => ch,
+            else => '-',
+        };
+    }
+    return buf[0..branch.len];
+}
+
+/// Build the absolute worktree path <repo>/.worktrees/<sanitized-branch>
+/// for a validated branch. `repo` is the resolved repository root
+/// (forward or back slashes both fine on Windows). Caller owns the
+/// returned slice. Validation (validateBranch) is the caller's
+/// responsibility and must run first; this asserts the branch is already
+/// separator/traversal-free.
+pub fn worktreePath(
+    alloc: Allocator,
+    repo: []const u8,
+    validated_branch: []const u8,
+) Allocator.Error![]u8 {
+    var name_buf: [max_worktree_name]u8 = undefined;
+    const name = sanitizeBranchName(validated_branch, &name_buf);
+    // std.fs.path.join normalizes the separator per the host; on Windows
+    // this yields backslashes, which git -C accepts.
+    return std.fs.path.join(alloc, &.{ repo, ".worktrees", name });
 }
 
 pub const ParseFailure = struct {
@@ -204,6 +348,7 @@ pub fn parseLine(gpa: Allocator, line: []const u8) Allocator.Error!ParseResult {
         .id = id,
         .cmd = cmd,
         .args = args,
+        .worktree_path = null,
     };
     return .{ .ok = req };
 }
@@ -450,13 +595,13 @@ const PipeSecurity = struct {
     }
 };
 
-/// Format the production pipe name "ghostty-browser-<pid>" into buf.
-/// The CLI client resolves the target window's pid and opens
-/// \\.\pipe\ghostty-browser-<pid> with CreateFileW.
+/// Format the production pipe name "ghostty-ipc-<pid>" into buf. The CLI
+/// clients (+browser/+workspace/+tab/+send) resolve the target window's
+/// pid and open \\.\pipe\ghostty-ipc-<pid> with CreateFileW.
 pub fn defaultPipeName(buf: []u8) std.fmt.BufPrintError![]u8 {
     return std.fmt.bufPrint(
         buf,
-        "ghostty-browser-{d}",
+        "ghostty-ipc-{d}",
         .{windows.GetCurrentProcessId()},
     );
 }
@@ -1301,6 +1446,143 @@ test "ipc: argId validates the optional pane address" {
         defer req.destroy();
         try testing.expectEqual(case.expect, argId(req));
     }
+}
+
+test "ipc: argU32 reads named index fields, rejecting out-of-range" {
+    const alloc = testing.allocator;
+    const Case = struct { line: []const u8, key: []const u8, expect: ?u32 };
+    const cases = [_]Case{
+        // index 0 is a valid workspace/tab address (unlike a missing key).
+        .{ .line = "{\"id\":1,\"cmd\":\"workspace-select\",\"args\":{\"index\":0}}", .key = "index", .expect = 0 },
+        .{ .line = "{\"id\":1,\"cmd\":\"workspace-select\",\"args\":{\"index\":3}}", .key = "index", .expect = 3 },
+        .{ .line = "{\"id\":1,\"cmd\":\"tab-new\",\"args\":{\"workspace\":4294967295}}", .key = "workspace", .expect = 4294967295 },
+        .{ .line = "{\"id\":1,\"cmd\":\"tab-new\",\"args\":{\"workspace\":4294967296}}", .key = "workspace", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"tab\":-1}}", .key = "tab", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"tab\":1.5}}", .key = "tab", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"tab\":\"2\"}}", .key = "tab", .expect = null },
+        // A different key than the one present → null.
+        .{ .line = "{\"id\":1,\"cmd\":\"tab-new\",\"args\":{\"workspace\":2}}", .key = "tab", .expect = null },
+        // No args object at all.
+        .{ .line = "{\"id\":1,\"cmd\":\"workspace-list\"}", .key = "index", .expect = null },
+    };
+    for (cases) |case| {
+        const result = try parseLine(alloc, case.line);
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(case.expect, argU32(req, case.key));
+    }
+}
+
+test "ipc: argBool reads the optional enter flag" {
+    const alloc = testing.allocator;
+    const Case = struct { line: []const u8, expect: ?bool };
+    const cases = [_]Case{
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"enter\":true}}", .expect = true },
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"enter\":false}}", .expect = false },
+        // Missing → null (handler defaults to no CR).
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"text\":\"x\"}}", .expect = null },
+        // Wrong type → null.
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"enter\":1}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"send\",\"args\":{\"enter\":\"true\"}}", .expect = null },
+        // No args object at all.
+        .{ .line = "{\"id\":1,\"cmd\":\"send\"}", .expect = null },
+    };
+    for (cases) |case| {
+        const result = try parseLine(alloc, case.line);
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(case.expect, argBool(req, "enter"));
+    }
+}
+
+test "ipc: send arg validation via argString/argU32/argBool" {
+    const alloc = testing.allocator;
+    // A fully-specified send: text + workspace + tab + enter all present.
+    const result = try parseLine(
+        alloc,
+        "{\"id\":5,\"cmd\":\"send\",\"args\":{\"text\":\"echo hi\",\"workspace\":1,\"tab\":0,\"enter\":true}}",
+    );
+    const req = result.ok;
+    defer req.destroy();
+    try testing.expectEqual(Command.send, req.cmd);
+    try testing.expectEqualStrings("echo hi", argString(req, "text").?);
+    try testing.expectEqual(@as(u32, 1), argU32(req, "workspace").?);
+    try testing.expectEqual(@as(u32, 0), argU32(req, "tab").?);
+    try testing.expect(argBool(req, "enter").?);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: worktree path construction + branch sanitization
+// ---------------------------------------------------------------------------
+
+test "ipc: validateBranch accepts ordinary branch names" {
+    try testing.expectEqualStrings("feature-x", try validateBranch("feature-x"));
+    try testing.expectEqualStrings("v1.2.3", try validateBranch("v1.2.3"));
+    try testing.expectEqualStrings("fix_42", try validateBranch("fix_42"));
+    // Surrounding whitespace is trimmed.
+    try testing.expectEqualStrings("trim-me", try validateBranch("  trim-me\t"));
+}
+
+test "ipc: validateBranch rejects empty and whitespace-only names" {
+    try testing.expectError(error.EmptyBranch, validateBranch(""));
+    try testing.expectError(error.EmptyBranch, validateBranch("   "));
+    try testing.expectError(error.EmptyBranch, validateBranch("\t\n "));
+}
+
+test "ipc: validateBranch rejects path traversal and separators" {
+    // The headline attack: escape .worktrees via "..".
+    try testing.expectError(error.UnsafeBranch, validateBranch("../x"));
+    try testing.expectError(error.UnsafeBranch, validateBranch(".."));
+    try testing.expectError(error.UnsafeBranch, validateBranch("a/../../b"));
+    try testing.expectError(error.UnsafeBranch, validateBranch("..\\evil"));
+    // A lone "." is not a usable directory name either.
+    try testing.expectError(error.UnsafeBranch, validateBranch("."));
+    // Any separator is refused (we keep a single flat .worktrees dir).
+    try testing.expectError(error.UnsafeBranch, validateBranch("feature/x"));
+    try testing.expectError(error.UnsafeBranch, validateBranch("a\\b"));
+    // Windows drive / alternate-data-stream marker.
+    try testing.expectError(error.UnsafeBranch, validateBranch("C:evil"));
+    // ".." embedded without a separator on each side is still traversal.
+    try testing.expectError(error.UnsafeBranch, validateBranch("a..b"));
+}
+
+test "ipc: validateBranch rejects an over-long name" {
+    const long = [_]u8{'a'} ** (max_worktree_name + 1);
+    try testing.expectError(error.BranchTooLong, validateBranch(&long));
+    // Exactly at the cap is fine.
+    const at_cap = [_]u8{'a'} ** max_worktree_name;
+    try testing.expectEqualStrings(&at_cap, try validateBranch(&at_cap));
+}
+
+test "ipc: sanitizeBranchName maps display-hostile bytes to dashes" {
+    var buf: [max_worktree_name]u8 = undefined;
+    // Spaces, punctuation → '-'; alnum/-/_/. pass through.
+    try testing.expectEqualStrings("a-b-c", sanitizeBranchName("a b c", &buf));
+    try testing.expectEqualStrings("v1.2.3", sanitizeBranchName("v1.2.3", &buf));
+    try testing.expectEqualStrings("keep_me-", sanitizeBranchName("keep_me!", &buf));
+    // A name that's already clean is unchanged.
+    try testing.expectEqualStrings("feature-x", sanitizeBranchName("feature-x", &buf));
+}
+
+test "ipc: worktreePath joins repo/.worktrees/<sanitized>" {
+    const alloc = testing.allocator;
+    const branch = try validateBranch("feature x");
+    const path = try worktreePath(alloc, "C:\\repos\\app", branch);
+    defer alloc.free(path);
+    // std.fs.path.join normalizes to the host separator (backslash on
+    // Windows); assert the tail components regardless of separator style.
+    try testing.expect(std.mem.endsWith(u8, path, "feature-x"));
+    try testing.expect(std.mem.indexOf(u8, path, ".worktrees") != null);
+    try testing.expect(std.mem.startsWith(u8, path, "C:\\repos\\app"));
+}
+
+test "ipc: worktreePath round-trips a clean branch" {
+    const alloc = testing.allocator;
+    const branch = try validateBranch("v1.2.3");
+    const path = try worktreePath(alloc, "/home/me/proj", branch);
+    defer alloc.free(path);
+    try testing.expect(std.mem.endsWith(u8, path, "v1.2.3"));
+    try testing.expect(std.mem.indexOf(u8, path, ".worktrees") != null);
 }
 
 test "ipc: every error code has a JSON-safe message" {

@@ -234,11 +234,16 @@ Open a web browser inside a split or a tab, next to your terminals:
   is loaded on demand); opening a browser pane then shows
   **"WebView2 runtime unavailable"** in the pane instead of failing.
 
-## `ghostty +browser` — Scripted Browser Control
+## Agent Scripting — `+browser`, `+workspace`, `+tab`, `+send`, `+notify`
 
-A running Ghostty instance exposes its browser panes over a named pipe
-(`ghostty-browser-<pid>`), so scripts and agents can drive them from any
-shell:
+A running Ghostty instance exposes a scripting API over a per-process named
+pipe (`ghostty-ipc-<pid>`), so scripts and agents can drive it from any
+shell. The target instance is found via the `GHOSTTY_PID` environment
+variable (exported into every shell Ghostty spawns); outside one, the CLI
+connects to the sole running instance and errors if there are zero or
+several. All of these are Windows-only.
+
+### `+browser` — scripted browser control
 
 ```text
 ghostty +browser open <url> [--tab|--split]   # open a pane, prints its id
@@ -250,12 +255,101 @@ ghostty +browser fill <ref> <text> [--id N]
 ghostty +browser list                         # ids of live browser panes
 ```
 
-The target instance is found via the `GHOSTTY_PID` environment variable
-(exported into every shell Ghostty spawns); outside one, the CLI connects to
-the sole running instance and errors if there are zero or several. Without
-`--id`, the most recently created browser pane is used — panes are addressed
-**across all windows and workspaces**, so a command can drive a browser pane
-sitting in a background workspace. Windows-only.
+Without `--id`, the most recently created browser pane is used — panes are
+addressed **across all windows and workspaces**, so a command can drive a
+browser pane sitting in a background workspace.
+
+### `+workspace` / `+tab` / `+send` / `+notify` — workspace, tab, keystroke, and attention control
+
+These operate on the *target window* (the foreground Ghostty window, else
+the first live one). Workspace and tab indices are window-local; `+tab` and
+`+send` default to the active workspace and accept `--workspace I` to address
+another. JSON list output is printed to stdout.
+
+```text
+ghostty +workspace list                         # [{index, name, active, tab_count}]
+ghostty +workspace new [--name X]               # new workspace + default tab, prints {index}
+ghostty +workspace new --worktree <branch> [--repo P] [--name X]   # git worktree workspace
+ghostty +workspace select <index>
+ghostty +workspace close <index>                # closing the last one closes the window
+
+ghostty +tab list [--workspace I]               # [{index, title, active}]
+ghostty +tab new [--workspace I] [--command "..."]   # prints {index}; inherits backend without --command
+ghostty +tab select <index> [--workspace I]
+ghostty +tab close <index> [--workspace I]
+
+ghostty +send <text> [--workspace I] [--tab J] [--enter]
+```
+
+`+send` writes `text` to the child PTY of the active pane of the target tab,
+exactly as typed input would; `--enter` appends a carriage return so the line
+is submitted. The target pane must be a terminal (a browser pane has no PTY).
+
+```
+ghostty +notify ring  [--workspace I] [--tab J]   # flag a pane "needs attention"
+ghostty +notify clear [--workspace I] [--tab J]   # clear the flag
+```
+
+`+notify ring` flags the active pane of the target tab for attention (see
+**Notification Rings** below); `clear` removes it. Both default to the active
+workspace's active tab. The target pane must be a terminal.
+
+## Notification Rings
+
+A per-pane **"needs attention / waiting for input"** indicator — the signal an
+agent raises when it has stopped to ask you something while you are looking
+elsewhere. Attention is surfaced at three levels at once so you can find the
+waiting pane even when it is not visible:
+
+- **Pane ring** — a 3px DPI-scaled blue border (accent `#3D8EF8`) drawn around
+  the flagged pane in the visible split layout, but **only when it is not the
+  focused pane** (you are never ringed around what you are already looking at).
+- **Top tab dot** — a blue dot on the tab that contains a flagged pane.
+- **Sidebar row** — the workspace row lights up with the blue accent bar and a
+  blue dot, so a background workspace where an agent is waiting reads at a
+  glance.
+
+Attention **clears automatically** when the pane gains focus or its
+tab+workspace become active (like the bell/exited status), so simply looking at
+the pane dismisses it.
+
+There are two ways to raise attention, both explicit and reliable:
+
+1. **CLI** — `ghostty +notify ring [--workspace I --tab J]` over the agent IPC
+   pipe (see above). Pair it with a wrapper, e.g. run your agent then
+   `ghostty +notify ring` when it blocks.
+2. **OSC sequence** — a program emits, on its own pane:
+   ```sh
+   printf '\033]9;@ghostty-attention:ring\033\\'    # set
+   printf '\033]9;@ghostty-attention:clear\033\\'   # clear
+   ```
+   PowerShell:
+   ```powershell
+   $e=[char]27; Write-Host "$e]9;@ghostty-attention:ring$e\" -NoNewline
+   ```
+   This rides the OSC 9 desktop-notification channel with a private
+   `@ghostty-attention:` marker, so it needs no new terminal-parser support and
+   produces no balloon or log entry — only the ring.
+
+**Detection honesty.** There is **no automatic "the agent is blocked on stdin"
+heuristic**. Reliably detecting a blocked-on-input process through ConPTY is not
+feasible without false positives (a paused pager, a long compile, and a prompt
+waiting for input are indistinguishable from the read side), so attention is
+**explicit-signal-only**: shell integration, an agent, or a wrapper must emit
+the OSC or call `+notify`. This is a deliberate trade of "magic" for
+correctness.
+
+**Worktree workspaces** — `+workspace new --worktree <branch>` binds a new
+workspace to a git worktree (the "one agent per branch" primitive). Ghostty
+runs `git worktree add <repo>/.worktrees/<branch> -b <branch>` (omitting `-b`
+to attach the branch if it already exists), names the workspace after the
+branch (override with `--name`), and spawns every tab of that workspace inside
+the worktree directory. The repository is the client's current directory
+(sent over IPC, since the running Ghostty's cwd is its own) or an explicit
+`--repo P`. The `git` invocation runs on the IPC pipe thread before the
+workspace is created, so a slow checkout never stalls the UI; on a git failure
+(or a branch name that would escape `.worktrees`, e.g. containing `/`, `\`, or
+`..`) the command reports the error and creates no workspace.
 
 ## Working-Directory Inheritance (OSC 7) + PowerShell Integration
 

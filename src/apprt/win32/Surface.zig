@@ -153,6 +153,17 @@ palette_filtered: [palette_entries.len]u16 = undefined,
 /// in that gap must not dereference it.
 pane: ?*Pane = null,
 
+/// "Needs attention" flag (the notification ring). Set by an explicit
+/// signal — the attention OSC (see App.handleAttentionOsc) or the
+/// `+notify ring` IPC verb — when an agent in this pane wants the user's
+/// eye (typically "waiting for input"). Distinct from the tab-level
+/// bell/exited status: those are transient events, this is a sticky
+/// "still waiting" state. Cleared when the pane gains focus
+/// (handleFocus) or its tab+workspace become active. The ring overlay
+/// (AttentionRing) and the cross-level sidebar/tab dots read this; the
+/// per-tab/workspace aggregate is derived from it (see Window).
+attention: bool = false,
+
 /// The per-surface command override this surface was spawned with (the
 /// new-session backend picker), if any. Owned deep copy, freed in
 /// deinit(). Splits read this from their source surface so they inherit
@@ -164,13 +175,17 @@ spawn_command: ?[]const []const u8 = null,
 /// then initialize the core terminal surface (fonts, renderer, PTY, IO).
 /// `command` optionally overrides the configured command for this one
 /// surface (the new-session backend picker); the argv is copied so the
-/// caller's memory may be freed after this returns.
+/// caller's memory may be freed after this returns. `cwd` optionally
+/// overrides the working directory the child shell spawns in (a
+/// workspace bound to a git worktree); the path is copied into the
+/// surface config clone, so the caller's memory may be freed too.
 pub fn init(
     self: *Surface,
     app: *App,
     parent: *Window,
     context: apprt.surface.NewSurfaceContext,
     command: ?[]const []const u8,
+    cwd: ?[]const u8,
 ) !void {
     self.* = .{
         .app = app,
@@ -294,6 +309,7 @@ pub fn init(
         &app.config,
         context,
         command,
+        cwd,
     );
     defer config.deinit();
 
@@ -2257,6 +2273,31 @@ fn writeWin32InputSequence(
     self.core_surface.io.queueMessage(msg, .unlocked);
 }
 
+/// Write `text` (UTF-8) directly to the child PTY as if it had been
+/// typed/pasted, optionally appending a carriage return. Used by the
+/// agent IPC `+send` verb. Bypasses keyCallback (no modifier tracking /
+/// selection clearing); the bytes pass through the same termio write
+/// queue as keyboard input, so the child sees ordinary stdin. A CR (not
+/// LF) is appended for `enter` because that is the Enter key's PTY
+/// encoding. No-op if the core surface is not ready (init in flight or
+/// shutting down). The data is copied into the write request, so `text`
+/// need not outlive this call.
+pub fn ipcSendText(self: *Surface, text: []const u8, enter: bool) !void {
+    if (!self.core_surface_ready) return;
+    if (text.len > 0) {
+        const msg = try termio.Message.writeReq(self.app.core_app.alloc, text);
+        self.core_surface.io.queueMessage(msg, .unlocked);
+    }
+    if (enter) {
+        // writeReq requires a slice (it asserts info.size == .slice); a
+        // bare "\r" literal is a pointer-to-array and trips that assert,
+        // so pass an explicit single-element slice.
+        const cr: []const u8 = &[_]u8{'\r'};
+        const msg = try termio.Message.writeReq(self.app.core_app.alloc, cr);
+        self.core_surface.io.queueMessage(msg, .unlocked);
+    }
+}
+
 /// Called by the renderer thread after SwapBuffers to signal that a
 /// frame has been presented. Wakes the main thread if it's blocking
 /// in handleResize during live resize.
@@ -2268,6 +2309,14 @@ pub fn signalFrameDrawn(self: *Surface) void {
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
 pub fn handleFocus(self: *Surface, focused: bool) void {
+    // Gaining focus clears any pending attention ring on this pane (the
+    // user is now looking at it), mirroring how the bell/exited tab
+    // status clears in selectTabIndex/selectWorkspace. Done before the
+    // core_surface_ready guard so it still fires for a pane that is
+    // focused while the core is mid-init — the ring is pure apprt state.
+    if (focused and self.attention) {
+        self.parent_window.clearAttentionForSurface(self);
+    }
     if (!self.core_surface_ready) return;
     // Drop any buffered high surrogate and pending dead key on focus loss —
     // otherwise they would combine with the next character when focus returns.

@@ -55,11 +55,11 @@ pub const Options = struct {
 ///
 ///   * `list`: List the ids of the live browser panes.
 ///
-/// The target instance's IPC pipe is `ghostty-browser-<pid>`. The pid is
-/// taken from the `GHOSTTY_PID` environment variable (exported into every
-/// shell Ghostty spawns); if it is unset, `+browser` connects to the sole
-/// `ghostty-browser-*` pipe present and errors if there are zero or more
-/// than one.
+/// The target instance's IPC pipe is `ghostty-ipc-<pid>` (shared with the
+/// `+workspace`/`+tab`/`+send` scripting verbs). The pid is taken from the
+/// `GHOSTTY_PID` environment variable (exported into every shell Ghostty
+/// spawns); if it is unset, `+browser` connects to the sole `ghostty-ipc-*`
+/// pipe present and errors if there are zero or more than one.
 ///
 /// Only supported on Windows.
 ///
@@ -442,9 +442,9 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
 
     const ResolveError = error{ NoInstance, MultipleInstances } || Allocator.Error;
 
-    /// Resolve the full "\\.\pipe\ghostty-browser-<pid>" path. Prefer the
+    /// Resolve the full "\\.\pipe\ghostty-ipc-<pid>" path. Prefer the
     /// GHOSTTY_PID env var (set in every Ghostty-spawned shell); otherwise
-    /// enumerate ghostty-browser-* pipes and require exactly one. Caller
+    /// enumerate ghostty-ipc-* pipes and require exactly one. Caller
     /// frees the returned slice.
     fn resolvePipePath(alloc: Allocator, stderr: *std.Io.Writer) ResolveError![]u8 {
         if (std.process.getEnvVarOwned(alloc, "GHOSTTY_PID")) |pid_str| {
@@ -453,15 +453,15 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             if (trimmed.len > 0) {
                 return std.fmt.allocPrint(
                     alloc,
-                    "\\\\.\\pipe\\ghostty-browser-{s}",
+                    "\\\\.\\pipe\\ghostty-ipc-{s}",
                     .{trimmed},
                 );
             }
         } else |_| {}
 
-        // Enumerate \\.\pipe\ghostty-browser-* and require exactly one.
+        // Enumerate \\.\pipe\ghostty-ipc-* and require exactly one.
         const pattern_w = std.unicode.utf8ToUtf16LeStringLiteral(
-            "\\\\.\\pipe\\ghostty-browser-*",
+            "\\\\.\\pipe\\ghostty-ipc-*",
         );
         var find_data: WIN32_FIND_DATAW = undefined;
         const find = FindFirstFileW(pattern_w, &find_data);

@@ -9,6 +9,7 @@ const apprt = @import("../../apprt.zig");
 const internal_os = @import("../../os/main.zig");
 
 const App = @import("App.zig");
+const AttentionRing = @import("AttentionRing.zig").AttentionRing;
 const BrowserPane = @import("BrowserPane.zig");
 const Pane = @import("Pane.zig");
 const Sidebar = @import("Sidebar.zig");
@@ -51,10 +52,27 @@ pub const Workspace = struct {
     tab_title_lens: [MAX_TABS]u16 = undefined,
     /// Per-tab sidebar status. Cleared to .normal when the tab is selected.
     tab_status: [MAX_TABS]TabStatus = [_]TabStatus{.normal} ** MAX_TABS,
+    /// Per-tab "needs attention" flag (the notification ring), separate
+    /// from tab_status: a sticky "an agent here is waiting for input"
+    /// state set by the attention OSC or `+notify ring`, NOT a transient
+    /// bell/exited event. A tab's flag is the OR of its panes' Surface
+    /// attention flags; it is cleared when the tab becomes the visible
+    /// active tab (selectTabIndex/selectWorkspace), like tab_status. Must
+    /// be @splat(false) on value-init (see the struct doc), which the
+    /// `= @splat(false)` default guarantees alongside tab_status.
+    tab_attention: [MAX_TABS]bool = @splat(false),
     /// Workspace name shown on its sidebar row.
     name: [64]u16 = undefined,
     /// Length of the workspace name in UTF-16 code units.
     name_len: u16 = 0,
+    /// Optional working directory this workspace's tabs spawn in (a git
+    /// worktree bound via `+workspace new --worktree`). Owned heap copy,
+    /// allocated by setWorkingDir and freed by freeWorkingDir. Null = the
+    /// configured default (the inherited/home cwd, current behavior). The
+    /// path is only consumed when a tab's surface config clone is built
+    /// (addTabWithCommand), so it is moved verbatim through workspace-slot
+    /// shifts (closeWorkspace) without re-validation.
+    working_dir: ?[]const u8 = null,
 
     /// The parallel per-tab arrays as a tuple of array pointers. EVERY
     /// per-tab array must be listed here: the mutation sites
@@ -68,6 +86,7 @@ pub const Workspace = struct {
         *[MAX_TABS][256]u16,
         *[MAX_TABS]u16,
         *[MAX_TABS]TabStatus,
+        *[MAX_TABS]bool,
     } {
         return .{
             &self.tab_trees,
@@ -75,6 +94,7 @@ pub const Workspace = struct {
             &self.tab_titles,
             &self.tab_title_lens,
             &self.tab_status,
+            &self.tab_attention,
         };
     }
 
@@ -92,6 +112,15 @@ pub const Workspace = struct {
         return worst;
     }
 
+    /// Whether any of this workspace's tabs is flagged for attention (the
+    /// notification ring). Drives the blue dot/ring on the workspace's
+    /// sidebar row, orthogonal to aggregateStatus (a tab can be both
+    /// "exited" and "waiting"). Pure over tab_attention[0..tab_count] so
+    /// the cross-level surfacing rule is unit-testable.
+    pub fn hasAttention(self: *const Workspace) bool {
+        return aggregateAttention(self.tab_attention[0..self.tab_count]);
+    }
+
     /// Find the Node.Handle for a pane in this workspace's tab tree.
     pub fn findHandle(self: *Workspace, tab_idx: usize, pane: *Pane) ?SplitTree(Pane).Node.Handle {
         var it = self.tab_trees[tab_idx].iterator();
@@ -100,7 +129,39 @@ pub const Workspace = struct {
         }
         return null;
     }
+
+    /// Bind (or replace) this workspace's spawn working directory with an
+    /// owned heap copy of `path`. Frees any previous binding first.
+    pub fn setWorkingDir(self: *Workspace, alloc: Allocator, path: []const u8) Allocator.Error!void {
+        const copy = try alloc.dupe(u8, path);
+        if (self.working_dir) |old| alloc.free(old);
+        self.working_dir = copy;
+    }
+
+    /// Release this workspace's working_dir binding, if any. Idempotent.
+    /// Must be called exactly once per workspace whose slot is going away
+    /// (window/workspace teardown), never on a slot whose value was moved
+    /// into another live slot (closeWorkspace's shift).
+    pub fn freeWorkingDir(self: *Workspace, alloc: Allocator) void {
+        if (self.working_dir) |dir| {
+            alloc.free(dir);
+            self.working_dir = null;
+        }
+    }
 };
+
+/// Pure attention aggregation: true iff any flag in `flags` is set. The
+/// caller passes the live tab slice (tab_attention[0..tab_count]) so
+/// stale slots past tab_count are never consulted. Factored out of
+/// Workspace.hasAttention so the cross-level "a workspace/tab shows the
+/// ring when a pane in it is waiting" rule is unit-testable without a
+/// live window.
+pub fn aggregateAttention(flags: []const bool) bool {
+    for (flags) |f| {
+        if (f) return true;
+    }
+    return false;
+}
 
 /// A located tab: the workspace that owns it and its index within that
 /// workspace. Returned by findLoc/findLocOfSurface.
@@ -255,6 +316,13 @@ min_track_w: i32 = 0,
 min_track_h: i32 = 0,
 max_track_w: i32 = 0,
 max_track_h: i32 = 0,
+
+/// Pool of notification-ring overlays (layered popups), grown on demand
+/// by updateAttentionRings and reused across layouts. Each ring is
+/// positioned around one attention-flagged, non-focused pane in the
+/// active tab; surplus rings are hidden. Created lazily so windows that
+/// never see an attention signal pay nothing. Freed in deinit().
+attention_rings: std.ArrayList(*AttentionRing) = .empty,
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -560,6 +628,11 @@ pub fn deinit(self: *Window) void {
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
 
+    // Destroy the notification-ring overlays (owned popups) before the
+    // owner window so they never outlive it.
+    for (self.attention_rings.items) |ring| ring.destroy();
+    self.attention_rings.deinit(self.app.core_app.alloc);
+
     // Delete the tab bar font.
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);
@@ -783,7 +856,10 @@ pub fn addTabWithCommand(
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.init(self.app, self, .tab, command);
+    // A workspace bound to a git worktree spawns every new tab in that
+    // directory; a null binding falls through to the configured/inherited
+    // cwd (current behavior).
+    try surface.init(self.app, self, .tab, command, ws.working_dir);
     // After surface.init succeeds, wrap it in a Pane and create the
     // SplitTree which takes ownership via ref(). If this fails, we
     // manually clean up.
@@ -1018,6 +1094,14 @@ fn closeTabInWorkspace(self: *Window, ws_idx: usize, idx: usize) void {
     }
 }
 
+/// Public wrapper over closeTabInWorkspace for the agent IPC `tab-close`,
+/// which addresses a tab by (workspace index, tab index). Bounds are
+/// validated inside; closing the last tab of the only workspace closes
+/// the window, exactly as the UI close paths do.
+pub fn closeTabInWorkspaceForIpc(self: *Window, ws_idx: usize, idx: usize) void {
+    self.closeTabInWorkspace(ws_idx, idx);
+}
+
 /// Close tabs based on mode: this (current), other (all but current), right (all after current).
 pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Surface) void {
     switch (mode) {
@@ -1161,11 +1245,18 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     }
     ws.active_tab = idx;
     ws.tab_status[idx] = .normal;
+    // The tab is now visible: clear any pending attention ring on it
+    // (mirrors the bell/exited clear above). The pane.focus() below also
+    // clears the focused pane, but a backgrounded split pane in this tab
+    // must clear too — the user is looking at the whole tab now.
+    self.clearTabAttention(ws, idx);
     const pane = ws.tab_active_pane[idx];
     self.layoutSplits();
     pane.focus();
     self.updateWindowTitle();
     self.invalidateSidebar();
+    self.invalidateTabBar();
+    self.updateAttentionRings();
 }
 
 /// Switch to the workspace at the given index. Hides the outgoing
@@ -1213,7 +1304,14 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     // is selected"), otherwise the sidebar dot sticks after the user
     // has seen the tab.
     const new_ws = self.activeWorkspace();
-    if (new_ws.tab_count > 0) new_ws.tab_status[new_ws.active_tab] = .normal;
+    if (new_ws.tab_count > 0) {
+        new_ws.tab_status[new_ws.active_tab] = .normal;
+        // The incoming active tab is now visible — clear its attention
+        // ring too (mirrors the bell/exited clear). Other tabs of this
+        // workspace keep their attention so the sidebar row dot persists
+        // until each is actually viewed.
+        self.clearTabAttention(new_ws, new_ws.active_tab);
+    }
 
     // The new workspace may have a different tab count, so the tab bar's
     // visibility can change. This may resize (changing surfaceRect), so
@@ -1224,6 +1322,7 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     self.updateWindowTitle();
     self.invalidateTabBar();
     self.invalidateSidebar();
+    self.updateAttentionRings();
 }
 
 /// Pure guard for createAndSelectWorkspace: a new workspace slot may be
@@ -1269,6 +1368,49 @@ pub fn newWorkspace(self: *Window) void {
         log.err("failed to create first tab for new workspace: {}", .{err});
         self.closeWorkspace(idx);
     };
+    self.invalidateSidebar();
+}
+
+/// Like newWorkspace, but binds the new workspace to `working_dir` (an
+/// owned-by-caller path; copied here) BEFORE spawning its first tab, so
+/// that tab — and every later tab of this workspace — opens in that
+/// directory. Used by `+workspace new --worktree`. Returns the new
+/// workspace index, or null when the workspace could not be created
+/// (QuickTerminal, MAX_WORKSPACES) or its first tab failed to spawn (the
+/// slot is collapsed back, matching newWorkspace). The working_dir copy
+/// is freed by the workspace teardown paths (closeWorkspace /
+/// cleanupAllSurfaces).
+pub fn newWorkspaceWithDir(self: *Window, working_dir: []const u8) ?usize {
+    const idx = self.createAndSelectWorkspace() orelse return null;
+    // Bind the directory before addTab: addTabWithCommand reads
+    // workspaces[active].working_dir to build the surface config clone.
+    self.workspaces[idx].setWorkingDir(self.app.core_app.alloc, working_dir) catch {
+        // Couldn't even copy the path; collapse the empty slot.
+        self.closeWorkspace(idx);
+        return null;
+    };
+    _ = self.addTab() catch |err| {
+        log.err("failed to create first tab for new worktree workspace: {}", .{err});
+        // closeWorkspace frees the binding we just set.
+        self.closeWorkspace(idx);
+        return null;
+    };
+    self.invalidateSidebar();
+    return idx;
+}
+
+/// Set workspace `idx`'s sidebar name from a UTF-8 string, mirroring the
+/// inline-rename write path (truncated to the name buffer; invalid UTF-8
+/// leaves the name unchanged). Used by the agent IPC `workspace-new
+/// --name`. No-op for an out-of-range index.
+pub fn setWorkspaceName(self: *Window, idx: usize, name: []const u8) void {
+    if (idx >= self.workspace_count) return;
+    const wsp = &self.workspaces[idx];
+    const nlen = std.unicode.utf8ToUtf16Le(
+        &wsp.name,
+        name[0..@min(name.len, wsp.name.len)],
+    ) catch return;
+    wsp.name_len = @intCast(@min(nlen, wsp.name.len));
     self.invalidateSidebar();
 }
 
@@ -1365,10 +1507,13 @@ pub fn closeWorkspace(self: *Window, idx: usize) void {
     self.active_workspace = survivor;
 
     // Tear down the closed workspace's trees from the value copy now that
-    // the live array no longer references them.
+    // the live array no longer references them. Free its worktree binding
+    // here too: the shift moved every survivor's working_dir pointer down
+    // by value, so only this removed slot's copy is unreferenced.
     for (dying.tab_trees[0..dying.tab_count]) |*tree| {
         tree.deinit();
     }
+    dying.freeWorkingDir(self.app.core_app.alloc);
 
     // Lay out and focus the survivor. updateTabBarVisibility first (the
     // survivor may have a different tab count, changing surfaceRect).
@@ -1453,6 +1598,10 @@ pub fn layoutSplits(self: *Window) void {
             _ = w32.ReleaseDC(hwnd, dc);
         }
     }
+
+    // Keep the notification rings glued to the just-laid-out panes
+    // (resize/split/zoom all flow through here).
+    self.updateAttentionRings();
 }
 
 fn layoutNode(self: *Window, tree: SplitTree(Pane), handle: SplitTree(Pane).Node.Handle, rect: w32.RECT) void {
@@ -1482,6 +1631,110 @@ fn layoutNode(self: *Window, tree: SplitTree(Pane), handle: SplitTree(Pane).Node
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
                 self.layoutNode(tree, s.left, top_rect);
                 self.layoutNode(tree, s.right, bottom_rect);
+            }
+        },
+    }
+}
+
+/// Reconcile the notification-ring overlays with the current attention
+/// state and layout. A ring is drawn around each pane of the ACTIVE
+/// workspace's ACTIVE tab whose Surface.attention is set AND which is not
+/// the focused/visible-active pane — you are never ringed around what you
+/// are already looking at. Panes in other tabs/workspaces are not visible,
+/// so they carry no ring; the sidebar row dot and top tab dot surface
+/// those instead. Rings are reused from a pool; surplus rings are hidden.
+/// Safe to call after any layout/attention/focus change; cheap when no
+/// pane needs a ring (every existing ring is simply hidden).
+pub fn updateAttentionRings(self: *Window) void {
+    // No chrome on a closing/zoomed/empty window: hide everything.
+    const hwnd = self.hwnd orelse return self.hideAllRings();
+    if (self.closing) return self.hideAllRings();
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return self.hideAllRings();
+    const tree = ws.tab_trees[ws.active_tab];
+    // A zoomed tab shows a single pane full-bleed; ringing it would frame
+    // the whole content area, so suppress rings while zoomed.
+    if (tree.zoomed != null) return self.hideAllRings();
+
+    const focused = ws.tab_active_pane[ws.active_tab];
+    var next: usize = 0;
+    self.attentionRingNode(hwnd, tree, .root, self.surfaceRect(), focused, &next);
+
+    // Hide any rings beyond the ones we just positioned this pass.
+    var i = next;
+    while (i < self.attention_rings.items.len) : (i += 1) {
+        self.attention_rings.items[i].hide();
+    }
+}
+
+/// Hide every ring in the pool (no visible attention pane).
+fn hideAllRings(self: *Window) void {
+    for (self.attention_rings.items) |ring| ring.hide();
+}
+
+/// Borrow ring slot `idx` from the pool, growing it (creating a new
+/// layered popup) on demand. Returns null if creation fails (the ring is
+/// then simply skipped — attention still surfaces via the sidebar/tab
+/// dots, so a GDI handle shortage degrades gracefully).
+fn ringAt(self: *Window, idx: usize, hwnd: w32.HWND) ?*AttentionRing {
+    if (idx < self.attention_rings.items.len) {
+        const ring = self.attention_rings.items[idx];
+        ring.setScale(self.scale);
+        return ring;
+    }
+    const ring = AttentionRing.create(self.app.core_app.alloc, self.app.hinstance, hwnd) catch return null;
+    ring.setScale(self.scale);
+    self.attention_rings.append(self.app.core_app.alloc, ring) catch {
+        ring.destroy();
+        return null;
+    };
+    return ring;
+}
+
+/// Walk the tab tree mirroring layoutNode's geometry; for each leaf pane
+/// that is an attention-flagged terminal other than `focused`, position a
+/// pool ring around its client rect (converted to screen coords).
+/// `next` is the running count of rings used this pass.
+fn attentionRingNode(
+    self: *Window,
+    hwnd: w32.HWND,
+    tree: SplitTree(Pane),
+    handle: SplitTree(Pane).Node.Handle,
+    rect: w32.RECT,
+    focused: *Pane,
+    next: *usize,
+) void {
+    if (handle.idx() >= tree.nodes.len) return;
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |view| {
+            if (view == focused) return;
+            const surface = view.surface() orelse return;
+            if (!surface.attention) return;
+            const ring = self.ringAt(next.*, hwnd) orelse return;
+            // Client rect → screen rect (the popup lives in screen coords).
+            var tl = w32.POINT{ .x = rect.left, .y = rect.top };
+            var br = w32.POINT{ .x = rect.right, .y = rect.bottom };
+            _ = w32.ClientToScreen(hwnd, &tl);
+            _ = w32.ClientToScreen(hwnd, &br);
+            ring.positionAround(.{ .left = tl.x, .top = tl.y, .right = br.x, .bottom = br.y });
+            next.* += 1;
+        },
+        .split => |s| {
+            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
+            if (s.layout == .horizontal) {
+                const total_w = rect.right - rect.left;
+                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
+                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+                self.attentionRingNode(hwnd, tree, s.left, left_rect, focused, next);
+                self.attentionRingNode(hwnd, tree, s.right, right_rect, focused, next);
+            } else {
+                const total_h = rect.bottom - rect.top;
+                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
+                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
+                self.attentionRingNode(hwnd, tree, s.left, top_rect, focused, next);
+                self.attentionRingNode(hwnd, tree, s.right, bottom_rect, focused, next);
             }
         },
     }
@@ -1726,7 +1979,10 @@ pub fn newSplitWithCommand(
         new_surface.deinit();
         alloc.destroy(new_surface);
     }
-    try new_surface.init(self.app, self, .split, command);
+    // Splits inherit the source pane's live cwd via OSC 7 / pwd
+    // (split-inherit-working-directory), so they need no explicit
+    // worktree override here.
+    try new_surface.init(self.app, self, .split, command, null);
 
     // Create a single-node tree for the new surface's pane. The block
     // scopes the pane errdefer to the window between Pane.create and
@@ -2030,6 +2286,66 @@ pub fn setTabStatusForSurface(self: *Window, surface: *Surface, status: TabStatu
     self.invalidateSidebar();
 }
 
+/// Recompute `tab_attention[tab]` from the live panes of that tab: a tab
+/// is "attention" iff any of its terminal panes has Surface.attention.
+/// Called after any surface flag flips so the per-tab aggregate the
+/// sidebar/tab paint reads stays consistent with the per-pane source of
+/// truth. The ring overlay reads the Surface flags directly.
+fn recomputeTabAttention(self: *Window, ws: *Workspace, tab: usize) void {
+    _ = self;
+    var any = false;
+    var it = ws.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        if (entry.view.surface()) |s| {
+            if (s.attention) {
+                any = true;
+                break;
+            }
+        }
+    }
+    ws.tab_attention[tab] = any;
+}
+
+/// Flag (or clear) the notification ring on the pane wrapping `surface`.
+/// Sets the per-pane Surface flag, recomputes its tab's aggregate, and
+/// repaints the chrome (sidebar row + top tab dot) and the ring overlays.
+/// A request to ring a pane in the currently visible+focused position is
+/// honored at the data level but the ring overlay only DRAWS on panes
+/// that are not the focused/visible-active pane (see updateAttentionRings),
+/// so the user is never ringed around what they are already looking at.
+/// No-op if the surface is not in any tab of this window.
+pub fn setAttentionForSurface(self: *Window, surface: *Surface, on: bool) void {
+    const loc = self.findLocOfSurface(surface) orelse return;
+    if (surface.attention == on) return;
+    surface.attention = on;
+    self.recomputeTabAttention(loc.ws, loc.tab);
+    self.invalidateSidebar();
+    self.invalidateTabBar();
+    self.updateAttentionRings();
+}
+
+/// Clear the notification ring on the pane wrapping `surface` (the pane
+/// gained focus / the user is now looking at it). Thin wrapper over
+/// setAttentionForSurface(false) so the focus path reads clearly.
+pub fn clearAttentionForSurface(self: *Window, surface: *Surface) void {
+    self.setAttentionForSurface(surface, false);
+}
+
+/// Clear attention on every pane of a tab and its aggregate. Used when a
+/// tab becomes the visible active tab (selectTabIndex/selectWorkspace):
+/// the user is now looking at the whole tab, so any pane's pending ring
+/// is satisfied. Repainting/ring refresh is the caller's job (the select
+/// paths already invalidate + layout).
+fn clearTabAttention(self: *Window, ws: *Workspace, tab: usize) void {
+    _ = self;
+    if (tab >= ws.tab_count) return;
+    var it = ws.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        if (entry.view.surface()) |s| s.attention = false;
+    }
+    ws.tab_attention[tab] = false;
+}
+
 /// Update tab bar visibility based on config and tab count.
 fn updateTabBarVisibility(self: *Window) void {
     if (self.is_quick_terminal) {
@@ -2244,12 +2560,37 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             }
         }
 
+        // Attention dot: a small blue glyph at the tab's left edge when a
+        // pane in this tab is waiting (the notification ring), surfacing
+        // the attention on the top tab bar even when the pane isn't the
+        // visible one. The title is shifted right by the dot width so it
+        // doesn't overlap. The active tab's pending attention is cleared
+        // on select, so in practice the dot only shows on inactive tabs.
+        const attn_dot_w: i32 = if (ws.tab_attention[i]) @intFromFloat(@round(12.0 * self.scale)) else 0;
+        if (attn_dot_w > 0) {
+            _ = w32.SetTextColor(mem_dc, accent_color);
+            const dot_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{25CF}");
+            var dot_rect = w32.RECT{
+                .left = x + text_pad,
+                .top = 0,
+                .right = x + text_pad + attn_dot_w,
+                .bottom = bar_h,
+            };
+            _ = w32.DrawTextW(
+                mem_dc,
+                dot_char,
+                1,
+                &dot_rect,
+                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+            );
+        }
+
         // Draw tab title text.
         const title_len = ws.tab_title_lens[i];
         if (title_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
             var text_rect = w32.RECT{
-                .left = x + text_pad,
+                .left = x + text_pad + attn_dot_w,
                 .top = 0,
                 .right = x + this_tab_w - close_btn_w - text_pad,
                 .bottom = bar_h,
@@ -3469,12 +3810,14 @@ fn cleanupAllSurfaces(self: *Window) void {
     // to undefined; deinit'ing a local copy would only mark the copy,
     // leaving stale arena/node pointers in tab_trees that any post-WM_CLOSE
     // message walking the slot could dereference.
+    const alloc = self.app.core_app.alloc;
     for (self.workspaces[0..self.workspace_count]) |*ws| {
         for (ws.tab_trees[0..ws.tab_count]) |*tree| {
             tree.deinit();
             tree.* = .empty;
         }
         ws.tab_count = 0;
+        ws.freeWorkingDir(alloc);
     }
 }
 
@@ -4241,6 +4584,50 @@ test "unit: workspace aggregate status exited beats bell" {
     ws.tab_status[0] = .normal;
     ws.tab_count = 1;
     try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+}
+
+test "unit: aggregateAttention is an OR over the slice" {
+    try testing.expect(!aggregateAttention(&.{}));
+    try testing.expect(!aggregateAttention(&.{ false, false, false }));
+    try testing.expect(aggregateAttention(&.{ false, true, false }));
+    try testing.expect(aggregateAttention(&.{true}));
+    // Trailing true outside a shorter slice the caller passes is never
+    // seen — the caller slices to tab_count.
+    const flags = [_]bool{ false, false, true };
+    try testing.expect(!aggregateAttention(flags[0..2]));
+    try testing.expect(aggregateAttention(flags[0..3]));
+}
+
+test "unit: workspace hasAttention ignores slots past tab_count" {
+    var ws: Workspace = .{};
+    // Empty workspace: no attention even with a dirty slot.
+    ws.tab_attention[0] = true;
+    try testing.expect(!ws.hasAttention());
+    // Becomes visible once the live range covers the set slot.
+    ws.tab_count = 1;
+    try testing.expect(ws.hasAttention());
+    // A set slot beyond the live range stays hidden.
+    ws.tab_attention[0] = false;
+    ws.tab_count = 2;
+    ws.tab_attention[5] = true;
+    try testing.expect(!ws.hasAttention());
+    ws.tab_attention[1] = true;
+    try testing.expect(ws.hasAttention());
+}
+
+test "unit: workspace attention is orthogonal to bell/exited status" {
+    // A tab can be both exited and waiting; the two aggregates are
+    // independent so the sidebar can surface both.
+    var ws: Workspace = .{};
+    ws.tab_count = 3;
+    ws.tab_status[0] = .exited;
+    ws.tab_attention[2] = true;
+    try testing.expectEqual(TabStatus.exited, ws.aggregateStatus());
+    try testing.expect(ws.hasAttention());
+    // Clearing attention leaves the status untouched.
+    ws.tab_attention[2] = false;
+    try testing.expectEqual(TabStatus.exited, ws.aggregateStatus());
+    try testing.expect(!ws.hasAttention());
 }
 
 test "unit: tab arrays stress at workspace capacity" {

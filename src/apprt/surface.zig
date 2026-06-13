@@ -171,23 +171,35 @@ pub fn shouldInheritWorkingDirectory(context: NewSurfaceContext, config: *const 
 
 /// Same as `newConfig` but with an optional per-surface command
 /// override (e.g. a WSL distro or alternate shell picked for a single
-/// tab). The argv slice is duplicated into the clone's arena so the
-/// caller's memory may be freed once this returns; null leaves the
-/// configured command untouched.
+/// tab) and an optional working-directory override (e.g. a workspace
+/// bound to a git worktree). Both are duplicated into the clone's arena
+/// so the caller's memory may be freed once this returns; null leaves
+/// the configured value untouched.
+///
+/// `cwd` is applied AFTER `newConfig`'s working-directory inheritance, so
+/// an explicit worktree path wins over the inherited/configured cwd
+/// (which is the point: every tab of the workspace lands in its
+/// worktree, not the cwd of whatever surface was last focused).
 pub fn newConfigWithCommand(
     app: *const App,
     config: *const Config,
     context: NewSurfaceContext,
     command: ?[]const []const u8,
+    cwd: ?[]const u8,
 ) Allocator.Error!Config {
     var copy = try newConfig(app, config, context);
     errdefer copy.deinit();
 
+    const alloc = copy._arena.?.allocator();
+
     if (command) |argv| {
-        const alloc = copy._arena.?.allocator();
         const copied = try alloc.alloc([:0]const u8, argv.len);
         for (argv, 0..) |arg, i| copied[i] = try alloc.dupeZ(u8, arg);
         copy.command = .{ .direct = copied };
+    }
+
+    if (cwd) |path| {
+        copy.@"working-directory" = .{ .path = try alloc.dupe(u8, path) };
     }
 
     return copy;

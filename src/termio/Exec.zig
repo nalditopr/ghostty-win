@@ -778,10 +778,10 @@ const Subprocess = struct {
             // running in Ghostty.
             try env.put("GHOSTTY_BIN_DIR", exe_dir);
 
-            // Export the running instance's PID so `ghostty +browser`
-            // (and any future agent CLI) can resolve the per-process IPC
-            // pipe name (ghostty-browser-<pid>) without enumerating. Only
-            // meaningful where the browser IPC pipe exists (Win32).
+            // Export the running instance's PID so the agent CLI verbs
+            // (`ghostty +browser`/`+workspace`/`+tab`/`+send`) can resolve
+            // the per-process IPC pipe name (ghostty-ipc-<pid>) without
+            // enumerating. Only meaningful where the IPC pipe exists (Win32).
             if (comptime builtin.os.tag == .windows) {
                 try env.put(
                     "GHOSTTY_PID",

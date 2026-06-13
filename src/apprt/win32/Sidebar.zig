@@ -345,6 +345,12 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             else => false,
         };
 
+        // A workspace with an attention pane (the notification ring)
+        // lights up its row with the same blue accent bar the active row
+        // uses, so a background workspace where an agent is waiting reads
+        // at a glance. Orthogonal to the bell/exited status dot.
+        const has_attention = wsp.hasAttention();
+
         if (is_active) {
             if (w32.CreateSolidBrush(active_bg_color)) |brush| {
                 _ = w32.FillRect(mem_dc, &row, brush);
@@ -369,14 +375,39 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             }
         }
 
-        // Draw status dot: the worst status across the workspace's tabs.
+        // Attention left accent bar on a non-active row (the active row
+        // already shows the accent). Drawn after the hover fill so it sits
+        // on top.
+        if (has_attention and !is_active) {
+            var attn_rect = w32.RECT{
+                .left = 0,
+                .top = row.top,
+                .right = accent_w,
+                .bottom = row.bottom,
+            };
+            if (w32.CreateSolidBrush(accent_color)) |brush| {
+                _ = w32.FillRect(mem_dc, &attn_rect, brush);
+                _ = w32.DeleteObject(@ptrCast(brush));
+            }
+        }
+
+        // Draw the dot column: the worst bell/exited status takes it;
+        // otherwise an attention-only workspace shows a blue dot there.
+        // (When a workspace is both exited/bell AND waiting, the left
+        // accent bar above carries the attention signal.)
         const status = wsp.aggregateStatus();
-        if (status != .normal) {
-            _ = w32.SetTextColor(mem_dc, switch (status) {
+        const dot_color: ?u32 = if (status != .normal)
+            switch (status) {
                 .bell => bell_color,
                 .exited => exited_color,
                 .normal => unreachable,
-            });
+            }
+        else if (has_attention)
+            accent_color
+        else
+            null;
+        if (dot_color) |dc| {
+            _ = w32.SetTextColor(mem_dc, dc);
             const dot_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{25CF}");
             var dot_rect = w32.RECT{
                 .left = accent_w + pad,
