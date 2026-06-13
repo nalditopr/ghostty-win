@@ -278,9 +278,14 @@ tracking_mouse: bool = false,
 is_quick_terminal: bool = false,
 
 /// Set during init() when restoring persisted state asked for a
-/// maximized window. Consumed when the first tab shows the window
-/// (ShowWindow uses SW_SHOWMAXIMIZED instead of SW_SHOW). Always false
-/// for quick terminals and non-first windows. Only the main window
+/// maximized window. Consumed (reset to false) the first time a tab
+/// shows the window so the maximize is a true one-shot at initial
+/// bring-up: ShowWindow uses SW_SHOWMAXIMIZED that one time, then
+/// SW_SHOW thereafter. This matters because creating/selecting a
+/// workspace re-enters the first-tab show path on a fresh
+/// (tab_count==1) workspace; without consuming the flag every new
+/// workspace would re-maximize the window. Always false for quick
+/// terminals and non-first windows. Only the main window
 /// persists/restores geometry.
 restore_maximized: bool = false,
 
@@ -912,6 +917,13 @@ pub fn addTabWithCommand(
         if (!self.is_quick_terminal) {
             if (self.hwnd) |h| {
                 const cmd: i32 = if (self.restore_maximized) w32.SW_SHOWMAXIMIZED else w32.SW_SHOW;
+                // One-shot: consume the restore-maximized intent so it
+                // applies exactly once, during the initial window
+                // bring-up. Creating/selecting a workspace runs addTab on
+                // a fresh (tab_count==1) workspace and re-enters this
+                // branch — without clearing the flag that would
+                // re-maximize the window on every new workspace.
+                self.restore_maximized = false;
                 _ = w32.ShowWindow(h, cmd);
                 _ = w32.UpdateWindow(h);
             }

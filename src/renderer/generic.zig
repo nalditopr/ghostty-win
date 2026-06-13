@@ -1014,13 +1014,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return self.has_custom_shaders;
         }
 
-        /// True if our renderer is using vsync. If true, the renderer or apprt
-        /// is responsible for triggering draw_now calls to the render thread.
-        /// That is the only way to trigger a drawFrame.
+        /// True if our renderer is using vsync. If true, the free-running
+        /// draw timer in the render thread is suppressed and presents are
+        /// paced by the vsync mechanism instead.
+        ///
+        /// On macOS this is backed by a CVDisplayLink: when true, the apprt
+        /// is responsible for triggering `draw_now` calls (the only way to
+        /// trigger a drawFrame in that mode). On platforms without a
+        /// DisplayLink, the graphics API may still pace frames itself (e.g.
+        /// Win32 OpenGL via a blocking SwapBuffers with swap interval 1); in
+        /// that case presents remain driven by the normal wakeup/content
+        /// path (see renderer.Thread.drawFrame) rather than `draw_now`.
         pub fn hasVsync(self: *const Self) bool {
-            if (comptime DisplayLink == void) return false;
-            const display_link = self.display_link orelse return false;
-            return display_link.isRunning();
+            if (comptime DisplayLink != void) {
+                const display_link = self.display_link orelse return false;
+                return display_link.isRunning();
+            }
+
+            // No DisplayLink on this platform. Defer to the graphics API if
+            // it can pace frames on its own (Win32 OpenGL swap control).
+            if (comptime @hasDecl(GraphicsAPI, "hasVsync")) {
+                return self.api.hasVsync();
+            }
+
+            return false;
         }
 
         /// Callback when the focus changes for the terminal this is rendering.

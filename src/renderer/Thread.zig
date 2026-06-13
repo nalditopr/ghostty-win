@@ -501,9 +501,18 @@ fn drawFrame(self: *Thread, now: bool) void {
     // If we're invisible, we do not draw.
     if (!self.flags.visible) return;
 
-    // If the renderer is managing a vsync on its own, we only draw
-    // when we're forced to via `now`.
-    if (!now and self.renderer.hasVsync()) return;
+    // If the renderer is managing vsync via an *external* present driver
+    // (macOS: a CVDisplayLink that fires `draw_now` every vblank), then a
+    // non-forced draw is redundant and we only present when forced via
+    // `now`. The display link is the sole source of presents in that mode.
+    //
+    // On Win32, vsync is instead "self-paced": SwapBuffers blocks until
+    // vblank (swap interval 1). There is no external `draw_now` ticker, so
+    // we must keep presenting on the normal content/wakeup path — the
+    // blocking present provides the pacing. Suppressing it here would stop
+    // all rendering (black window), so we do NOT early-return on Windows.
+    const vsync_uses_external_driver = comptime builtin.os.tag.isDarwin();
+    if (vsync_uses_external_driver and !now and self.renderer.hasVsync()) return;
 
     if (must_draw_from_app_thread) {
         _ = self.app_mailbox.push(

@@ -41,6 +41,11 @@ const wgl = if (apprt.runtime == apprt.win32) struct {
         hglrc: ?*anyopaque,
     ) callconv(.c) i32;
     extern "opengl32" fn wglGetCurrentDC() callconv(.c) ?*anyopaque;
+    /// Used to resolve WGL extension entry points (e.g. swap control)
+    /// that are not part of the static opengl32.dll export table.
+    extern "opengl32" fn wglGetProcAddress(
+        name: [*:0]const u8,
+    ) callconv(.c) ?*const anyopaque;
     extern "gdi32" fn SwapBuffers(hdc: ?*anyopaque) callconv(.c) i32;
     extern "user32" fn WindowFromDC(hdc: ?*anyopaque) callconv(.c) ?std.os.windows.HWND;
     const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
@@ -48,6 +53,53 @@ const wgl = if (apprt.runtime == apprt.win32) struct {
         hwnd: std.os.windows.HWND,
         rect: *RECT,
     ) callconv(.c) i32;
+
+    /// Signature of wglSwapIntervalEXT (WGL_EXT_swap_control). Returns
+    /// non-zero on success. interval=1 syncs SwapBuffers to vblank.
+    const SwapIntervalProc = *const fn (interval: i32) callconv(.c) i32;
+
+    /// True on the current (renderer) thread once wglSwapIntervalEXT(1)
+    /// has been successfully applied to this thread's context. This is a
+    /// threadlocal to mirror the threadlocal nature of the GL/WGL context
+    /// (see pkg/opengl/glad.zig). `hasVsync` reads this on the same thread.
+    threadlocal var swap_control_active: bool = false;
+
+    /// Resolve wglSwapIntervalEXT and request vsync (interval 1) so that
+    /// SwapBuffers blocks until the next vertical blank. Safe to call only
+    /// after a context is current. Failure (extension absent on older or
+    /// headless ICDs) is non-fatal: we simply leave vsync disabled, which
+    /// matches the pre-existing unsynced behavior.
+    fn enableSwapControl() void {
+        // WGL_EXT_swap_control is resolved via wglGetProcAddress, which
+        // requires a current context. If the extension is unavailable the
+        // returned pointer is null (or, on some buggy ICDs, a small sentinel
+        // like 1/2/3 — guard against that too).
+        const raw = wglGetProcAddress("wglSwapIntervalEXT") orelse {
+            log.info(
+                "WGL_EXT_swap_control unavailable; vsync disabled (frames unsynced)",
+                .{},
+            );
+            return;
+        };
+        if (@intFromPtr(raw) <= 3) {
+            log.info(
+                "wglSwapIntervalEXT returned invalid pointer; vsync disabled",
+                .{},
+            );
+            return;
+        }
+
+        const swapInterval: SwapIntervalProc = @ptrCast(raw);
+        if (swapInterval(1) != 0) {
+            swap_control_active = true;
+            log.info("vsync enabled via wglSwapIntervalEXT(1)", .{});
+        } else {
+            log.info(
+                "wglSwapIntervalEXT(1) call failed; vsync disabled",
+                .{},
+            );
+        }
+    }
 } else struct {};
 
 /// We require at least OpenGL 4.3
@@ -269,8 +321,33 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             // Reload GL functions on this thread since OpenGL is
             // thread-local state.
             try prepareContext(null);
+
+            // Now that the context is current on the renderer thread,
+            // request vsync (swap interval 1) so SwapBuffers blocks until
+            // vblank and our frame loop is paced by the display. This is a
+            // no-op (gracefully) if the swap-control extension is missing.
+            wgl.enableSwapControl();
         },
     }
+}
+
+/// Whether this graphics API is pacing frames against the display refresh.
+///
+/// On Win32 this is true once wglSwapIntervalEXT(1) has been applied to the
+/// renderer thread's context: SwapBuffers then blocks until vblank, which is
+/// our frame pacing mechanism. On other platforms OpenGL does not drive its
+/// own vsync (macOS uses Metal + a CVDisplayLink; GTK relies on its own
+/// compositor) so this returns false and the generic renderer falls back to
+/// its DisplayLink-or-timer logic.
+///
+/// Must be called on the renderer thread (reads threadlocal state set in
+/// `threadEnter`).
+pub fn hasVsync(self: *const OpenGL) bool {
+    _ = self;
+    if (comptime apprt.runtime == apprt.win32) {
+        return wgl.swap_control_active;
+    }
+    return false;
 }
 
 /// Callback called by renderer.Thread when it exits.
