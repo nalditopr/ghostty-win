@@ -144,7 +144,14 @@ pub const HitCtx = struct {
 /// newest-first), and finally the footer strip (bell/gear icons). The
 /// row area ends at the panel top (footer top when closed); rows under
 /// the panel/footer are not hit.
+///
+/// Points outside the strip are .none on both axes: x outside
+/// [0, width) never resolves a target, mirroring the y bounds. Callers
+/// gate on `x < sidebarWidth()` today, but capture-driven mouse
+/// messages can deliver NEGATIVE client x, which used to fall through
+/// to a row body; the guard makes the function safe stand-alone.
 pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
+    if (x < 0 or x >= ctx.width) return .none;
     if (y < 0 or ctx.item_h <= 0) return .none;
     if (y >= ctx.client_h) return .none;
 
@@ -706,11 +713,18 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             // smaller one.
             if (w32.CreateFontW(
                 -scaled(10, win.scale),
-                0, 0, 0,
+                0,
+                0,
+                0,
                 w32.FW_NORMAL,
-                0, 0, 0,
+                0,
+                0,
+                0,
                 w32.DEFAULT_CHARSET,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
             )) |badge_font| {
                 const prev_font = w32.SelectObject(mem_dc, badge_font);
@@ -923,6 +937,39 @@ test "sidebar hitTest: y at or below the client bottom is none" {
     const ctx = testCtx(3, false, 0);
     try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 400, ctx));
     try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 500, ctx));
+}
+
+test "sidebar hitTest: negative x is none" {
+    // Capture-driven mouse messages can deliver negative client x; a
+    // row/footer/panel y must not resolve a target there.
+    const ctx = testCtx(3, true, 2);
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(-1, 0, ctx)); // row 0 body
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(-100, 35, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(-1, 3 * 36, ctx)); // new session row
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(-1, 232, ctx)); // panel entry 0
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(-1, 368, ctx)); // footer strip
+}
+
+test "sidebar hitTest: x at or beyond the width is none" {
+    // x == width is the first out-of-strip pixel (the strip spans
+    // [0, width), like the rows span [top, bottom)); the row body used
+    // to extend to any x >= width.
+    const ctx = testCtx(3, true, 2);
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(220, 0, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(500, 35, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(220, 3 * 36, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(220, 208, ctx)); // panel header / Clear y
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(220, 368, ctx));
+    // The last in-strip x still resolves (boundary partner).
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(219, 0, ctx));
+}
+
+test "sidebar hitTest: zero width (hidden sidebar) is none everywhere" {
+    var ctx = testCtx(3, false, 0);
+    ctx.width = 0;
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(0, 0, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 100, ctx));
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(8, 368, ctx));
 }
 
 test "sidebar hitTest: footer bell and gear slots" {

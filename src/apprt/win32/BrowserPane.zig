@@ -172,9 +172,18 @@ pub fn create(alloc: Allocator, app: *App, parent: *Window) !*BrowserPane {
     _ = w32.SetWindowTheme(edit, L("DarkMode_Explorer"), null);
     self.address_font = w32.CreateFontW(
         -@as(i32, @intFromFloat(@round(15.0 * parent.scale))),
-        0, 0, 0, 400,
-        0, 0, 0,
-        0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         L("Segoe UI"),
     );
     if (self.address_font) |f| {
@@ -405,16 +414,27 @@ fn onDocumentTitleChanged(self: *BrowserPane, sender: ?*wv2.ICoreWebView2, args:
     self.parent_window.onPaneTitleChanged(pane, self.title_buf[0..len :0]);
 }
 
-/// Cap a UTF-16 string at `max_units` code units without splitting a
-/// surrogate pair: a dangling high surrogate at the cut would make
-/// the whole utf16LeToUtf8 conversion fail (and the title be dropped).
+/// Cap a UTF-16 string at `max_units` code units without leaving a
+/// malformed surrogate at the cut: a dangling high surrogate (its low
+/// half was cut off) or an unpaired low surrogate at the boundary
+/// would make the whole utf16LeToUtf8 conversion fail (and the title
+/// be dropped). A low surrogate that completes a pair is kept.
 fn capUtf16(span: []const u16, max_units: usize) []const u16 {
     if (span.len <= max_units) return span;
     var capped = span[0..max_units];
-    if (capped.len > 0 and
-        capped[capped.len - 1] >= 0xD800 and capped[capped.len - 1] <= 0xDBFF)
-    {
-        capped = capped[0 .. capped.len - 1];
+    if (capped.len > 0) {
+        const last = capped[capped.len - 1];
+        if (last >= 0xD800 and last <= 0xDBFF) {
+            // High surrogate at the cut: its low half was cut off.
+            capped = capped[0 .. capped.len - 1];
+        } else if (last >= 0xDC00 and last <= 0xDFFF) {
+            // Low surrogate at the cut: keep it only when the unit
+            // before it is the high half of its pair; a lone low
+            // surrogate is just as malformed as a dangling high one.
+            const paired = capped.len >= 2 and
+                capped[capped.len - 2] >= 0xD800 and capped[capped.len - 2] <= 0xDBFF;
+            if (!paired) capped = capped[0 .. capped.len - 1];
+        }
     }
     return capped;
 }
@@ -1377,4 +1397,35 @@ test "unit: browser title exact fit including a trailing surrogate pair" {
     // unit is the low half of a pair.
     const input = [_]u16{ 'a', 0xD83D, 0xDE00 };
     try testing.expectEqualSlices(u16, &input, capUtf16(&input, 3));
+}
+
+test "unit: browser title cap drops an unpaired low surrogate at the cut" {
+    // A lone low surrogate (no preceding high half) landing exactly at
+    // the boundary is just as malformed as a dangling high surrogate:
+    // it must be backed over, not passed through.
+    const input = [_]u16{ 'a', 'b', 0xDE00, 'c', 'd' };
+    try testing.expectEqualSlices(u16, &.{ 'a', 'b' }, capUtf16(&input, 3));
+}
+
+test "unit: browser title cap drops a lone high surrogate at the cut" {
+    // A lone high surrogate (the next unit is NOT its low half) at the
+    // boundary is dropped — same path as the split-pair case.
+    const input = [_]u16{ 'a', 0xD800, 'b', 'c' };
+    try testing.expectEqualSlices(u16, &.{'a'}, capUtf16(&input, 2));
+}
+
+test "unit: browser title cap=1 with a leading lone low surrogate collapses to empty" {
+    // A lone low surrogate first: backing over it leaves nothing, which
+    // beats emitting one malformed unit.
+    const input = [_]u16{ 0xDE00, 'a', 'b' };
+    try testing.expectEqualSlices(u16, &.{}, capUtf16(&input, 1));
+}
+
+test "unit: browser title exact fit with a trailing lone low surrogate is unchanged" {
+    // span.len <= max_units takes the no-op path: the cap only repairs
+    // damage the CUT would cause; pre-existing malformation in a string
+    // that fits is passed through untouched (utf16LeToUtf8 still
+    // rejects it, exactly as it would have without any cap).
+    const input = [_]u16{ 'a', 0xDE00 };
+    try testing.expectEqualSlices(u16, &input, capUtf16(&input, 2));
 }

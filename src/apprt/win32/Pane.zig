@@ -168,6 +168,40 @@ test "unit: pane unref hides only an orphaned browser" {
     try testing.expectEqual(UnrefAction.keep, unrefAction(1, .terminal, false));
 }
 
+test "unit: pane unref decision matrix is total" {
+    // Every (remaining, kind, in_a_tab) cell as one explicit table —
+    // the focused tests above pin the interesting cells, this one
+    // guarantees no combination was left unasserted: zero destroys
+    // unconditionally, live terminals are always kept, and a live
+    // browser is kept exactly while some tree still owns it.
+    const Kind = std.meta.Tag(Content);
+    const cases = [_]struct {
+        remaining: u32,
+        kind: Kind,
+        in_a_tab: bool,
+        want: UnrefAction,
+    }{
+        .{ .remaining = 0, .kind = .terminal, .in_a_tab = true, .want = .destroy },
+        .{ .remaining = 0, .kind = .terminal, .in_a_tab = false, .want = .destroy },
+        .{ .remaining = 0, .kind = .browser, .in_a_tab = true, .want = .destroy },
+        .{ .remaining = 0, .kind = .browser, .in_a_tab = false, .want = .destroy },
+        .{ .remaining = 1, .kind = .terminal, .in_a_tab = true, .want = .keep },
+        .{ .remaining = 1, .kind = .terminal, .in_a_tab = false, .want = .keep },
+        .{ .remaining = 1, .kind = .browser, .in_a_tab = true, .want = .keep },
+        .{ .remaining = 1, .kind = .browser, .in_a_tab = false, .want = .hide_zombie },
+        .{ .remaining = 2, .kind = .terminal, .in_a_tab = true, .want = .keep },
+        .{ .remaining = 2, .kind = .terminal, .in_a_tab = false, .want = .keep },
+        .{ .remaining = 2, .kind = .browser, .in_a_tab = true, .want = .keep },
+        .{ .remaining = 2, .kind = .browser, .in_a_tab = false, .want = .hide_zombie },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(
+            c.want,
+            unrefAction(c.remaining, c.kind, c.in_a_tab),
+        );
+    }
+}
+
 test "unit: pane ref counts up and returns self" {
     // No test calls unref(): analyzing it pulls the entire content
     // teardown graph (Surface.deinit -> renderer -> a comptime

@@ -74,10 +74,14 @@ pub const State = struct {
     }
 
     /// Parse the `key=value` text format. Tolerant of a missing/corrupt
-    /// file: unknown keys are skipped, malformed lines are skipped, and a
-    /// partial parse returns null unless every required geometry field
-    /// (width/height/x/y) was present. `maximized` defaults to false when
-    /// absent or unparseable.
+    /// file: a leading UTF-8 BOM is stripped (Notepad's "UTF-8 with BOM"
+    /// would otherwise glue onto the first key and silently lose ALL
+    /// state), unknown keys are skipped, malformed lines are skipped,
+    /// and a partial parse returns null unless every required geometry
+    /// field (width/height/x/y) was present. A malformed value for a
+    /// known key never clobbers an earlier valid duplicate (the last
+    /// VALID occurrence wins). `maximized` defaults to false when absent
+    /// or unparseable.
     ///
     /// Returns null when the input cannot produce a usable, on-its-face
     /// valid State (see `validate`), so callers fall back to defaults.
@@ -88,7 +92,9 @@ pub const State = struct {
         var y: ?i32 = null;
         var maximized: bool = false;
 
-        var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+        const bom = "\xEF\xBB\xBF";
+        const body = if (std.mem.startsWith(u8, text, bom)) text[bom.len..] else text;
+        var lines = std.mem.tokenizeAny(u8, body, "\r\n");
         while (lines.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t");
             if (line.len == 0) continue;
@@ -96,14 +102,17 @@ pub const State = struct {
             const key = std.mem.trim(u8, line[0..eq], " \t");
             const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
 
+            // `catch <field>` keeps the previous value (null or an
+            // earlier valid duplicate) when this value is malformed:
+            // garbage never poisons a field a valid line already set.
             if (std.mem.eql(u8, key, "width")) {
-                width = std.fmt.parseInt(i32, val, 10) catch null;
+                width = std.fmt.parseInt(i32, val, 10) catch width;
             } else if (std.mem.eql(u8, key, "height")) {
-                height = std.fmt.parseInt(i32, val, 10) catch null;
+                height = std.fmt.parseInt(i32, val, 10) catch height;
             } else if (std.mem.eql(u8, key, "x")) {
-                x = std.fmt.parseInt(i32, val, 10) catch null;
+                x = std.fmt.parseInt(i32, val, 10) catch x;
             } else if (std.mem.eql(u8, key, "y")) {
-                y = std.fmt.parseInt(i32, val, 10) catch null;
+                y = std.fmt.parseInt(i32, val, 10) catch y;
             } else if (std.mem.eql(u8, key, "maximized")) {
                 if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1")) {
                     maximized = true;
@@ -350,11 +359,12 @@ test "winsize: parse duplicate keys last occurrence wins" {
     try testing.expect(!out.maximized);
 }
 
-test "winsize: parse duplicate key with malformed last value poisons the field" {
+test "winsize: parse duplicate key with malformed last value keeps the valid value" {
     const testing = std.testing;
-    // Pins current behavior: a later malformed duplicate RESETS the field
-    // to null (last-wins applies even when the last value is garbage), so
-    // the whole parse fails despite an earlier valid value.
+    // A later malformed duplicate is IGNORED: it neither overwrites nor
+    // poisons the earlier valid value, so the parse succeeds. (This used
+    // to pin the opposite — the garbage duplicate nulled the field and
+    // failed the whole parse.)
     const text =
         \\width=800
         \\height=600
@@ -363,7 +373,27 @@ test "winsize: parse duplicate key with malformed last value poisons the field" 
         \\width=corrupt
         \\
     ;
-    try testing.expect(State.parse(text) == null);
+    const out = State.parse(text) orelse return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 800), out.width);
+    try testing.expectEqual(@as(i32, 600), out.height);
+}
+
+test "winsize: parse duplicate key garbage-then-valid takes the valid value" {
+    const testing = std.testing;
+    // The mirror case: garbage first is ignored, a later valid duplicate
+    // sets the field normally (last VALID occurrence wins).
+    const text =
+        \\height=junk
+        \\width=800
+        \\height=600
+        \\x=1
+        \\y=2
+        \\
+    ;
+    const out = State.parse(text) orelse return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 600), out.height);
+    // Garbage-only (no valid duplicate anywhere) still fails the parse.
+    try testing.expect(State.parse("width=junk\nheight=600\nx=1\ny=2\n") == null);
 }
 
 test "winsize: parse extreme numeric values" {
@@ -445,12 +475,32 @@ test "winsize: parse unicode junk" {
     try testing.expect(State.parse("w\xc3\xaddth=800\nheight=600\nx=1\ny=2\n") == null);
     // Fullwidth digits are not ASCII digits → parseInt fails.
     try testing.expect(State.parse("width=\xef\xbc\x98\xef\xbc\x90\xef\xbc\x90\nheight=600\nx=1\ny=2\n") == null);
-    // A UTF-8 BOM glues onto the first key → that key is not recognized.
-    try testing.expect(State.parse("\xef\xbb\xbfwidth=800\nheight=600\nx=1\ny=2\n") == null);
+    // A leading UTF-8 BOM is stripped before parsing, so the first key
+    // is recognized. (This used to pin the opposite — the BOM glued onto
+    // the first key and the whole parse failed.)
+    try testing.expect(State.parse("\xef\xbb\xbfwidth=800\nheight=600\nx=1\ny=2\n") != null);
+    // A BOM anywhere else is still junk: it glues onto that line's key.
+    try testing.expect(State.parse("\xef\xbb\xbf\xef\xbb\xbfwidth=800\nheight=600\nx=1\ny=2\n") == null);
     // Emoji garbage on separate lines does not disturb valid keys.
     const out = State.parse("\xf0\x9f\xa6\x80\xf0\x9f\xa6\x80\nwidth=800\nheight=600\nx=1\ny=2\n\xf0\x9f\x92\xa5=42\n") orelse
         return error.ParseFailed;
     try testing.expectEqual(@as(i32, 800), out.width);
+}
+
+test "winsize: parse BOM-prefixed valid file (Notepad UTF-8 with BOM)" {
+    const testing = std.testing;
+    // Notepad's "UTF-8 with BOM" encoding prepends EF BB BF; the state
+    // file must survive a user editing it there. CRLF endings included,
+    // since that is what Notepad writes.
+    const out = State.parse("\xef\xbb\xbfwidth=1024\r\nheight=768\r\nx=100\r\ny=80\r\nmaximized=true\r\n") orelse
+        return error.ParseFailed;
+    try testing.expectEqual(@as(i32, 1024), out.width);
+    try testing.expectEqual(@as(i32, 768), out.height);
+    try testing.expectEqual(@as(i32, 100), out.x);
+    try testing.expectEqual(@as(i32, 80), out.y);
+    try testing.expect(out.maximized);
+    // A BOM alone is still an empty file.
+    try testing.expect(State.parse("\xef\xbb\xbf") == null);
 }
 
 test "winsize: parse maximized value variants" {

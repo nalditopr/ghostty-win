@@ -2885,6 +2885,51 @@ pub const BackendTarget = union(enum) {
     split: SplitTree(Pane).Split.Direction,
 };
 
+/// The operation class showBackendMenu performs for a (selection,
+/// target) pair: the decision half of the picker dispatch, kept pure
+/// so the full selection x target table is unit-testable. The
+/// side-effectful half (the switch at the bottom of showBackendMenu)
+/// only performs the class chosen here.
+const BackendDispatch = enum {
+    /// Menu dismissed, or a stale/foreign command ID: do nothing.
+    dismiss,
+    /// Browser pane as a new tab in the active workspace.
+    browser_tab,
+    /// Browser pane as the first tab of a brand-new workspace.
+    browser_workspace,
+    /// Browser pane as a split off the active pane.
+    browser_split,
+    /// Terminal (with the resolved argv/title) as a new tab.
+    terminal_tab,
+    /// Terminal as the first tab of a brand-new workspace.
+    terminal_workspace,
+    /// Terminal as a split off the active pane.
+    terminal_split,
+};
+
+/// Map a backend-picker selection and target to the operation class to
+/// perform. Browser is a pane kind rather than a command, so it gets
+/// its own classes; every terminal-backed selection (including the
+/// configured default) shares the terminal classes.
+fn backendDispatch(
+    selection: PickerSelection,
+    target: BackendTarget,
+) BackendDispatch {
+    return switch (selection) {
+        .none => .dismiss,
+        .browser => switch (target) {
+            .new_tab => .browser_tab,
+            .new_workspace => .browser_workspace,
+            .split => .browser_split,
+        },
+        .default, .pwsh, .cmd, .distro => switch (target) {
+            .new_tab => .terminal_tab,
+            .new_workspace => .terminal_workspace,
+            .split => .terminal_split,
+        },
+    };
+}
+
 /// Show the backend picker at client coordinates (x, y): "Default" /
 /// "PowerShell" / "Command Prompt", each installed WSL distribution
 /// (Windows Terminal style), and "Browser" (a WebView2 pane). The
@@ -2955,36 +3000,18 @@ pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) voi
     // Resolve the picked backend to an argv (null = the configured
     // default — explicit for splits, which otherwise inherit the
     // source pane's backend) and a tab title. Browser is a pane kind,
-    // not a command: dispatch it directly.
+    // not a command: its dispatch arms below never read the backend.
+    const selection = pickerSelection(@intCast(cmd), distros.len);
     const Backend = struct {
         argv: ?[]const []const u8,
         title: ?[]const u8,
     };
     var distro_argv: [5][]const u8 = undefined;
-    const backend: Backend = switch (pickerSelection(@intCast(cmd), distros.len)) {
-        .none => return,
-        .browser => {
-            switch (target) {
-                .new_tab => self.addBrowserTab() catch |err| {
-                    log.err("failed to create browser tab: {}", .{err});
-                },
-                .new_workspace => {
-                    const idx = self.createAndSelectWorkspace() orelse return;
-                    self.addBrowserTab() catch |err| {
-                        // Same collapse-the-empty-slot path as
-                        // newWorkspace: never show a 0-tab workspace.
-                        log.err("failed to create browser tab for new workspace: {}", .{err});
-                        self.closeWorkspace(idx);
-                    };
-                    self.invalidateSidebar();
-                },
-                .split => |dir| self.newBrowserSplit(dir) catch |err| {
-                    log.err("failed to open browser split: {}", .{err});
-                },
-            }
-            return;
-        },
-        .default => .{ .argv = null, .title = null },
+    const backend: Backend = switch (selection) {
+        // .none dispatches to .dismiss and .browser to the browser
+        // classes, none of which reads the backend; null/null is the
+        // same harmless value .default resolves to.
+        .none, .browser, .default => .{ .argv = null, .title = null },
         .pwsh => .{
             .argv = if (havePwsh()) &.{"pwsh.exe"} else &.{"powershell.exe"},
             .title = "PowerShell",
@@ -2997,11 +3024,30 @@ pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) voi
         },
     };
 
-    switch (target) {
-        .new_tab => _ = self.addTabWithCommand(backend.argv, backend.title) catch |err| {
+    // The *_split classes only arise from a .split target, so the
+    // target.split accesses below are guaranteed by backendDispatch.
+    switch (backendDispatch(selection, target)) {
+        .dismiss => return,
+        .browser_tab => self.addBrowserTab() catch |err| {
+            log.err("failed to create browser tab: {}", .{err});
+        },
+        .browser_workspace => {
+            const idx = self.createAndSelectWorkspace() orelse return;
+            self.addBrowserTab() catch |err| {
+                // Same collapse-the-empty-slot path as newWorkspace:
+                // never show a 0-tab workspace.
+                log.err("failed to create browser tab for new workspace: {}", .{err});
+                self.closeWorkspace(idx);
+            };
+            self.invalidateSidebar();
+        },
+        .browser_split => self.newBrowserSplit(target.split) catch |err| {
+            log.err("failed to open browser split: {}", .{err});
+        },
+        .terminal_tab => _ = self.addTabWithCommand(backend.argv, backend.title) catch |err| {
             log.err("failed to create new tab: {}", .{err});
         },
-        .new_workspace => {
+        .terminal_workspace => {
             // Create-and-select FIRST so the picked backend becomes the
             // new workspace's first tab (a .default pick passes
             // null/null, identical to newWorkspace's plain addTab).
@@ -3014,7 +3060,7 @@ pub fn showBackendMenu(self: *Window, x: i32, y: i32, target: BackendTarget) voi
             };
             self.invalidateSidebar();
         },
-        .split => |dir| self.newSplitWithCommand(dir, backend.argv) catch |err| {
+        .terminal_split => self.newSplitWithCommand(target.split, backend.argv) catch |err| {
             log.err("failed to create split: {}", .{err});
         },
     }
@@ -4276,4 +4322,123 @@ test "unit: inherit title unknown or degenerate argv keeps the default" {
     try testing.expectEqual(@as(?[]const u8, null), titleForCommand(&.{"wsl.exe"}));
     // Trailing -d with no value must not read past the argv.
     try testing.expectEqual(@as(?[]const u8, null), titleForCommand(&.{ "wsl.exe", "-d" }));
+}
+
+test "unit: inherit title resolves full paths and mixed-case exe names" {
+    // basename strips the directory; the exe name and the .exe
+    // extension both match case-insensitively.
+    try testing.expectEqualStrings(
+        "Ubuntu",
+        titleForCommand(&.{ "C:\\Windows\\System32\\wsl.exe", "-d", "Ubuntu" }).?,
+    );
+    try testing.expectEqualStrings(
+        "Ubuntu",
+        titleForCommand(&.{ "WsL.ExE", "-d", "Ubuntu" }).?,
+    );
+    try testing.expectEqualStrings("PowerShell", titleForCommand(&.{"PoWeRsHeLl.ExE"}).?);
+    try testing.expectEqualStrings("PowerShell", titleForCommand(&.{"Pwsh.EXE"}).?);
+    // Single-element argv without an extension still resolves.
+    try testing.expectEqualStrings("PowerShell", titleForCommand(&.{"powershell"}).?);
+}
+
+test "unit: inherit title keeps a distro name containing spaces" {
+    // The name is a single argv element; spaces inside it belong to
+    // the distro name, not to argument splitting.
+    try testing.expectEqualStrings(
+        "openSUSE Leap 15.6",
+        titleForCommand(&.{ "wsl.exe", "--cd", "~", "-d", "openSUSE Leap 15.6" }).?,
+    );
+    try testing.expectEqualStrings(
+        "Ubuntu 24.04 LTS",
+        titleForCommand(&.{ "wsl.exe", "--distribution", "Ubuntu 24.04 LTS" }).?,
+    );
+}
+
+test "unit: inherit title only recognizes the exact two-token distro flag" {
+    // Only the exact "-d <name>" / "--distribution <name>" forms the
+    // picker writes are recognized; near misses fall back to the
+    // default title (a harmless fallback, never a wrong distro name).
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        titleForCommand(&.{ "wsl.exe", "-D", "Ubuntu" }),
+    );
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        titleForCommand(&.{ "wsl.exe", "-d=Ubuntu" }),
+    );
+    // --distribution as the LAST token has no value to take.
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        titleForCommand(&.{ "wsl.exe", "--distribution" }),
+    );
+}
+
+test "unit: backend dispatch maps every selection and target pair" {
+    const selections = [_]PickerSelection{
+        .none, .default, .pwsh, .cmd, .{ .distro = 0 }, .browser,
+    };
+    const targets = [_]BackendTarget{
+        .new_tab, .new_workspace, .{ .split = .right },
+    };
+    // Rows follow `selections`, columns follow `targets`.
+    const expected = [_][3]BackendDispatch{
+        .{ .dismiss, .dismiss, .dismiss },
+        .{ .terminal_tab, .terminal_workspace, .terminal_split },
+        .{ .terminal_tab, .terminal_workspace, .terminal_split },
+        .{ .terminal_tab, .terminal_workspace, .terminal_split },
+        .{ .terminal_tab, .terminal_workspace, .terminal_split },
+        .{ .browser_tab, .browser_workspace, .browser_split },
+    };
+    for (selections, expected) |sel, row| {
+        for (targets, row) |tgt, want| {
+            try testing.expectEqual(want, backendDispatch(sel, tgt));
+        }
+    }
+}
+
+test "unit: backend dispatch ignores split direction and distro index" {
+    // The split payload picks WHERE the split goes, never WHAT class
+    // of operation runs; same for which distro index was picked.
+    const dirs = [_]SplitTree(Pane).Split.Direction{ .left, .right, .down, .up };
+    for (dirs) |dir| {
+        try testing.expectEqual(
+            BackendDispatch.terminal_split,
+            backendDispatch(.default, .{ .split = dir }),
+        );
+        try testing.expectEqual(
+            BackendDispatch.browser_split,
+            backendDispatch(.browser, .{ .split = dir }),
+        );
+    }
+    try testing.expectEqual(
+        BackendDispatch.terminal_workspace,
+        backendDispatch(.{ .distro = 63 }, .new_workspace),
+    );
+}
+
+test "unit: workspace aggregate status slot visibility at the count boundaries" {
+    var ws: Workspace = .{};
+
+    // tab_count = 0: all 64 slots dirty, none live.
+    for (&ws.tab_status) |*s| s.* = .exited;
+    ws.tab_count = 0;
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+
+    // tab_count = MAX_TABS: no slot is beyond the count, so dirt in
+    // the very last slot must be seen.
+    for (&ws.tab_status) |*s| s.* = .normal;
+    ws.tab_status[MAX_TABS - 1] = .exited;
+    ws.tab_count = MAX_TABS;
+    try testing.expectEqual(TabStatus.exited, ws.aggregateStatus());
+
+    // One below capacity: the same slot is beyond the count again.
+    ws.tab_count = MAX_TABS - 1;
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+
+    // Bell behaves the same at both boundaries.
+    ws.tab_status[MAX_TABS - 1] = .bell;
+    ws.tab_count = MAX_TABS;
+    try testing.expectEqual(TabStatus.bell, ws.aggregateStatus());
+    ws.tab_count = 0;
+    try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
 }

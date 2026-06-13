@@ -3478,3 +3478,38 @@ test "unit: set command preserves very long lines byte for byte" {
     defer alloc.free(expected);
     try testing.expectEqualStrings(expected, out);
 }
+
+test "unit: set command preserves leading and trailing value spaces verbatim" {
+    const alloc = testing.allocator;
+    // The value is written verbatim after "command = "; surrounding
+    // spaces are part of it, on both the replace and append paths.
+    {
+        const out = try setCommandInConfigText(alloc, "command = cmd.exe\n", " pwsh.exe ");
+        defer alloc.free(out);
+        try testing.expectEqualStrings("command =  pwsh.exe \n", out);
+    }
+    {
+        const out = try setCommandInConfigText(alloc, "theme = dark\n", " pwsh.exe ");
+        defer alloc.free(out);
+        try testing.expectEqualStrings("theme = dark\ncommand =  pwsh.exe \n", out);
+    }
+}
+
+test "unit: set command appends after a BOM-only file" {
+    const alloc = testing.allocator;
+    // A UTF-8 BOM is opaque content, not whitespace: it is preserved
+    // byte for byte and the appended entry starts on its own line.
+    const out = try setCommandInConfigText(alloc, "\xEF\xBB\xBF", "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("\xEF\xBB\xBF\ncommand = pwsh.exe\n", out);
+}
+
+test "unit: set command appends after a CRLF-only file" {
+    const alloc = testing.allocator;
+    // A file holding a single blank CRLF line: the bare \r line is no
+    // key match, the existing line ending is reused as the separator,
+    // and nothing is duplicated.
+    const out = try setCommandInConfigText(alloc, "\r\n", "pwsh.exe");
+    defer alloc.free(out);
+    try testing.expectEqualStrings("\r\ncommand = pwsh.exe\n", out);
+}
