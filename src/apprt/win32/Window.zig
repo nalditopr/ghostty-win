@@ -951,6 +951,18 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     self.closeTabInWorkspace(self.active_workspace, idx);
 }
 
+/// Pure active-tab fixup for closeTabInWorkspace: the tab at `idx` was
+/// removed (arrays already shifted left) leaving `new_count` >= 1 tabs;
+/// return the post-close active index. A surviving active tab follows
+/// its shifted slot; closing the active tab selects the tab that slid
+/// into its slot, clamped to the new last index. HWND-free so it can be
+/// unit tested exhaustively.
+fn closeTabActiveFixup(new_count: usize, active: usize, idx: usize) usize {
+    if (active >= new_count) return new_count - 1;
+    if (active > idx) return active - 1;
+    return active;
+}
+
 /// Close the tab at `idx` within workspace `ws_idx`, which need not be
 /// the active workspace (pane-pointer close paths resolve via findLoc).
 fn closeTabInWorkspace(self: *Window, ws_idx: usize, idx: usize) void {
@@ -993,11 +1005,7 @@ fn closeTabInWorkspace(self: *Window, ws_idx: usize, idx: usize) void {
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
-    if (ws.active_tab >= ws.tab_count) {
-        ws.active_tab = ws.tab_count - 1;
-    } else if (ws.active_tab > idx) {
-        ws.active_tab -= 1;
-    }
+    ws.active_tab = closeTabActiveFixup(ws.tab_count, ws.active_tab, idx);
     tree.deinit();
     if (ws_idx == self.active_workspace) {
         self.selectTabIndex(ws.active_tab);
@@ -1218,6 +1226,13 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     self.invalidateSidebar();
 }
 
+/// Pure guard for createAndSelectWorkspace: a new workspace slot may be
+/// created only on a non-QuickTerminal (multi-workspace) window with
+/// fewer than MAX_WORKSPACES slots in use.
+fn canCreateWorkspace(is_quick_terminal: bool, count: usize) bool {
+    return !is_quick_terminal and count < MAX_WORKSPACES;
+}
+
 /// Create a new workspace slot (a new sidebar row) and make it active,
 /// WITHOUT giving it a tab. Returns the new index, or null for
 /// QuickTerminal (single-workspace) or when the MAX_WORKSPACES cap is
@@ -1230,8 +1245,7 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
 /// newWorkspace (default tab) and showBackendMenu's .new_workspace
 /// target (picked-backend tab).
 fn createAndSelectWorkspace(self: *Window) ?usize {
-    if (self.is_quick_terminal) return null;
-    if (self.workspace_count >= MAX_WORKSPACES) return null;
+    if (!canCreateWorkspace(self.is_quick_terminal, self.workspace_count)) return null;
     self.cancelTabRename();
 
     const idx = self.workspace_count;
@@ -1258,6 +1272,34 @@ pub fn newWorkspace(self: *Window) void {
     self.invalidateSidebar();
 }
 
+/// Pure index arithmetic for closeWorkspace, HWND-free so it can be
+/// unit tested exhaustively. Closing the only workspace closes the
+/// window. Otherwise the caller shifts slots [idx+1, count) left one
+/// (`for (idx..new_count) |i| slot[i] = slot[i+1]`), value-inits the
+/// now-duplicate slot at new_count, and selects new_active: a surviving
+/// active workspace follows its shifted slot, and closing the active
+/// one selects the workspace that slid into its slot, clamped to the
+/// new last index.
+const CloseWorkspaceArith = union(enum) {
+    close_window,
+    survivors: struct {
+        new_count: usize,
+        new_active: usize,
+    },
+};
+
+fn closeWorkspaceArith(count: usize, active: usize, idx: usize) CloseWorkspaceArith {
+    if (count == 1) return .close_window;
+    const new_count = count - 1;
+    const new_active: usize = if (idx == active)
+        @min(idx, new_count - 1)
+    else if (active > idx)
+        active - 1
+    else
+        active;
+    return .{ .survivors = .{ .new_count = new_count, .new_active = new_active } };
+}
+
 /// Close the workspace at `idx`: deinit all its tab trees (each unrefs
 /// its panes), then either close the window (if it was the only
 /// workspace) or shift the survivors down and select a neighbor.
@@ -1266,10 +1308,12 @@ pub fn closeWorkspace(self: *Window, idx: usize) void {
     if (idx >= self.workspace_count) return;
     self.cancelTabRename();
 
+    const arith = closeWorkspaceArith(self.workspace_count, self.active_workspace, idx);
+
     // Last workspace → close the whole window. Mirror closeTabByIndex's
     // last-tab path: flag closing FIRST so re-entrant input/focus
     // messages are dropped while the trees tear down, then post WM_CLOSE.
-    if (self.workspace_count == 1) {
+    if (arith == .close_window) {
         self.closing = true;
         const ws = &self.workspaces[idx];
         for (ws.tab_trees[0..ws.tab_count]) |*tree| {
@@ -1294,19 +1338,12 @@ pub fn closeWorkspace(self: *Window, idx: usize) void {
         }
     }
 
-    // Compute the survivor to focus AFTER the shift: the workspace that
-    // ends up where this one was, clamped to the new last index. If the
-    // active workspace sat after the removed one, its index shifts down.
-    const new_count = self.workspace_count - 1;
-    const survivor: usize = blk: {
-        if (idx == self.active_workspace) {
-            break :blk @min(idx, new_count - 1);
-        } else if (self.active_workspace > idx) {
-            break :blk self.active_workspace - 1;
-        } else {
-            break :blk self.active_workspace;
-        }
-    };
+    // The survivor to focus AFTER the shift: the workspace that ends up
+    // where this one was, clamped to the new last index. If the active
+    // workspace sat after the removed one, its index shifts down. All
+    // computed by closeWorkspaceArith above.
+    const new_count = arith.survivors.new_count;
+    const survivor = arith.survivors.new_active;
 
     // PUBLISH the post-shift workspaces array + active_workspace BEFORE
     // deiniting the closed workspace's trees: the deinit can destroy a
@@ -1343,6 +1380,18 @@ pub fn closeWorkspace(self: *Window, idx: usize) void {
     self.invalidateSidebar();
 }
 
+/// Pure active-index fixup for moveWorkspaceTo: the slot at `from`
+/// moved to `to`, shifting every slot between them one toward `from`;
+/// return where the index `active` lands so the same workspace stays
+/// active. Identity when from == to. HWND-free so it can be unit
+/// tested exhaustively.
+fn moveActiveFixup(active: usize, from: usize, to: usize) usize {
+    if (active == from) return to;
+    if (from < to and active > from and active <= to) return active - 1;
+    if (from > to and active >= to and active < from) return active + 1;
+    return active;
+}
+
 /// Move the workspace at `from` to `to`, shifting the workspaces between
 /// them. Fixes up active_workspace so the same workspace stays active.
 /// Analogous to moveTabTo. No-op for QuickTerminal or out-of-range.
@@ -1365,14 +1414,8 @@ pub fn moveWorkspaceTo(self: *Window, from: usize, to: usize) void {
     self.workspaces[to] = saved;
 
     // Fix up active_workspace so the same workspace stays active across
-    // the shuffle (mirrors the index arithmetic the shift performed).
-    if (self.active_workspace == from) {
-        self.active_workspace = to;
-    } else if (from < to and self.active_workspace > from and self.active_workspace <= to) {
-        self.active_workspace -= 1;
-    } else if (from > to and self.active_workspace >= to and self.active_workspace < from) {
-        self.active_workspace += 1;
-    }
+    // the shuffle (pure arithmetic mirroring the shift above).
+    self.active_workspace = moveActiveFixup(self.active_workspace, from, to);
 
     self.invalidateSidebar();
 }
@@ -4396,6 +4439,87 @@ test "unit: backend dispatch maps every selection and target pair" {
     }
 }
 
+test "unit: workspace close survivor selection table" {
+    const Case = struct {
+        count: usize,
+        active: usize,
+        idx: usize,
+        new_active: usize,
+    };
+    const cases = [_]Case{
+        // Closing below the active workspace shifts it down with the slots.
+        .{ .count = 3, .active = 2, .idx = 0, .new_active = 1 },
+        .{ .count = 4, .active = 2, .idx = 1, .new_active = 1 },
+        .{ .count = 2, .active = 1, .idx = 0, .new_active = 0 },
+        // Closing above the active workspace leaves it in place.
+        .{ .count = 3, .active = 0, .idx = 2, .new_active = 0 },
+        .{ .count = 4, .active = 1, .idx = 3, .new_active = 1 },
+        .{ .count = 2, .active = 0, .idx = 1, .new_active = 0 },
+        // Closing the active workspace selects the slot that slid in...
+        .{ .count = 3, .active = 1, .idx = 1, .new_active = 1 },
+        .{ .count = 4, .active = 0, .idx = 0, .new_active = 0 },
+        // ...clamped to the new last index when the last one closes.
+        .{ .count = 3, .active = 2, .idx = 2, .new_active = 1 },
+        .{ .count = 2, .active = 1, .idx = 1, .new_active = 0 },
+    };
+    for (cases) |c| {
+        const s = closeWorkspaceArith(c.count, c.active, c.idx).survivors;
+        try testing.expectEqual(c.count - 1, s.new_count);
+        try testing.expectEqual(c.new_active, s.new_active);
+    }
+}
+
+test "unit: workspace close of the only workspace closes the window" {
+    try testing.expect(closeWorkspaceArith(1, 0, 0) == .close_window);
+    // With siblings, the window never closes from this path.
+    try testing.expect(closeWorkspaceArith(2, 0, 0) != .close_window);
+    try testing.expect(closeWorkspaceArith(2, 1, 1) != .close_window);
+}
+
+test "unit: workspace close arithmetic exhaustive over count 1..4" {
+    // Every (count, active, idx) combination, verified against an id
+    // simulation of the slot shift closeWorkspace publishes: for i in
+    // idx..new_count slot[i] = slot[i+1], then the duplicate at
+    // new_count is value-initialized.
+    var count: usize = 1;
+    while (count <= 4) : (count += 1) {
+        for (0..count) |active| {
+            for (0..count) |idx| {
+                const outcome = closeWorkspaceArith(count, active, idx);
+                if (count == 1) {
+                    // Last close always signals window close.
+                    try testing.expect(outcome == .close_window);
+                    continue;
+                }
+                const s = outcome.survivors;
+                try testing.expectEqual(count - 1, s.new_count);
+                // The new active index is always valid.
+                try testing.expect(s.new_active < s.new_count);
+
+                // Simulate the shift over distinct ids; 99 marks the
+                // cleared duplicate slot.
+                var ids: [4]usize = .{ 0, 1, 2, 3 };
+                for (idx..s.new_count) |i| ids[i] = ids[i + 1];
+                ids[s.new_count] = 99;
+
+                // The cleared slot is never selected.
+                try testing.expect(ids[s.new_active] != 99);
+                if (idx != active) {
+                    // A background close keeps the same workspace active.
+                    try testing.expectEqual(active, ids[s.new_active]);
+                } else if (idx < s.new_count) {
+                    // Closing the active workspace selects the one that
+                    // slid into its slot...
+                    try testing.expectEqual(idx + 1, ids[s.new_active]);
+                } else {
+                    // ...or the new last when the last one was closed.
+                    try testing.expectEqual(idx - 1, ids[s.new_active]);
+                }
+            }
+        }
+    }
+}
+
 test "unit: backend dispatch ignores split direction and distro index" {
     // The split payload picks WHERE the split goes, never WHAT class
     // of operation runs; same for which distro index was picked.
@@ -4441,4 +4565,112 @@ test "unit: workspace aggregate status slot visibility at the count boundaries" 
     try testing.expectEqual(TabStatus.bell, ws.aggregateStatus());
     ws.tab_count = 0;
     try testing.expectEqual(TabStatus.normal, ws.aggregateStatus());
+}
+
+test "unit: workspace move active fixup table" {
+    // Moving the active workspace tracks it to the destination.
+    try testing.expectEqual(@as(usize, 3), moveActiveFixup(0, 0, 3));
+    try testing.expectEqual(@as(usize, 0), moveActiveFixup(3, 3, 0));
+    // Rightward move: actives inside (from, to] shift down one.
+    try testing.expectEqual(@as(usize, 1), moveActiveFixup(2, 0, 3));
+    try testing.expectEqual(@as(usize, 2), moveActiveFixup(3, 0, 3));
+    // Leftward move: actives inside [to, from) shift up one.
+    try testing.expectEqual(@as(usize, 2), moveActiveFixup(1, 3, 0));
+    try testing.expectEqual(@as(usize, 2), moveActiveFixup(1, 2, 0));
+    // Actives outside the shifted span stay put.
+    try testing.expectEqual(@as(usize, 0), moveActiveFixup(0, 1, 3));
+    try testing.expectEqual(@as(usize, 3), moveActiveFixup(3, 0, 2));
+}
+
+test "unit: workspace move active fixup exhaustive over count 1..4" {
+    // Every (count, active, from, to) combination — including the
+    // from == to identity the call site early-returns — verified
+    // against an id simulation of the lift-shift-drop shuffle
+    // moveWorkspaceTo performs: the fixed-up index must stay in range
+    // and keep pointing at the same workspace id.
+    var count: usize = 1;
+    while (count <= 4) : (count += 1) {
+        for (0..count) |active| {
+            for (0..count) |from| {
+                for (0..count) |to| {
+                    var ids: [4]usize = .{ 0, 1, 2, 3 };
+                    const saved = ids[from];
+                    if (from < to) {
+                        var i: usize = from;
+                        while (i < to) : (i += 1) ids[i] = ids[i + 1];
+                    } else {
+                        var i: usize = from;
+                        while (i > to) : (i -= 1) ids[i] = ids[i - 1];
+                    }
+                    ids[to] = saved;
+
+                    const fixed = moveActiveFixup(active, from, to);
+                    try testing.expect(fixed < count);
+                    try testing.expectEqual(active, ids[fixed]);
+                }
+            }
+        }
+    }
+}
+
+test "unit: tab close active fixup table" {
+    // Args are (new_count, active, idx): the POST-close tab count, the
+    // pre-close active index, and the closed index.
+    // Closing below the active tab shifts it down.
+    try testing.expectEqual(@as(usize, 1), closeTabActiveFixup(3, 2, 0));
+    // Closing above the active tab leaves it in place.
+    try testing.expectEqual(@as(usize, 1), closeTabActiveFixup(3, 1, 2));
+    // Closing the active tab selects the tab that slid into its slot...
+    try testing.expectEqual(@as(usize, 1), closeTabActiveFixup(3, 1, 1));
+    // ...clamped to the new last index when the last tab closes.
+    try testing.expectEqual(@as(usize, 1), closeTabActiveFixup(2, 2, 2));
+    // Closing the only sibling of the active first tab keeps index 0.
+    try testing.expectEqual(@as(usize, 0), closeTabActiveFixup(1, 0, 1));
+}
+
+test "unit: tab close active fixup exhaustive over count 2..4" {
+    // Every (count, active, idx) with count >= 2 (closing the last tab
+    // takes the workspace-collapse/window-close paths before the fixup
+    // runs), verified against tabArraysRemove's real shift.
+    var count: usize = 2;
+    while (count <= 4) : (count += 1) {
+        for (0..count) |active| {
+            for (0..count) |idx| {
+                const new_count = count - 1;
+                var ids: [4]usize = .{ 0, 1, 2, 3 };
+                tabArraysRemove(.{&ids}, count, idx);
+
+                const fixed = closeTabActiveFixup(new_count, active, idx);
+                // The new active index is always valid.
+                try testing.expect(fixed < new_count);
+                if (idx != active) {
+                    // A surviving active tab stays active.
+                    try testing.expectEqual(active, ids[fixed]);
+                } else if (idx < new_count) {
+                    // Closing the active tab selects the slid-in tab...
+                    try testing.expectEqual(idx + 1, ids[fixed]);
+                } else {
+                    // ...or the new last when the last tab was closed.
+                    try testing.expectEqual(idx - 1, ids[fixed]);
+                }
+            }
+        }
+    }
+}
+
+test "unit: workspace create guard caps at 16 and blocks quick terminal" {
+    // Every count below the cap is allowed on a normal window.
+    for (0..MAX_WORKSPACES) |count| {
+        try testing.expect(canCreateWorkspace(false, count));
+    }
+    // At (and past) the cap: no new slot.
+    try testing.expect(!canCreateWorkspace(false, MAX_WORKSPACES));
+    try testing.expect(!canCreateWorkspace(false, MAX_WORKSPACES + 1));
+    // QuickTerminal is single-workspace regardless of count.
+    try testing.expect(!canCreateWorkspace(true, 0));
+    try testing.expect(!canCreateWorkspace(true, 1));
+    try testing.expect(!canCreateWorkspace(true, MAX_WORKSPACES));
+    // The sidebar's row math and the workspaces array size both assume
+    // this exact cap; a silent change must fail a test.
+    try testing.expectEqual(@as(usize, 16), MAX_WORKSPACES);
 }
