@@ -1,7 +1,10 @@
 //! Per-pane top-right corner action buttons for the Win32 apprt: a small
-//! cluster of clickable icons (New Tab, New Browser, Split, Close) shown
-//! in the top-right corner of EVERY pane, always visible (the hovered
-//! button is highlighted; hovering is not required to reveal the cluster).
+//! cluster of clickable icons shown in the top-right corner of EVERY pane,
+//! always visible (the hovered button is highlighted; hovering is not
+//! required to reveal the cluster). The set mirrors cmux's per-pane
+//! (Bonsplit) action buttons exactly: New Terminal, New Browser, Split
+//! Right, Split Down — drawn to resemble cmux's SF Symbols `terminal`,
+//! `globe`, `square.split.2x1`, `square.split.1x2`.
 //!
 //! Like AttentionRing/Scrollbar, panes are GL/WebView2 child HWNDs that
 //! fully cover their rect, so GDI painted on the parent window would be
@@ -30,7 +33,7 @@ const testing = std.testing;
 const log = std.log.scoped(.win32_pane_buttons);
 
 /// Number of icon buttons in the cluster, left -> right:
-/// 0 New Tab, 1 New Browser, 2 Split, 3 Close.
+/// 0 New Terminal, 1 New Browser, 2 Split Right, 3 Split Down.
 pub const BUTTON_COUNT: usize = 4;
 
 /// Per-button square size in unscaled pixels (DPI-scaled at use time).
@@ -58,20 +61,16 @@ const ICON_R: u8 = 0xE6;
 const ICON_G: u8 = 0xE6;
 const ICON_B: u8 = 0xE6;
 
-/// Close-icon stroke color when hovered (red ×).
-const CLOSE_R: u8 = 0xFF;
-const CLOSE_G: u8 = 0xFF;
-const CLOSE_B: u8 = 0xFF;
-
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyPaneButtons");
 
 /// The action a clicked button maps to. Pure enum so the hit-test result
 /// is testable; Window routes each to the corresponding pane operation.
+/// Order + meaning mirror cmux's per-pane Bonsplit action buttons.
 pub const Action = enum(usize) {
-    new_tab = 0,
+    new_terminal = 0,
     new_browser = 1,
-    split = 2,
-    close = 3,
+    split_right = 2,
+    split_down = 3,
 };
 
 /// DPI-scaled value of an unscaled base constant.
@@ -337,20 +336,19 @@ pub const PaneButtons = struct {
             else
                 packBGRA(PLATE_R, PLATE_G, PLATE_B, PLATE_ALPHA);
             fillRect(pixels, w, h, r, plate);
-            const stroke = if (b == @intFromEnum(Action.close) and hot)
-                packBGRA(CLOSE_R, CLOSE_G, CLOSE_B, 255)
-            else
-                packBGRA(ICON_R, ICON_G, ICON_B, 255);
+            const stroke = packBGRA(ICON_R, ICON_G, ICON_B, 255);
             self.drawGlyph(pixels, w, h, r, @enumFromInt(b), stroke);
         }
     }
 
     /// Draw the glyph for `action` inside button rect `r` using simple
     /// pixel shapes (no GDI text), so every icon is crisp at any DPI and
-    /// carries zero tofu risk.
+    /// carries zero tofu risk. Each shape mirrors the corresponding cmux
+    /// SF Symbol: `terminal`, `globe`, `square.split.2x1`, `square.split.1x2`.
     fn drawGlyph(self: *PaneButtons, pixels: [*]u32, w: i32, h: i32, r: w32.RECT, action: Action, color: u32) void {
-        const t = @max(scaled(2, self.scale), 1); // stroke thickness
-        const inset = scaled(5, self.scale); // glyph inset from button edge
+        const t = @max(scaled(2, self.scale), 1); // stroke thickness (bold)
+        const thin = @max(@divFloor(t, 2), 1); // outline/divider thickness
+        const inset = scaled(4, self.scale); // glyph inset from button edge
         const gx0 = r.left + inset;
         const gy0 = r.top + inset;
         const gx1 = r.right - inset;
@@ -360,40 +358,39 @@ pub const PaneButtons = struct {
         const cy = @divFloor(gy0 + gy1, 2);
 
         switch (action) {
-            .new_tab => {
-                // A "+" : horizontal + vertical bar.
-                hLine(pixels, w, h, gx0, gx1, cy, t, color);
-                vLine(pixels, w, h, cx, gy0, gy1, t, color);
+            .new_terminal => {
+                // cmux `terminal`: a ">" command prompt and an "_" cursor.
+                // Drawn without the enclosing rounded square (it reads as a
+                // terminal from the chevron alone and stays legible at small
+                // sizes; the square would crowd the glyph).
+                const pad = scaled(2, self.scale);
+                // ">" chevron: top-left -> center, then center -> bottom-left.
+                diag(pixels, w, h, gx0 + pad, gy0 + pad, cx, cy, t, color);
+                diag(pixels, w, h, cx, cy, gx0 + pad, gy1 - pad, t, color);
+                // "_" underscore (cursor) along the bottom, right of center.
+                hLine(pixels, w, h, cx, gx1 - pad, gy1 - pad, t, color);
             },
             .new_browser => {
-                // A globe ("web") icon: a ring crossed by BOTH a vertical
-                // meridian and a horizontal equator. The equator is the
-                // key feature that distinguishes it from the split glyph
-                // (which has only a vertical divider). Thin strokes keep
-                // the grid legible inside a small button. Crisp + tofu-free.
-                const thin = @max(@divFloor(t, 2), 1);
-                // Outer ring (approximates the globe's circle).
-                hLine(pixels, w, h, gx0, gx1, gy0, thin, color);
-                hLine(pixels, w, h, gx0, gx1, gy1 - thin, thin, color);
-                vLine(pixels, w, h, gx0, gy0, gy1, thin, color);
-                vLine(pixels, w, h, gx1 - thin, gy0, gy1, thin, color);
-                // Equator + meridian through the center.
-                hLine(pixels, w, h, gx0, gx1, cy, thin, color);
+                // cmux `globe`: a round circle crossed by a vertical meridian
+                // and a horizontal equator. Drawn as an actual circle (not a
+                // square) so it is unmistakably a globe and distinct from the
+                // square split glyphs.
+                const radius = @divFloor(@min(gx1 - gx0, gy1 - gy0), 2);
+                strokeCircle(pixels, w, h, cx, cy, radius, thin, color);
+                vLine(pixels, w, h, cx, cy - radius, cy + radius, thin, color);
+                hLine(pixels, w, h, cx - radius, cx + radius, cy, thin, color);
+            },
+            .split_right => {
+                // cmux `square.split.2x1`: a square split into two COLUMNS
+                // (a vertical divider down the middle).
+                drawBox(pixels, w, h, gx0, gy0, gx1, gy1, thin, color);
                 vLine(pixels, w, h, cx, gy0, gy1, thin, color);
             },
-            .split => {
-                // Two side-by-side rects with a gap (split-right glyph):
-                // an outer ring plus a vertical divider.
-                hLine(pixels, w, h, gx0, gx1, gy0, t, color);
-                hLine(pixels, w, h, gx0, gx1, gy1 - t, t, color);
-                vLine(pixels, w, h, gx0, gy0, gy1, t, color);
-                vLine(pixels, w, h, gx1 - t, gy0, gy1, t, color);
-                vLine(pixels, w, h, cx, gy0, gy1, t, color);
-            },
-            .close => {
-                // An "×": two diagonals.
-                diag(pixels, w, h, gx0, gy0, gx1, gy1, t, color); // top-left -> bottom-right
-                diag(pixels, w, h, gx0, gy1, gx1, gy0, t, color); // bottom-left -> top-right
+            .split_down => {
+                // cmux `square.split.1x2`: a square split into two ROWS
+                // (a horizontal divider across the middle).
+                drawBox(pixels, w, h, gx0, gy0, gx1, gy1, thin, color);
+                hLine(pixels, w, h, gx0, gx1, cy, thin, color);
             },
         }
     }
@@ -438,8 +435,50 @@ fn vLine(pixels: [*]u32, w: i32, h: i32, x: i32, y0: i32, y1: i32, t: i32, color
     }
 }
 
+/// Outline a rectangle [x0,x1) x [y0,y1) with a border of thickness `t`.
+/// Used for the two split-square glyphs.
+fn drawBox(pixels: [*]u32, w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, t: i32, color: u32) void {
+    hLine(pixels, w, h, x0, x1, y0, t, color); // top
+    hLine(pixels, w, h, x0, x1, y1 - t, t, color); // bottom
+    vLine(pixels, w, h, x0, y0, y1, t, color); // left
+    vLine(pixels, w, h, x1 - t, y0, y1, t, color); // right
+}
+
+/// One-pixel midpoint circle centered at (cx,cy). Plots the 8 octant
+/// symmetric points each step.
+fn midpointCircle(pixels: [*]u32, w: i32, h: i32, cx: i32, cy: i32, radius: i32, color: u32) void {
+    if (radius <= 0) return;
+    var x: i32 = radius;
+    var y: i32 = 0;
+    var err: i32 = 1 - radius;
+    while (x >= y) {
+        putPixel(pixels, w, h, cx + x, cy + y, color);
+        putPixel(pixels, w, h, cx - x, cy + y, color);
+        putPixel(pixels, w, h, cx + x, cy - y, color);
+        putPixel(pixels, w, h, cx - x, cy - y, color);
+        putPixel(pixels, w, h, cx + y, cy + x, color);
+        putPixel(pixels, w, h, cx - y, cy + x, color);
+        putPixel(pixels, w, h, cx + y, cy - x, color);
+        putPixel(pixels, w, h, cx - y, cy - x, color);
+        y += 1;
+        if (err < 0) {
+            err += 2 * y + 1;
+        } else {
+            x -= 1;
+            err += 2 * (y - x) + 1;
+        }
+    }
+}
+
+/// Stroke a circle of thickness `t` (t concentric midpoint circles) — the
+/// globe outline for the New Browser glyph.
+fn strokeCircle(pixels: [*]u32, w: i32, h: i32, cx: i32, cy: i32, radius: i32, t: i32, color: u32) void {
+    var k: i32 = 0;
+    while (k < t) : (k += 1) midpointCircle(pixels, w, h, cx, cy, radius - k, color);
+}
+
 /// Anti-alias-free diagonal line from (x0,y0) to (x1,y1) with a square
-/// brush of size `t` (Bresenham-ish). Used for the close "×".
+/// brush of size `t` (Bresenham-ish). Used for the terminal ">" chevron.
 fn diag(pixels: [*]u32, w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, t: i32, color: u32) void {
     const steps = @max(@abs(x1 - x0), @abs(y1 - y0));
     if (steps == 0) return;
@@ -595,11 +634,11 @@ test "unit: hitTest scales with DPI" {
     try testing.expectEqual(@as(?usize, null), hitTest(10, 40, 2.0));
 }
 
-test "unit: Action enum matches button order" {
-    try testing.expectEqual(@as(usize, 0), @intFromEnum(Action.new_tab));
+test "unit: Action enum matches cmux button order" {
+    try testing.expectEqual(@as(usize, 0), @intFromEnum(Action.new_terminal));
     try testing.expectEqual(@as(usize, 1), @intFromEnum(Action.new_browser));
-    try testing.expectEqual(@as(usize, 2), @intFromEnum(Action.split));
-    try testing.expectEqual(@as(usize, 3), @intFromEnum(Action.close));
+    try testing.expectEqual(@as(usize, 2), @intFromEnum(Action.split_right));
+    try testing.expectEqual(@as(usize, 3), @intFromEnum(Action.split_down));
     try testing.expectEqual(BUTTON_COUNT, @typeInfo(Action).@"enum".fields.len);
 }
 

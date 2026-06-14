@@ -2388,15 +2388,15 @@ fn paneButtonsNode(
 /// Routed from a corner-button overlay click (PaneButtons.on_click). The
 /// `window` opaque is this *Window; `pane` is validated by address before
 /// any action runs (it may have been closed since the overlay was
-/// positioned). New Tab/Browser/Split operate on the active pane, so the
-/// target pane is focused first; Close acts on the validated pane
-/// directly.
+/// positioned). All four actions (New Terminal / New Browser / Split Right
+/// / Split Down) operate on the active pane, so the target pane is brought
+/// to the foreground and focused first.
 pub fn onPaneButtonClick(window: *anyopaque, pane: *Pane, action: PaneButtonsMod.Action) void {
     const self: *Window = @ptrCast(@alignCast(window));
     if (self.closing) return;
     // Validate the pane still exists in this window (by address) and
     // bring its workspace/tab/pane to the foreground so the active-pane
-    // actions (New Tab/Browser/Split) target it.
+    // actions (New Terminal/Browser/Split Right/Split Down) target it.
     const loc = self.findLoc(pane) orelse return;
     const ws_idx = self.workspaceIndex(loc.ws);
     if (ws_idx != self.active_workspace) self.selectWorkspace(ws_idx);
@@ -2407,16 +2407,18 @@ pub fn onPaneButtonClick(window: *anyopaque, pane: *Pane, action: PaneButtonsMod
     pane.focus();
 
     switch (action) {
-        .new_tab => _ = self.addTabInherit() catch |err| {
-            log.err("corner New Tab failed: {}", .{err});
+        .new_terminal => _ = self.addTabInherit() catch |err| {
+            log.err("corner New Terminal failed: {}", .{err});
         },
         .new_browser => self.addBrowserTab() catch |err| {
             log.err("corner New Browser failed: {}", .{err});
         },
-        .split => self.newSplit(.right) catch |err| {
-            log.err("corner Split failed: {}", .{err});
+        .split_right => self.newSplit(.right) catch |err| {
+            log.err("corner Split Right failed: {}", .{err});
         },
-        .close => self.closeSplitPane(pane),
+        .split_down => self.newSplit(.down) catch |err| {
+            log.err("corner Split Down failed: {}", .{err});
+        },
     }
 }
 
