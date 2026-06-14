@@ -30,10 +30,16 @@ pub const Options = struct {
 ///   * `list [--workspace I]`: Print a JSON array of the target
 ///     workspace's tabs, one object per tab: `{index, title, active}`.
 ///
-///   * `new [--workspace I] [--command "..."]`: Add a tab and print its
-///     index as `{index: N}`. With `--command` the tab runs that command
-///     (split on whitespace into an argv); without it the tab inherits the
-///     active pane's backend (the same behavior as the tab bar "+").
+///   * `new [--workspace I] [--command "..."] [--focus]`: Add a tab and
+///     print its index as `{index: N}`. With `--command` the tab runs that
+///     command (split on whitespace into an argv); without it the tab
+///     inherits the active pane's backend (the same behavior as the tab
+///     bar "+"). By DEFAULT the tab is created in the background: the
+///     active workspace/tab does not change and the window is not raised
+///     (so an agent spawning tabs never yanks you out of your current
+///     app). Pass `--focus` to switch to the tab's workspace and select
+///     the new tab. The printed index is relative to the target workspace
+///     — the same index `list`/`close` use for that workspace.
 ///
 ///   * `select <index> [--workspace I]`: Make tab `<index>` active.
 ///
@@ -110,8 +116,11 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         var positional: ?[]const u8 = null;
         var workspace: ?u32 = null;
         var command: ?[]const u8 = null;
+        var focus = false;
         while (iter.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--workspace=")) {
+            if (std.mem.eql(u8, arg, "--focus")) {
+                focus = true;
+            } else if (std.mem.startsWith(u8, arg, "--workspace=")) {
                 workspace = std.fmt.parseInt(u32, arg["--workspace=".len..], 10) catch {
                     try stderr.print("invalid --workspace value\n", .{});
                     return 1;
@@ -170,6 +179,16 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
                 try argbuf.writer(alloc).print("\"command\":{f}", .{std.json.fmt(c, .{})});
                 have_field = true;
             }
+            // Non-focus is the default; only emit focus when opted in so a
+            // plain `tab new` stays a background create.
+            if (focus) {
+                if (have_field) try argbuf.append(alloc, ',');
+                try argbuf.writer(alloc).print("\"focus\":true", .{});
+                have_field = true;
+            }
+        } else if (focus) {
+            try stderr.print("--focus is only valid for 'new'\n", .{});
+            return 1;
         }
         try argbuf.append(alloc, '}');
 

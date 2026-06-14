@@ -6730,6 +6730,42 @@ pub const Keybinds = struct {
                 .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_split = .down },
             );
+            // Sidebar toggle + smart Ctrl+C / Ctrl+V: ALL win32 apprt only.
+            // On Linux/GTK there is no sidebar and ctrl+c must stay SIGINT
+            // (copy is ctrl+shift+c there), so none of these may be
+            // registered cross-platform — an unimplemented action would
+            // still CONSUME the key and silently swallow ^B / ^C before it
+            // reaches the terminal (breaking the tmux prefix and readline).
+            //
+            // `performable:` is load-bearing on ctrl+c: it makes the binding
+            // consume the key (copy) ONLY when there is a selection; with no
+            // selection copy_to_clipboard returns false and Ghostty acts as
+            // if the key were unbound, so ctrl+c still encodes ^C and
+            // interrupts the running process. ctrl+v pastes unconditionally
+            // (also marked performable to match the existing ctrl+shift+v
+            // default, but paste is always performable).
+            if (comptime build_config.app_runtime == .win32) {
+                // Toggle the workspace sidebar. ctrl+b mirrors VS Code's
+                // "Toggle Side Bar" / cmux's ⌘B. Note: ctrl+b is also the
+                // tmux prefix, so users running tmux may want to rebind it.
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true } },
+                    .{ .toggle_sidebar = {} },
+                );
+                try self.set.putFlags(
+                    alloc,
+                    .{ .key = .{ .unicode = 'c' }, .mods = .{ .ctrl = true } },
+                    .{ .copy_to_clipboard = .mixed },
+                    .{ .performable = true },
+                );
+                try self.set.putFlags(
+                    alloc,
+                    .{ .key = .{ .unicode = 'v' }, .mods = .{ .ctrl = true } },
+                    .{ .paste_from_clipboard = {} },
+                    .{ .performable = true },
+                );
+            }
             try self.set.putFlags(
                 alloc,
                 .{ .key = .{ .unicode = '[' }, .mods = .{ .ctrl = true, .super = true } },

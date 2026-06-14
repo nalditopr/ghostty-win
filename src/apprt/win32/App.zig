@@ -968,6 +968,16 @@ pub fn performAction(
             return true;
         },
 
+        .toggle_sidebar => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.toggleSidebar();
+                },
+            }
+            return true;
+        },
+
         .initial_size => {
             switch (target) {
                 .app => {},
@@ -1349,9 +1359,17 @@ pub fn performAction(
                 .surface => |core_surface| {
                     const win = core_surface.rt_surface.parent_window;
                     if (win.hwnd) |hwnd| {
-                        // ShowWindow(SW_RESTORE) brings back from minimize.
-                        _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
-                        _ = w32.SetForegroundWindow(hwnd);
+                        // Only un-minimize: SW_RESTORE on a *maximized*
+                        // window un-maximizes it to the restored rect, so a
+                        // notification click would shrink/resize a maximized
+                        // window. Gate on IsIconic so a maximized or normal
+                        // window keeps its size/maximized state untouched.
+                        if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+                        // Only move OS foreground when we already own it;
+                        // never yank the user out of another app (the
+                        // critical OS-foreground gate, applied to every
+                        // raise path).
+                        forceForegroundWindow(hwnd);
                         // Make sure the workspace AND tab containing this
                         // surface are active: select the workspace first
                         // (it re-lays out for the new tab count), then the
@@ -2457,7 +2475,11 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
     const loc = win.findLocOfSurface(surface) orelse return false;
 
     const win_hwnd = win.hwnd orelse return false;
-    _ = w32.ShowWindow(win_hwnd, w32.SW_RESTORE);
+    // Only un-minimize: SW_RESTORE on a *maximized* window un-maximizes it
+    // to the restored rect, so a notification-jump click would shrink/resize
+    // a maximized window. Gate on IsIconic so a maximized or normal window
+    // keeps its size/maximized state untouched.
+    if (w32.IsIconic(win_hwnd) != 0) _ = w32.ShowWindow(win_hwnd, w32.SW_RESTORE);
     // The click may land outside the target window (shell tray, another
     // window's sidebar), where Windows treats us as a background
     // process; a plain SetForegroundWindow would only flash the
@@ -3277,18 +3299,32 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
     const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
     if (window.is_quick_terminal) return IpcError.QuickTerminal;
 
-    const idx: usize = if (req.worktree_path) |path| blk: {
-        // newWorkspaceWithDir binds the cwd before the first tab spawns
-        // and collapses the slot on failure (returning null), so we never
-        // report an index for an empty workspace.
-        break :blk window.newWorkspaceWithDir(path) orelse return IpcError.NoWindow;
-    } else blk: {
+    // Programmatic creation defaults to NON-FOCUS: the workspace is created
+    // in the background and the user stays in whatever workspace (and
+    // whatever app) they were in. `--focus` (focus:true over IPC) opts in
+    // to switching the in-app active workspace to the new one. Matches
+    // cmux #3215: "workspace creation is not a focus-intent operation."
+    const focus = ipcArgBool(req, "focus") orelse false;
+
+    const idx: usize = if (focus) blk: {
+        // Focus path: create AND select the new workspace (the historical
+        // behavior), but never steal OS foreground from another app — the
+        // selectWorkspace/SetFocus only affects keyboard focus when this
+        // window is already foreground.
+        if (req.worktree_path) |path| {
+            break :blk window.newWorkspaceWithDir(path) orelse return IpcError.NoWindow;
+        }
         const before = window.workspace_count;
         window.newWorkspace();
         // newWorkspace collapses the slot if its first tab fails to spawn,
         // so confirm a workspace was actually added before reporting one.
         if (window.workspace_count <= before) return IpcError.NoWindow;
         break :blk window.workspace_count - 1;
+    } else blk: {
+        // Background path (default): create without changing the active
+        // workspace. newWorkspaceBackground collapses the slot on failure.
+        break :blk window.newWorkspaceBackground(req.worktree_path) orelse
+            return IpcError.NoWindow;
     };
 
     // Name precedence: explicit --name wins; otherwise a worktree
@@ -3361,31 +3397,51 @@ fn ipcTabNew(self: *App, req: *ipc.Request) anyerror!void {
     const server = self.ipc_server orelse return;
     const target = try self.ipcResolveWorkspace(req);
     const window = target.window;
+    const ws_idx = target.ws_idx;
     if (window.is_quick_terminal) return IpcError.QuickTerminal;
 
-    if (target.ws_idx != window.active_workspace) window.selectWorkspace(target.ws_idx);
+    // Programmatic creation defaults to NON-FOCUS: the tab is added to the
+    // target workspace in the background; the active workspace/tab does not
+    // change. `--focus` (focus:true) switches to the target workspace and
+    // selects the new tab. Matches cmux #3215 (applied to all create verbs)
+    // and the "create != focus" policy.
+    //
+    // The returned index is the new tab's index WITHIN THE TARGET
+    // WORKSPACE, the same index `+tab list --workspace <ws>` shows and
+    // `+tab close --workspace <ws>` accepts (BUG 2: previously this read
+    // the window's active-workspace active_tab, which could disagree with
+    // the workspace tab-list/close query when they targeted different
+    // workspaces).
+    const focus = ipcArgBool(req, "focus") orelse false;
 
+    if (focus and ws_idx != window.active_workspace)
+        window.selectWorkspace(ws_idx);
+
+    // Parse an optional explicit command (split on whitespace) once; an
+    // empty/whitespace-only command falls through to the inherit path.
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(self.core_app.alloc);
     if (ipcArgString(req, "command")) |command_str| {
-        const alloc = self.core_app.alloc;
-        // Split the command string on ASCII whitespace into an argv the
-        // surface deep-copies; an empty/whitespace-only command falls
-        // through to the inherit path.
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(alloc);
         var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
-        while (it.next()) |tok| try argv.append(alloc, tok);
-        if (argv.items.len > 0) {
-            _ = try window.addTabWithCommand(argv.items, null);
+        while (it.next()) |tok| try argv.append(self.core_app.alloc, tok);
+    }
+    const command: ?[]const []const u8 = if (argv.items.len > 0) argv.items else null;
+
+    const idx: usize = if (focus) blk: {
+        // After the (optional) selectWorkspace above, ws_idx is the active
+        // workspace; the interactive add-tab paths switch to and focus the
+        // new tab, and return its index.
+        if (command) |c| {
+            _ = try window.addTabWithCommand(c, null);
         } else {
             _ = try window.addTabInherit();
         }
-    } else {
-        _ = try window.addTabInherit();
-    }
+        break :blk window.activeWorkspace().active_tab;
+    } else if (command) |c|
+        try window.addTabBackground(ws_idx, c, null)
+    else
+        try window.addTabInheritBackground(ws_idx);
 
-    // addTab* inserts per config (current/end) and selects the new tab,
-    // so the active tab index is the new tab's index.
-    const idx = window.activeWorkspace().active_tab;
     var data_buf: [32]u8 = undefined;
     const data = std.fmt.bufPrint(&data_buf, "{{\"index\":{d}}}", .{idx}) catch
         return error.NoSpaceLeft;
@@ -3723,26 +3779,43 @@ fn ipcNewSplit(self: *App, req: *ipc.Request) anyerror!void {
     const window = target.window;
     if (window.is_quick_terminal) return IpcError.QuickTerminal;
 
-    if (target.ws_idx != window.active_workspace) window.selectWorkspace(target.ws_idx);
-    if (target.tab_idx != target.ws.active_tab) window.selectTabIndex(target.tab_idx);
-
-    if (ipcArgString(req, "command")) |command_str| {
-        const alloc = self.core_app.alloc;
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(alloc);
-        var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
-        while (it.next()) |tok| try argv.append(alloc, tok);
-        if (argv.items.len > 0) {
-            try window.newSplitWithCommand(direction, argv.items);
-        } else {
-            try window.newSplit(direction);
-        }
-    } else {
-        try window.newSplit(direction);
+    // Programmatic split defaults to NON-FOCUS: the split is created in the
+    // target tab's pane tree but the active workspace/tab/pane and OS
+    // foreground are NOT changed (a background pane, hidden until its tab is
+    // shown). `--focus` (focus:true) selects the target workspace+tab and
+    // focuses the new pane, the interactive split UX. Matches the
+    // "create != focus" policy applied to every create verb.
+    const focus = ipcArgBool(req, "focus") orelse false;
+    if (focus) {
+        if (target.ws_idx != window.active_workspace) window.selectWorkspace(target.ws_idx);
+        if (target.tab_idx != target.ws.active_tab) window.selectTabIndex(target.tab_idx);
     }
 
-    // newSplit* focus the new pane: it is now the tab's active pane.
-    const new_pane = window.getActivePane() orelse return IpcError.NoWindow;
+    // Parse an optional explicit command once (split on whitespace); an
+    // empty/whitespace-only command inherits the source pane's backend.
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(self.core_app.alloc);
+    if (ipcArgString(req, "command")) |command_str| {
+        var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
+        while (it.next()) |tok| try argv.append(self.core_app.alloc, tok);
+    }
+    const explicit: ?[]const []const u8 = if (argv.items.len > 0) argv.items else null;
+    // Inherit the source pane's backend when no explicit command (matching
+    // newSplit's inherit-from-active-pane behavior), read from the TARGET
+    // tab's active pane so a background split follows its own tab's shell.
+    const command: ?[]const []const u8 = explicit orelse blk: {
+        const src = target.ws.tab_active_pane[target.tab_idx].surface() orelse break :blk null;
+        break :blk src.spawn_command;
+    };
+
+    const new_pane = try window.newSplitInWorkspace(
+        target.ws_idx,
+        target.tab_idx,
+        direction,
+        command,
+        focus,
+    );
+
     const sid: u64 = ipcSurfaceId(new_pane) orelse 0;
     var data_buf: [32]u8 = undefined;
     const data = std.fmt.bufPrint(&data_buf, "{{\"id\":{d}}}", .{sid}) catch
@@ -4117,10 +4190,42 @@ pub fn dropDesktopNotifsForWindow(self: *App, window: *Window) void {
     }
 }
 
-/// Force a window to the foreground even when Ghostty is a background
-/// process. Uses AttachThreadInput to work around the Win32
-/// SetForegroundWindow restriction.
+/// Whether the current foreground window belongs to THIS process. The
+/// guard for every OS-foreground raise (forceForegroundWindow and the
+/// present_terminal raise): we only ever steal/move OS foreground when we
+/// already own it — switching between our own windows is fine, but we
+/// must NEVER yank the user out of another app (VS Code, Slack, the app
+/// an agent orchestrator is driving). Returns false when there is no
+/// foreground window (treat as "not ours" — don't grab it).
+pub fn foregroundIsOurs() bool {
+    const fg = w32.GetForegroundWindow() orelse return false;
+    var fg_pid: u32 = 0;
+    _ = w32.GetWindowThreadProcessId(fg, &fg_pid);
+    return fg_pid == w32.GetCurrentProcessId();
+}
+
+/// Raise a window of THIS process to the foreground, but ONLY when the
+/// current foreground window already belongs to us. When another
+/// application is foreground this is a no-op: the caller may still have
+/// restored/shown the window (it will flash its taskbar button) but we
+/// never steal OS foreground from another app. See foregroundIsOurs.
+/// This is the gate for every PROGRAMMATIC/notification raise
+/// (present_terminal, jumpToSurface, +notify next, --focus). The
+/// interactive QuickTerminal summon uses the ungated raiseForegroundWindow
+/// (user-pressed hotkey == explicit intent to come forward over any app).
 pub fn forceForegroundWindow(hwnd: w32.HWND) void {
+    if (!foregroundIsOurs()) return;
+    raiseForegroundWindow(hwnd);
+}
+
+/// Unconditionally raise `hwnd` to the OS foreground. Uses
+/// AttachThreadInput to work around the Win32 SetForegroundWindow
+/// restriction when the current foreground window belongs to another
+/// thread/process. The UNGATED primitive: only the interactive
+/// QuickTerminal summon (an explicit user hotkey) calls this directly;
+/// every programmatic/notification path goes through forceForegroundWindow
+/// so it can never yank the user out of another app.
+pub fn raiseForegroundWindow(hwnd: w32.HWND) void {
     const fg = w32.GetForegroundWindow();
     if (fg) |fg_hwnd| {
         const fg_tid = w32.GetWindowThreadProcessId(fg_hwnd, null);

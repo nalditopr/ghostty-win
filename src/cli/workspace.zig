@@ -29,9 +29,15 @@ pub const Options = struct {
 ///   * `list`: Print a JSON array of the target window's workspaces, one
 ///     object per workspace: `{index, name, active, tab_count}`.
 ///
-///   * `new [--name X] [--worktree <branch>] [--repo <path>]`: Create a
-///     new workspace (a sidebar row with one tab) and print its index as
-///     `{index: N}`. With `--worktree <branch>` the workspace is bound to
+///   * `new [--name X] [--worktree <branch>] [--repo <path>] [--focus]`:
+///     Create a new workspace (a sidebar row with one tab) and print its
+///     index as `{index: N}`. By DEFAULT the workspace is created in the
+///     BACKGROUND: the active workspace does not change and the window is
+///     not raised, so an agent orchestrator spawning workspaces never
+///     yanks you out of your current app (matching cmux's "workspace
+///     creation is not a focus-intent operation"). Pass `--focus` to
+///     switch the active workspace to the new one. With `--worktree
+///     <branch>` the workspace is bound to
 ///     a git worktree at `<repo>/.worktrees/<branch>`: Ghostty runs `git
 ///     worktree add` (creating the branch, or attaching it if it already
 ///     exists), the workspace is named after the branch (unless `--name`
@@ -119,8 +125,11 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         var name: ?[]const u8 = null;
         var worktree: ?[]const u8 = null;
         var repo: ?[]const u8 = null;
+        var focus = false;
         while (iter.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--name=")) {
+            if (std.mem.eql(u8, arg, "--focus")) {
+                focus = true;
+            } else if (std.mem.startsWith(u8, arg, "--name=")) {
                 name = try alloc.dupe(u8, arg["--name=".len..]);
             } else if (std.mem.eql(u8, arg, "--name")) {
                 const v = iter.next() orelse {
@@ -157,15 +166,15 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             }
         }
 
-        // --repo/--worktree are only meaningful to `new`.
-        if (sub != .new and (worktree != null or repo != null)) {
-            try stderr.print("--worktree/--repo are only valid for 'new'\n", .{});
+        // --repo/--worktree/--focus are only meaningful to `new`.
+        if (sub != .new and (worktree != null or repo != null or focus)) {
+            try stderr.print("--worktree/--repo/--focus are only valid for 'new'\n", .{});
             return 1;
         }
 
         const request = switch (sub) {
             .list => try alloc.dupe(u8, "{\"id\":1,\"cmd\":\"workspace-list\"}\n"),
-            .new => try buildNewRequest(alloc, name, worktree, repo, stderr) orelse return 1,
+            .new => try buildNewRequest(alloc, name, worktree, repo, focus, stderr) orelse return 1,
             .select => req: {
                 const idx = try parseIndex(positional, stderr) orelse return 1;
                 break :req try std.fmt.allocPrint(
@@ -199,6 +208,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         name: ?[]const u8,
         worktree: ?[]const u8,
         repo: ?[]const u8,
+        focus: bool,
         stderr: *std.Io.Writer,
     ) !?[]u8 {
         var args_buf: std.ArrayList(u8) = .empty;
@@ -236,6 +246,13 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
                 try sep(w, &first);
                 try w.print("\"repo\":{f}", .{std.json.fmt(r, .{})});
             }
+        }
+
+        // Non-focus is the default; only emit focus when opted in so a
+        // plain `workspace new` stays a background create.
+        if (focus) {
+            try sep(w, &first);
+            try w.print("\"focus\":true", .{});
         }
 
         if (first) {

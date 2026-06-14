@@ -566,6 +566,10 @@ pub extern "user32" fn IsZoomed(
     hWnd: HWND,
 ) callconv(.winapi) i32;
 
+pub extern "user32" fn IsIconic(
+    hWnd: HWND,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn SetCursor(
     // NULL is documented as valid — it hides the cursor. Make the
     // parameter optional so callers can pass null without a cast.
@@ -1308,6 +1312,8 @@ pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WA_INACTIVE: u16 = 0;
 
 pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
+
+pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
 pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 

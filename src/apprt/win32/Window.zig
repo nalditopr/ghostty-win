@@ -11,6 +11,8 @@ const internal_os = @import("../../os/main.zig");
 const App = @import("App.zig");
 const AttentionRing = @import("AttentionRing.zig").AttentionRing;
 const BrowserPane = @import("BrowserPane.zig");
+const PaneButtonsMod = @import("PaneButtons.zig");
+const PaneButtons = PaneButtonsMod.PaneButtons;
 const Pane = @import("Pane.zig");
 const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
@@ -46,6 +48,11 @@ const MAX_TABS: usize = 64;
 
 /// Maximum number of workspaces per window.
 const MAX_WORKSPACES: usize = 16;
+
+/// Width (unscaled px) of the thin re-show strip painted at the window's
+/// left edge while the sidebar is runtime-hidden. Clicking it (or Ctrl+B)
+/// brings the sidebar back. Kept narrow so it barely covers the surface.
+const RESHOW_STRIP_BASE: f32 = 8.0;
 
 /// Per-tab status indicator shown in the session sidebar.
 pub const TabStatus = enum { normal, bell, exited };
@@ -457,6 +464,14 @@ drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 sidebar_width_override: ?u32 = null,
 dragging_sidebar: bool = false,
 
+/// Session-only runtime hide of the sidebar, toggled by `toggle_sidebar`
+/// (Ctrl+B), the header collapse chevron, and the re-show edge strip.
+/// Overrides `window-show-sidebar` for the life of the window; NOT
+/// persisted. Reset to false in onConfigChange so a config reload
+/// re-asserts the configured visibility (matching how
+/// sidebar_width_override is dropped on reload).
+sidebar_hidden: bool = false,
+
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
 /// and the dispatch, queued mouse/keyboard messages can otherwise reach
@@ -478,6 +493,14 @@ max_track_h: i32 = 0,
 /// active tab; surplus rings are hidden. Created lazily so windows that
 /// never see an attention signal pay nothing. Freed in deinit().
 attention_rings: std.ArrayList(*AttentionRing) = .empty,
+
+/// Pool of per-pane corner-button overlays (clickable layered popups),
+/// grown on demand by updatePaneButtons and reused across layouts. v1
+/// policy: one overlay on the active workspace/tab's FOCUSED pane only
+/// (a cheap "where the user is" signal); surplus pool entries are hidden.
+/// Created lazily so windows that never need one pay nothing. Freed in
+/// deinit().
+pane_buttons: std.ArrayList(*PaneButtons) = .empty,
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -518,8 +541,10 @@ pub fn onConfigChange(self: *Window) void {
     }
     // window-show-sidebar / window-sidebar-width may have changed:
     // drop any drag-resize override so the config value re-applies,
-    // then recompute chrome layout and repaint.
+    // then recompute chrome layout and repaint. The runtime hide is
+    // session-only and re-asserts the configured visibility on reload.
     self.sidebar_width_override = null;
+    self.sidebar_hidden = false;
     self.updateTabBarVisibility();
     self.handleResize();
     self.invalidateSidebar();
@@ -531,6 +556,12 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         .app = app,
         .is_quick_terminal = options.is_quick_terminal,
     };
+
+    // Route corner-button overlay clicks back into Window. A process-wide
+    // fn pointer (the overlay WndProc has no Window import) — idempotent
+    // across windows since onPaneButtonClick recovers the *Window from the
+    // overlay's bound owner pointer.
+    PaneButtonsMod.on_click = onPaneButtonClick;
 
     // Value-init the first workspace before any addTab(): the workspaces
     // array is `undefined`, and the tab_status @splat default only applies
@@ -788,6 +819,11 @@ pub fn deinit(self: *Window) void {
     for (self.attention_rings.items) |ring| ring.destroy();
     self.attention_rings.deinit(self.app.core_app.alloc);
 
+    // Destroy the per-pane corner-button overlays (owned popups) before
+    // the owner window so they never outlive it.
+    for (self.pane_buttons.items) |pb| pb.destroy();
+    self.pane_buttons.deinit(self.app.core_app.alloc);
+
     // Delete the tab bar font.
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);
@@ -815,9 +851,48 @@ pub fn tabBarHeight(self: *const Window) i32 {
 pub fn sidebarWidth(self: *const Window) i32 {
     if (self.closing or self.is_quick_terminal) return 0;
     if (!self.app.config.@"window-show-sidebar") return 0;
+    if (self.sidebar_hidden) return 0;
     const unscaled = self.sidebar_width_override orelse self.app.config.@"window-sidebar-width";
     const width = std.math.clamp(unscaled, Sidebar.MIN_WIDTH, Sidebar.MAX_WIDTH);
     return @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
+}
+
+/// Whether the re-show edge strip (the thin affordance that brings the
+/// sidebar back when it is runtime-hidden) should be painted/hit-tested
+/// right now: the sidebar is enabled by config but hidden this session.
+/// QuickTerminals have no sidebar so never show the strip.
+pub fn sidebarReshowStripVisible(self: *const Window) bool {
+    if (self.closing or self.is_quick_terminal) return false;
+    if (!self.app.config.@"window-show-sidebar") return false;
+    return self.sidebar_hidden;
+}
+
+/// Width of the re-show edge strip in DPI-scaled pixels. Kept thin (8px)
+/// so it barely eats surface width; surfaceRect reserves exactly this much
+/// at the left edge while hidden so the GL/WebView2 child does not occlude
+/// the parent-painted strip.
+pub fn sidebarReshowStripWidth(self: *const Window) i32 {
+    return @intFromFloat(@round(@as(f32, RESHOW_STRIP_BASE) * self.scale));
+}
+
+/// Toggle the runtime (session-only) sidebar hide. No-op on a quick
+/// terminal (it has no sidebar). Flips the bool, cancels any in-flight
+/// edge drag, then relays out the panes + repaints chrome + re-glues the
+/// overlays (handleResize routes through layoutSplits). Distinct from the
+/// `window-show-sidebar` config: a config reload re-asserts the
+/// configured visibility (onConfigChange resets sidebar_hidden).
+pub fn toggleSidebar(self: *Window) void {
+    if (self.is_quick_terminal) return;
+    self.sidebar_hidden = !self.sidebar_hidden;
+    // Abort any half-finished edge drag: the grab band disappears when
+    // the width is 0, so a captured drag would otherwise dangle.
+    self.dragging_sidebar = false;
+    // Switching to/from a 0 width changes surfaceRect; relayout panes,
+    // repaint the tab bar + sidebar, and re-glue the over-GL overlays.
+    self.handleResize();
+    // The re-show strip lives over the surface's left edge (paintChrome
+    // draws it when hidden); force a full repaint so it appears/clears.
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
 }
 
 /// Whether the sidebar should render the metadata second line on its rows
@@ -856,6 +931,12 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
     }
     rect.top += self.tabBarHeight();
     rect.left += self.sidebarWidth();
+    // While the sidebar is runtime-hidden, reserve the thin re-show strip
+    // at the left edge so the GL/WebView2 child does not cover it (a
+    // parent-window GDI strip painted inside the surface rect would be
+    // occluded by the child HWND). Only 8px, so it barely shrinks the
+    // surface; the WM_LBUTTONDOWN handler hit-tests the strip first.
+    if (self.sidebarReshowStripVisible()) rect.left += self.sidebarReshowStripWidth();
     return rect;
 }
 
@@ -924,6 +1005,23 @@ pub fn findLocOfSurface(self: *Window, surface: *Surface) ?Loc {
         }
     }
     return null;
+}
+
+/// Where a newly created tab is inserted into a workspace's tab arrays,
+/// per the `window-new-tab-position` config: `.current` puts it right
+/// after the active tab (or at 0 when empty), `.end` appends. Pure and
+/// HWND-free so the create/list/close index contract is unit-testable:
+/// the returned position is the index the new tab will occupy AND
+/// (because the new tab becomes active) the index `tab-new` reports,
+/// `tab-list` enumerates, and `tab-close` accepts — they must agree. The
+/// result is always <= count (a valid post-insert index, < new
+/// tab_count). Shared by addTabWithCommand, addTabBackground, and
+/// addBrowserTab.
+fn newTabInsertPos(pos_cfg: anytype, count: usize, active: usize) usize {
+    return switch (pos_cfg) {
+        .current => if (count > 0) active + 1 else 0,
+        .end => count,
+    };
 }
 
 /// Shift entries [pos, count) right by one in every array of the
@@ -1057,10 +1155,7 @@ pub fn addTabWithCommand(
     errdefer tree.deinit(); // tree.deinit() calls unref() which deinits+frees the pane
 
     // Determine insert position based on config.
-    const pos: usize = switch (self.app.config.@"window-new-tab-position") {
-        .current => if (ws.tab_count > 0) ws.active_tab + 1 else 0,
-        .end => ws.tab_count,
-    };
+    const pos: usize = newTabInsertPos(self.app.config.@"window-new-tab-position", ws.tab_count, ws.active_tab);
 
     // Shift elements right to make room at pos.
     tabArraysInsertGap(ws.tabArrays(), ws.tab_count, pos);
@@ -1124,6 +1219,109 @@ pub fn addTabWithCommand(
     return surface;
 }
 
+/// Add a tab to a workspace that need not be the active one, WITHOUT
+/// switching to it or moving focus. Mirrors addTabWithCommand's per-tab
+/// bookkeeping but targets `ws_idx` and keeps the background workspace's
+/// panes hidden (the freshly created child HWND is hidden right after
+/// Surface.init shows it). When `ws_idx` IS the active workspace this
+/// delegates to addTabWithCommand so the active-tab switch/focus behaves
+/// exactly as the interactive "+" path. `command` mirrors
+/// addTabWithCommand (null = the configured default shell). Used by the
+/// agent IPC `+tab new` (no `--focus`): the new tab exists in the
+/// background and `selectTabIndex`/`selectWorkspace` shows it later.
+/// Returns the new tab's index within `ws_idx`.
+pub fn addTabBackground(
+    self: *Window,
+    ws_idx: usize,
+    command: ?[]const []const u8,
+    title: ?[]const u8,
+) !usize {
+    if (self.closing) return error.WindowClosing;
+    if (ws_idx >= self.workspace_count) return error.NoWindow;
+    // Active workspace: identical to the interactive new-tab path (it
+    // both switches to and focuses the new tab — correct, since the user
+    // is already looking at this workspace and an explicit IPC add to the
+    // foreground workspace is reasonably a focus event there).
+    if (ws_idx == self.active_workspace) {
+        _ = try self.addTabWithCommand(command, title);
+        return self.activeWorkspace().active_tab;
+    }
+
+    const ws = &self.workspaces[ws_idx];
+    if (ws.tab_count >= MAX_TABS) return error.TooManyTabs;
+    self.cancelTabRename();
+
+    const alloc = self.app.core_app.alloc;
+    const surface = try alloc.create(Surface);
+    try surface.init(self.app, self, .tab, command, ws.working_dir);
+    const pane = Pane.create(alloc, surface) catch |err| {
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
+    var tree = SplitTree(Pane).init(alloc, pane) catch |err| {
+        alloc.destroy(pane);
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
+    errdefer tree.deinit();
+
+    // Background workspace: hide the child HWND Surface.init showed so it
+    // never paints over the visible workspace.
+    if (surface.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+
+    const pos: usize = newTabInsertPos(self.app.config.@"window-new-tab-position", ws.tab_count, ws.active_tab);
+
+    tabArraysInsertGap(ws.tabArrays(), ws.tab_count, pos);
+    ws.tab_trees[pos] = tree;
+    ws.tab_active_pane[pos] = pane;
+    ws.tab_status[pos] = .normal;
+    // Reset orchestration metadata for the freshly-occupied slot (the gap
+    // insert shifts toward the tail, leaving the old [pos] values), matching
+    // addTabWithCommand so a background tab never inherits a prior tab's
+    // status/progress/log.
+    ws.tab_status_text_len[pos] = 0;
+    ws.tab_progress[pos] = null;
+    ws.tab_log[pos].clear();
+    ws.tab_count += 1;
+
+    const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    @memcpy(ws.tab_titles[pos][0..default_title.len], default_title);
+    ws.tab_title_lens[pos] = @intCast(default_title.len);
+    if (title) |t| {
+        const wlen = std.unicode.utf8ToUtf16Le(
+            &ws.tab_titles[pos],
+            t[0..@min(t.len, 255)],
+        ) catch 0;
+        if (wlen > 0) ws.tab_title_lens[pos] = @intCast(@min(wlen, 255));
+    }
+
+    // Make the new tab the workspace's own active tab so a later switch
+    // lands on it (its panes stay hidden until then). The previously
+    // active tab of THIS background workspace is already hidden, so no
+    // hide is needed here.
+    ws.active_tab = pos;
+    self.invalidateSidebar();
+    return pos;
+}
+
+/// Like addTabBackground but inherits the source tab's backend, the
+/// non-focus counterpart to addTabInherit. The backend is read from the
+/// TARGET workspace's active tab (not the window's active workspace), so
+/// a background `+tab new` follows the shell of the workspace it lands in.
+pub fn addTabInheritBackground(self: *Window, ws_idx: usize) !usize {
+    if (ws_idx >= self.workspace_count) return error.NoWindow;
+    const command: ?[]const []const u8 = blk: {
+        const ws = &self.workspaces[ws_idx];
+        if (ws.tab_count == 0) break :blk null;
+        const src = ws.tab_active_pane[ws.active_tab].surface() orelse break :blk null;
+        break :blk src.spawn_command;
+    };
+    const title: ?[]const u8 = if (command) |argv| titleForCommand(argv) else null;
+    return self.addTabBackground(ws_idx, command, title);
+}
+
 /// Add a browser (WebView2) pane as a new tab. Mirrors
 /// addTabWithCommand's tab-array bookkeeping with a BrowserPane leaf
 /// instead of a terminal surface; the title is "Browser" until the
@@ -1159,10 +1357,7 @@ pub fn addBrowserTab(self: *Window) !void {
     };
 
     // Determine insert position based on config.
-    const pos: usize = switch (self.app.config.@"window-new-tab-position") {
-        .current => if (ws.tab_count > 0) ws.active_tab + 1 else 0,
-        .end => ws.tab_count,
-    };
+    const pos: usize = newTabInsertPos(self.app.config.@"window-new-tab-position", ws.tab_count, ws.active_tab);
 
     // Shift elements right to make room at pos.
     tabArraysInsertGap(ws.tabArrays(), ws.tab_count, pos);
@@ -1454,6 +1649,7 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.invalidateSidebar();
     self.invalidateTabBar();
     self.updateAttentionRings();
+    self.updatePaneButtons();
 }
 
 /// Switch to the workspace at the given index. Hides the outgoing
@@ -1520,6 +1716,7 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     self.invalidateTabBar();
     self.invalidateSidebar();
     self.updateAttentionRings();
+    self.updatePaneButtons();
 
     // Refresh the now-visible workspace's sidebar metadata off-thread (the
     // periodic timer only scans the active workspace, so a freshly-focused
@@ -1605,6 +1802,121 @@ pub fn newWorkspaceWithDir(self: *Window, working_dir: []const u8) ?usize {
     // needs the directory.
     self.app.refreshWorkspaceMetadataNow(self, idx);
     return idx;
+}
+
+/// Create a new workspace slot (a new sidebar row) WITHOUT selecting it
+/// and WITHOUT touching the active workspace. The counterpart to
+/// createAndSelectWorkspace's create-half, kept separate so the agent IPC
+/// (`+workspace new` without `--focus`) can create a background workspace
+/// the user is NOT yanked into. Returns the new index, or null for
+/// QuickTerminal or when MAX_WORKSPACES is reached. Callers MUST populate
+/// it with one tab (and collapse via collapseEmptyWorkspaceSlot on
+/// failure) so the "every workspace has at least one tab" invariant holds.
+fn createWorkspaceSlot(self: *Window) ?usize {
+    if (!canCreateWorkspace(self.is_quick_terminal, self.workspace_count)) return null;
+    self.cancelTabRename();
+    const idx = self.workspace_count;
+    self.workspaces[idx] = .{};
+    self.workspace_count += 1;
+    return idx;
+}
+
+/// Add the first tab to a workspace that is NOT the active one, keeping
+/// the active workspace visible and focused. Mirrors addTabWithCommand's
+/// per-tab bookkeeping but targets `ws_idx` explicitly and, crucially,
+/// HIDES the freshly created surface's child HWND: Surface.init shows the
+/// child (it needs a visible, sized window to spawn its ConPTY), which
+/// would otherwise paint the background workspace's pane over the visible
+/// one. The hidden pane is laid out and shown the first time
+/// selectWorkspace switches to this workspace, matching the
+/// background-workspace discipline used by closeTabInWorkspace /
+/// closeSplitPane. The new tab becomes the workspace's own active_tab
+/// (index 0) so a later switch lands on it.
+fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
+    if (self.closing) return error.WindowClosing;
+    if (ws_idx >= self.workspace_count) return error.NoWindow;
+    const ws = &self.workspaces[ws_idx];
+    std.debug.assert(ws.tab_count == 0);
+
+    const alloc = self.app.core_app.alloc;
+    const surface = try alloc.create(Surface);
+    try surface.init(self.app, self, .tab, null, ws.working_dir);
+    const pane = Pane.create(alloc, surface) catch |err| {
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
+    var tree = SplitTree(Pane).init(alloc, pane) catch |err| {
+        alloc.destroy(pane);
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
+    errdefer tree.deinit();
+
+    // Hide the child HWND Surface.init just showed: this workspace is not
+    // active, so its pane must not be visible over the active workspace.
+    if (surface.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+
+    // First (and only) tab goes in slot 0. The slot was just value-inited
+    // by createWorkspaceSlot, so the orchestration metadata arrays
+    // (tab_status, tab_status_text_len, tab_progress, tab_log) already
+    // hold their clean defaults — no per-tab reset is needed here.
+    ws.tab_trees[0] = tree;
+    ws.tab_active_pane[0] = pane;
+    ws.tab_status[0] = .normal;
+    const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    @memcpy(ws.tab_titles[0][0..default_title.len], default_title);
+    ws.tab_title_lens[0] = @intCast(default_title.len);
+    ws.active_tab = 0;
+    ws.tab_count = 1;
+
+    self.invalidateSidebar();
+}
+
+/// Like newWorkspace / newWorkspaceWithDir, but creates the workspace in
+/// the BACKGROUND: the active workspace does not change and the user is
+/// not pulled in. Used by the agent IPC `+workspace new` (no `--focus`),
+/// the non-focus default for programmatic creation. `working_dir` (an
+/// owned-by-caller path; copied here) binds the workspace to a git
+/// worktree like newWorkspaceWithDir; null keeps the configured cwd.
+/// Returns the new index, or null when the workspace could not be created
+/// (QuickTerminal, MAX_WORKSPACES) or its first tab failed to spawn (the
+/// slot is collapsed back).
+pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8) ?usize {
+    const idx = self.createWorkspaceSlot() orelse return null;
+    if (working_dir) |dir| {
+        self.workspaces[idx].setWorkingDir(self.app.core_app.alloc, dir) catch {
+            self.collapseEmptyWorkspaceSlot(idx);
+            return null;
+        };
+    }
+    self.addFirstTabBackground(idx) catch |err| {
+        log.err("failed to create first tab for background workspace: {}", .{err});
+        self.collapseEmptyWorkspaceSlot(idx);
+        return null;
+    };
+    self.invalidateSidebar();
+    // Surface git/port metadata for a worktree-bound workspace right away
+    // (matches newWorkspaceWithDir); harmless for a plain background slot.
+    if (working_dir != null) self.app.refreshWorkspaceMetadataNow(self, idx);
+    return idx;
+}
+
+/// Drop a background workspace slot whose first tab failed to spawn,
+/// WITHOUT going through closeWorkspace (which would re-select a survivor
+/// and could close the window when this is the last slot — neither is
+/// wanted for a never-shown background slot). The slot is the last one
+/// (createWorkspaceSlot appends), is empty (tab_count == 0), and is not
+/// the active workspace, so dropping it is pure bookkeeping: free its
+/// worktree binding and decrement the count.
+fn collapseEmptyWorkspaceSlot(self: *Window, idx: usize) void {
+    if (idx + 1 != self.workspace_count) return;
+    if (idx == self.active_workspace) return;
+    self.workspaces[idx].freeWorkingDir(self.app.core_app.alloc);
+    self.workspaces[idx] = .{};
+    self.workspace_count -= 1;
+    self.invalidateSidebar();
 }
 
 /// Set workspace `idx`'s sidebar name from a UTF-8 string, mirroring the
@@ -1810,6 +2122,9 @@ pub fn layoutSplits(self: *Window) void {
     // Keep the notification rings glued to the just-laid-out panes
     // (resize/split/zoom all flow through here).
     self.updateAttentionRings();
+    // Re-glue the per-pane corner buttons too (after the rings so the
+    // clickable cluster is never occluded by a ring popup).
+    self.updatePaneButtons();
 }
 
 fn layoutNode(self: *Window, tree: SplitTree(Pane), handle: SplitTree(Pane).Node.Handle, rect: w32.RECT) void {
@@ -1945,6 +2260,163 @@ fn attentionRingNode(
                 self.attentionRingNode(hwnd, tree, s.right, bottom_rect, focused, next);
             }
         },
+    }
+}
+
+/// Reconcile the per-pane corner-button overlays with the current layout.
+/// Policy: show a cluster on EVERY visible leaf pane of the active
+/// workspace's active tab (every pane gets its action icons, always — not
+/// just the focused one). Panes in other tabs/workspaces are not visible,
+/// so they carry no cluster. A zoomed tab shows only its focused pane, so
+/// it gets a single cluster. Cheap to call after any layout/focus change.
+/// Runs AFTER updateAttentionRings each pass (called second in layoutSplits)
+/// so the clickable cluster's popup is never occluded by a ring popup at the
+/// shared top-right corner. Safe to call repeatedly; surplus overlays in
+/// the pool are hidden.
+pub fn updatePaneButtons(self: *Window) void {
+    // No chrome on a closing/empty window: hide everything.
+    const hwnd = self.hwnd orelse return self.hideAllPaneButtons();
+    if (self.closing) return self.hideAllPaneButtons();
+    // QuickTerminals are bare popups with no tab/pane chrome.
+    if (self.is_quick_terminal) return self.hideAllPaneButtons();
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return self.hideAllPaneButtons();
+
+    const tree = ws.tab_trees[ws.active_tab];
+    const focused = ws.tab_active_pane[ws.active_tab];
+
+    var next: usize = 0;
+
+    // Locate the focused pane's content rect by walking the same split
+    // geometry layoutNode uses, then place one cluster at its top-right.
+    if (tree.zoomed) |zoomed_handle| {
+        // A zoomed tab shows the focused pane full-bleed; place the
+        // cluster at the full surface rect's top-right.
+        _ = zoomed_handle;
+        self.placePaneButton(hwnd, focused, self.surfaceRect(), &next);
+    } else {
+        self.paneButtonsNode(hwnd, tree, .root, self.surfaceRect(), &next);
+    }
+
+    // Hide any overlays beyond the one we positioned this pass.
+    var i = next;
+    while (i < self.pane_buttons.items.len) : (i += 1) {
+        self.pane_buttons.items[i].hide();
+    }
+}
+
+/// Hide every corner-button overlay in the pool.
+fn hideAllPaneButtons(self: *Window) void {
+    for (self.pane_buttons.items) |pb| pb.hide();
+}
+
+/// Borrow overlay slot `idx` from the pool, growing it (creating a new
+/// layered popup) on demand. Returns null if creation fails (the cluster
+/// is then simply skipped — a GDI handle shortage degrades to "no corner
+/// icons", which is non-fatal).
+fn paneButtonsAt(self: *Window, idx: usize, hwnd: w32.HWND) ?*PaneButtons {
+    if (idx < self.pane_buttons.items.len) {
+        const pb = self.pane_buttons.items[idx];
+        pb.setScale(self.scale);
+        return pb;
+    }
+    const pb = PaneButtons.create(self.app.core_app.alloc, self.app.hinstance, hwnd) catch return null;
+    pb.setScale(self.scale);
+    self.pane_buttons.append(self.app.core_app.alloc, pb) catch {
+        pb.destroy();
+        return null;
+    };
+    return pb;
+}
+
+/// Position one corner-button overlay around `pane`'s client rect (in
+/// client coords; converted to screen here), binding it to the pane and
+/// this window. `next` is the running count of overlays used this pass.
+fn placePaneButton(self: *Window, hwnd: w32.HWND, pane: *Pane, rect: w32.RECT, next: *usize) void {
+    const pb = self.paneButtonsAt(next.*, hwnd) orelse return;
+    var tl = w32.POINT{ .x = rect.left, .y = rect.top };
+    var br = w32.POINT{ .x = rect.right, .y = rect.bottom };
+    _ = w32.ClientToScreen(hwnd, &tl);
+    _ = w32.ClientToScreen(hwnd, &br);
+    pb.positionAt(
+        .{ .left = tl.x, .top = tl.y, .right = br.x, .bottom = br.y },
+        pane,
+        @ptrCast(self),
+    );
+    next.* += 1;
+}
+
+/// Walk the tab tree mirroring layoutNode's geometry; place a corner
+/// cluster on EVERY leaf pane so the action icons are visible on all
+/// panes at all times (not just the focused one). Mirrors
+/// attentionRingNode's recursion exactly so the geometry agrees.
+fn paneButtonsNode(
+    self: *Window,
+    hwnd: w32.HWND,
+    tree: SplitTree(Pane),
+    handle: SplitTree(Pane).Node.Handle,
+    rect: w32.RECT,
+    next: *usize,
+) void {
+    if (handle.idx() >= tree.nodes.len) return;
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |view| {
+            // Every leaf pane gets its own always-visible corner cluster.
+            self.placePaneButton(hwnd, view, rect, next);
+        },
+        .split => |s| {
+            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
+            if (s.layout == .horizontal) {
+                const total_w = rect.right - rect.left;
+                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
+                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+                self.paneButtonsNode(hwnd, tree, s.left, left_rect, next);
+                self.paneButtonsNode(hwnd, tree, s.right, right_rect, next);
+            } else {
+                const total_h = rect.bottom - rect.top;
+                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
+                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
+                self.paneButtonsNode(hwnd, tree, s.left, top_rect, next);
+                self.paneButtonsNode(hwnd, tree, s.right, bottom_rect, next);
+            }
+        },
+    }
+}
+
+/// Routed from a corner-button overlay click (PaneButtons.on_click). The
+/// `window` opaque is this *Window; `pane` is validated by address before
+/// any action runs (it may have been closed since the overlay was
+/// positioned). New Tab/Browser/Split operate on the active pane, so the
+/// target pane is focused first; Close acts on the validated pane
+/// directly.
+pub fn onPaneButtonClick(window: *anyopaque, pane: *Pane, action: PaneButtonsMod.Action) void {
+    const self: *Window = @ptrCast(@alignCast(window));
+    if (self.closing) return;
+    // Validate the pane still exists in this window (by address) and
+    // bring its workspace/tab/pane to the foreground so the active-pane
+    // actions (New Tab/Browser/Split) target it.
+    const loc = self.findLoc(pane) orelse return;
+    const ws_idx = self.workspaceIndex(loc.ws);
+    if (ws_idx != self.active_workspace) self.selectWorkspace(ws_idx);
+    if (loc.ws.active_tab != loc.tab) self.selectTabIndex(loc.tab);
+    // Make the clicked pane the focused one within its tab so the
+    // active-pane operations split/inherit from it.
+    loc.ws.tab_active_pane[loc.tab] = pane;
+    pane.focus();
+
+    switch (action) {
+        .new_tab => _ = self.addTabInherit() catch |err| {
+            log.err("corner New Tab failed: {}", .{err});
+        },
+        .new_browser => self.addBrowserTab() catch |err| {
+            log.err("corner New Browser failed: {}", .{err});
+        },
+        .split => self.newSplit(.right) catch |err| {
+            log.err("corner Split failed: {}", .{err});
+        },
+        .close => self.closeSplitPane(pane),
     }
 }
 
@@ -2167,7 +2639,8 @@ pub fn newSplit(self: *Window, direction: SplitTree(Pane).Split.Direction) !void
 /// Like newSplit, but with an explicit command override (the backend
 /// picker) instead of inheriting the source pane's backend. Null runs
 /// the configured default. The argv is copied by Surface.init, so the
-/// caller's memory may be freed once this returns.
+/// caller's memory may be freed once this returns. Splits the ACTIVE
+/// workspace's active tab and focuses the new pane (the interactive UX).
 pub fn newSplitWithCommand(
     self: *Window,
     direction: SplitTree(Pane).Split.Direction,
@@ -2175,11 +2648,36 @@ pub fn newSplitWithCommand(
 ) !void {
     const ws = self.activeWorkspace();
     if (ws.tab_count == 0) return;
-    const alloc = self.app.core_app.alloc;
-    const tab = ws.active_tab;
+    _ = try self.newSplitInWorkspace(self.active_workspace, ws.active_tab, direction, command, true);
+}
 
-    const active_pane = ws.tab_active_pane[tab];
-    const handle = ws.findHandle(tab, active_pane) orelse return;
+/// Split the active pane of (ws_idx, tab_idx) — which need NOT be the
+/// active workspace/tab — in `direction`. With `focus` true this is the
+/// interactive split: the new pane is focused and the tab re-laid-out (the
+/// caller must have selected the workspace/tab so it is the active one).
+/// With `focus` false this is the background (agent `+split` without
+/// `--focus`) path: the new pane is created and inserted into the tab tree
+/// but the active workspace/tab/pane is NOT changed and the new pane's
+/// child HWND is kept hidden (it is shown on the next layoutSplits when its
+/// workspace+tab becomes active), so a programmatic split never yanks the
+/// user's focus or foreground. Returns the new pane. `command` mirrors
+/// newSplitWithCommand (null inherits/defaults; the argv is copied).
+pub fn newSplitInWorkspace(
+    self: *Window,
+    ws_idx: usize,
+    tab_idx: usize,
+    direction: SplitTree(Pane).Split.Direction,
+    command: ?[]const []const u8,
+    focus: bool,
+) !*Pane {
+    if (self.closing) return error.WindowClosing;
+    if (ws_idx >= self.workspace_count) return error.NoWindow;
+    const ws = &self.workspaces[ws_idx];
+    if (tab_idx >= ws.tab_count) return error.UnknownTab;
+    const alloc = self.app.core_app.alloc;
+
+    const active_pane = ws.tab_active_pane[tab_idx];
+    const handle = ws.findHandle(tab_idx, active_pane) orelse return error.UnknownPane;
 
     // Create new surface.
     const new_surface = try alloc.create(Surface);
@@ -2191,6 +2689,14 @@ pub fn newSplitWithCommand(
     // (split-inherit-working-directory), so they need no explicit
     // worktree override here.
     try new_surface.init(self.app, self, .split, command, null);
+
+    // A background split (the target tab is not the visible active tab)
+    // must hide the child HWND Surface.init showed so it never paints over
+    // the active tab; layoutSplits shows it when this tab becomes active.
+    const is_visible = focus and ws_idx == self.active_workspace and tab_idx == ws.active_tab;
+    if (!is_visible) {
+        if (new_surface.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+    }
 
     // Create a single-node tree for the new surface's pane. The block
     // scopes the pane errdefer to the window between Pane.create and
@@ -2206,7 +2712,7 @@ pub fn newSplitWithCommand(
     defer insert_tree.deinit();
 
     // Split the current tree at the active pane.
-    const new_tree = try ws.tab_trees[tab].split(
+    const new_tree = try ws.tab_trees[tab_idx].split(
         alloc,
         handle,
         direction,
@@ -2215,15 +2721,27 @@ pub fn newSplitWithCommand(
     );
 
     // Replace old tree.
-    var old_tree = ws.tab_trees[tab];
+    var old_tree = ws.tab_trees[tab_idx];
     old_tree.deinit();
-    ws.tab_trees[tab] = new_tree;
+    ws.tab_trees[tab_idx] = new_tree;
 
-    // Focus the new pane.
-    ws.tab_active_pane[tab] = inserted_pane;
-
-    self.layoutSplits();
-    inserted_pane.focus();
+    if (focus) {
+        // Interactive: the new pane becomes the tab's active pane, the
+        // (active) tab is re-laid-out, and the new pane takes keyboard
+        // focus.
+        ws.tab_active_pane[tab_idx] = inserted_pane;
+        if (is_visible) self.layoutSplits();
+        inserted_pane.focus();
+    } else {
+        // Background: do NOT change the tab's active pane or focus. If the
+        // split happens to land in the currently-visible active tab,
+        // re-lay-it-out so the new pane appears without stealing focus;
+        // otherwise it stays hidden until its tab is shown.
+        if (ws_idx == self.active_workspace and tab_idx == ws.active_tab)
+            self.layoutSplits();
+    }
+    self.invalidateSidebar();
+    return inserted_pane;
 }
 
 /// Create a new browser (WebView2) split in the active tab, in the
@@ -2612,6 +3130,65 @@ fn paintChrome(self: *Window) void {
 
     self.paintTabBar(hdc_screen);
     if (self.sidebarWidth() > 0) Sidebar.paint(self, hdc_screen);
+    if (self.sidebarReshowStripVisible()) self.paintReshowStrip(hdc_screen);
+}
+
+/// Paint the thin re-show strip at the window's left edge while the
+/// sidebar is runtime-hidden: a narrow accent band with a "›" chevron so
+/// the user can click to bring the sidebar back (Ctrl+B also works). Sits
+/// below the tab bar so it doesn't fight the tab chrome. Direct GDI on the
+/// parent window (the strip is over the surface's left edge, but the GL
+/// child only repaints on its own; this floats on top until the next pane
+/// repaint — acceptable for a static affordance, and toggling it off
+/// relayouts/repaints the pane).
+fn paintReshowStrip(self: *Window, hdc: w32.HDC) void {
+    const hwnd = self.hwnd orelse return;
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0) return;
+    const top = self.tabBarHeight();
+    const w = self.sidebarReshowStripWidth();
+    if (w <= 0 or client.bottom <= top) return;
+
+    const bg = self.app.config.background;
+    // Strip background: terminal bg + 30 per channel so it reads as a
+    // grabbable edge against the surface.
+    const sr: u8 = @min(@as(u16, bg.r) + 30, 255);
+    const sg: u8 = @min(@as(u16, bg.g) + 30, 255);
+    const sb: u8 = @min(@as(u16, bg.b) + 30, 255);
+    var strip = w32.RECT{ .left = 0, .top = top, .right = w, .bottom = client.bottom };
+    if (w32.CreateSolidBrush(w32.RGB(sr, sg, sb))) |brush| {
+        _ = w32.FillRect(hdc, &strip, brush);
+        _ = w32.DeleteObject(@ptrCast(brush));
+    }
+
+    // A "›" chevron centered vertically near the top of the strip hints
+    // at "click to expand". Strip is narrow so it just fits the glyph.
+    var old_font: ?*anyopaque = null;
+    if (self.tab_font) |font| old_font = w32.SelectObject(hdc, font);
+    defer {
+        if (old_font) |f| _ = w32.SelectObject(hdc, f);
+    }
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+    _ = w32.SetTextColor(hdc, w32.RGB(200, 200, 200));
+    var glyph_rect = w32.RECT{ .left = 0, .top = top, .right = w, .bottom = top + @as(i32, @intFromFloat(@round(40.0 * self.scale))) };
+    if (glyph_rect.bottom > client.bottom) glyph_rect.bottom = client.bottom;
+    const chevron = std.unicode.utf8ToUtf16LeStringLiteral("\u{203A}"); // ›
+    _ = w32.DrawTextW(
+        hdc,
+        chevron,
+        chevron.len,
+        &glyph_rect,
+        w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+    );
+}
+
+/// Whether client point (x, y) lies within the re-show edge strip (the
+/// affordance that brings a runtime-hidden sidebar back). Pure-ish (reads
+/// only the strip's visibility + width + tab bar height), so the WndProc
+/// can route the click before the surface/divider checks.
+fn hitTestReshowStrip(self: *const Window, x: i32, y: i32) bool {
+    if (!self.sidebarReshowStripVisible()) return false;
+    return x >= 0 and x < self.sidebarReshowStripWidth() and y >= self.tabBarHeight();
 }
 
 /// Paint the tab bar using double-buffered GDI painting.
@@ -3381,6 +3958,7 @@ fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
         .browser_icon => self.newBrowserSplit(.right) catch |err| {
             log.err("failed to open browser split: {}", .{err});
         },
+        .collapse_toggle => self.toggleSidebar(),
         .notif_entry => |i| {
             if (self.app.notifAt(i)) |entry| {
                 const window = entry.window;
@@ -4073,6 +4651,20 @@ fn onDestroy(self: *Window) void {
         _ = w32.DeleteObject(font);
         self.tab_font = null;
     }
+
+    // Drain the per-window overlay pools. The owned-popup HWNDs are already
+    // reclaimed by the OS as this owner is destroyed, but the heap-side
+    // *AttentionRing / *PaneButtons structs and their ArrayList buffers are
+    // not — and this interactive-close path bypasses deinit() (which clears
+    // GWLP_USERDATA before DestroyWindow, so onDestroy never runs on the
+    // deinit path; the two paths are mutually exclusive). Without this, every
+    // interactively-closed window leaks its overlays — unbounded growth in an
+    // agent workflow that repeatedly opens and closes windows.
+    for (self.attention_rings.items) |ring| ring.destroy();
+    self.attention_rings.deinit(app.core_app.alloc);
+    for (self.pane_buttons.items) |pb| pb.destroy();
+    self.pane_buttons.deinit(app.core_app.alloc);
+
     self.hwnd = null;
 
     // Free the Window allocation.
@@ -4242,6 +4834,13 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            // The re-show strip (sidebar runtime-hidden) sits over the
+            // surface's left edge; check it before the surface/divider
+            // routing so a click on it brings the sidebar back.
+            if (window.hitTestReshowStrip(x, y)) {
+                window.toggleSidebar();
+                return 0;
+            }
             if (window.hitTestSidebarEdge(x)) {
                 window.startSidebarDrag();
                 return 0;
@@ -4629,6 +5228,52 @@ test "unit: tab arrays stay aligned across a mutation sequence" {
     try testing.expectEqualSlices(u8, &.{ 2, 1 }, ids[0..count]);
     for (ids[0..count], titles[0..count]) |id, title| {
         try testing.expectEqual(id + 100, title);
+    }
+}
+
+test "unit: new-tab insert position matches config" {
+    const Pos = enum { current, end };
+    // .current after the active tab; at 0 when empty.
+    try testing.expectEqual(@as(usize, 0), newTabInsertPos(Pos.current, 0, 0));
+    try testing.expectEqual(@as(usize, 1), newTabInsertPos(Pos.current, 1, 0));
+    try testing.expectEqual(@as(usize, 3), newTabInsertPos(Pos.current, 3, 2));
+    try testing.expectEqual(@as(usize, 2), newTabInsertPos(Pos.current, 3, 1));
+    // .end appends.
+    try testing.expectEqual(@as(usize, 0), newTabInsertPos(Pos.end, 0, 0));
+    try testing.expectEqual(@as(usize, 3), newTabInsertPos(Pos.end, 3, 1));
+}
+
+test "unit: tab new returns an index list shows and close accepts (BUG 2)" {
+    // The create/list/close index contract: the index `tab-new` reports
+    // (the insert position, which becomes the workspace's active_tab) must
+    // be a valid index for `tab-list` (0..tab_count) and address THAT same
+    // new tab on `tab-close`. Empirically reproduce the round-trip with
+    // the pure helpers the real handlers use, for both configs and for a
+    // fresh (1-tab) workspace — the report's scenario where tab-new said
+    // index 1 but list/close only saw index 0.
+    const Pos = enum { current, end };
+    const cfgs = [_]Pos{ .current, .end };
+    inline for (cfgs) |cfg| {
+        // A fresh background workspace has exactly one tab (active_tab 0).
+        var count: usize = 1;
+        const active: usize = 0;
+
+        // tab-new: insert at the config position; the new tab becomes the
+        // workspace's active tab, and tab-new returns that index.
+        const new_idx = newTabInsertPos(cfg, count, active);
+        count += 1; // the array bookkeeping bumps tab_count
+
+        // tab-list enumerates 0..count and must contain new_idx.
+        try testing.expect(new_idx < count);
+
+        // tab-close <new_idx>: must be a valid index (so it never answers
+        // UnknownTab for the index tab-new just handed back) and removes
+        // the tab at exactly new_idx, leaving the other tab behind.
+        try testing.expect(new_idx < count);
+        const post_active = closeTabActiveFixup(count - 1, new_idx, new_idx);
+        // After closing the just-created tab the survivor (the original
+        // tab 0) is the active one.
+        try testing.expectEqual(@as(usize, 0), post_active);
     }
 }
 

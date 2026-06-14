@@ -25,7 +25,7 @@ pub const Options = struct {
 /// surface id — the primitive an orchestrator uses to spawn a teammate pane
 /// next to an existing one, alongside `+surface`, `+send`, and `+tab`.
 ///
-/// Usage: `ghostty +split <right|down> [--workspace I] [--tab J] [--command "..."]`
+/// Usage: `ghostty +split <right|down> [--workspace I] [--tab J] [--command "..."] [--focus]`
 ///
 ///   * `<right|down>`: split the addressed (or active) pane horizontally
 ///     (right) or vertically (down).
@@ -34,6 +34,11 @@ pub const Options = struct {
 ///   * `--command "prog arg ..."`: run this command in the new pane (split
 ///     on whitespace). Without it, the new pane inherits the source pane's
 ///     backend (the same shell), matching the UI split behavior.
+///   * `--focus`: by DEFAULT the split is created in the background — the
+///     active workspace/tab/pane and the OS foreground are NOT changed (an
+///     agent spawning a teammate pane never yanks you out of your current
+///     app or pane). Pass `--focus` to switch to the target workspace/tab
+///     and focus the new pane (the interactive split behavior).
 ///
 /// On success, prints `{"id":<surface-id>}` — the new pane's stable surface
 /// id (the same value the pane's shell sees as `GHOSTTY_SURFACE_ID`), or 0
@@ -104,8 +109,11 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         var workspace: ?u32 = null;
         var tab: ?u32 = null;
         var command: ?[]const u8 = null;
+        var focus = false;
         while (iter.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--workspace=")) {
+            if (std.mem.eql(u8, arg, "--focus")) {
+                focus = true;
+            } else if (std.mem.startsWith(u8, arg, "--workspace=")) {
                 workspace = std.fmt.parseInt(u32, arg["--workspace=".len..], 10) catch {
                     try stderr.print("invalid --workspace value\n", .{});
                     return 1;
@@ -157,6 +165,9 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         if (command) |c| {
             try argbuf.writer(alloc).print(",\"command\":{f}", .{std.json.fmt(c, .{})});
         }
+        // Non-focus is the default; only emit focus when opted in so a
+        // plain `split` stays a background create.
+        if (focus) try argbuf.writer(alloc).print(",\"focus\":true", .{});
         try argbuf.append(alloc, '}');
 
         const request = try std.fmt.allocPrint(

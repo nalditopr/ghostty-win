@@ -594,6 +594,15 @@ pub const Action = union(enum) {
     /// found by running `ghostty +version`.
     toggle_tab_overview,
 
+    /// Toggle the workspace sidebar's visibility for the current window.
+    ///
+    /// This is a session-only runtime override of the `window-show-sidebar`
+    /// config option: it hides/shows the sidebar without rewriting config,
+    /// and a config reload re-asserts the configured visibility. Only the
+    /// Windows apprt implements a sidebar today; on other platforms this is
+    /// a no-op. Bound to `ctrl+b` by default on Windows.
+    toggle_sidebar,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1419,6 +1428,7 @@ pub const Action = union(enum) {
             .goto_tab,
             .move_tab,
             .toggle_tab_overview,
+            .toggle_sidebar,
             .new_split,
             .goto_split,
             .goto_window,

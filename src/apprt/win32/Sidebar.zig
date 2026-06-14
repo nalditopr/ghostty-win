@@ -51,6 +51,9 @@ pub const HitTarget = union(enum) {
     bell_icon,
     gear_icon,
     browser_icon,
+    /// The collapse chevron in the footer (fourth slot): runtime-hides
+    /// the sidebar (toggle_sidebar). Distinct from the config option.
+    collapse_toggle,
     /// Display index into the notification log, 0 = newest.
     notif_entry: usize,
     notif_clear,
@@ -129,6 +132,17 @@ pub fn globeSlotRect(footer_top: i32, scale: f32) w32.RECT {
     return .{ .left = left, .top = top, .right = left + icon, .bottom = top + icon };
 }
 
+/// Icon slot rect for the collapse chevron, RIGHT-aligned in the footer
+/// (set apart from the left-clustered bell/gear/globe so it reads as a
+/// distinct "hide" affordance). Ending at width-pad keeps it left of the
+/// drag-resize edge band, which is hit-tested first.
+pub fn collapseSlotRect(footer_top: i32, width: i32, scale: f32) w32.RECT {
+    const pad = scaled(PAD_BASE, scale);
+    const icon = scaled(FOOTER_ICON_BASE, scale);
+    const top = footer_top + @divTrunc(footerHeight(scale) - icon, 2);
+    return .{ .left = width - pad - icon, .top = top, .right = width - pad, .bottom = top + icon };
+}
+
 /// Hit-test an x coordinate against the drag-resize grab band, which
 /// spans [edge - band_w, edge) where `edge` is the sidebar's right
 /// edge. A hidden sidebar (edge <= 0) has no band.
@@ -173,9 +187,12 @@ pub fn hitTest(x: i32, y: i32, ctx: HitCtx) HitTarget {
     const footer_top = ctx.client_h - footerHeight(ctx.scale);
     if (y >= footer_top) {
         // Footer icon slots span the full strip height for a more
-        // forgiving click zone; only x decides the slot.
+        // forgiving click zone; only x decides the slot. The collapse
+        // chevron is right-aligned and checked first (it can't overlap
+        // the left cluster at any usable width).
         const pad = scaled(PAD_BASE, ctx.scale);
         const icon = scaled(FOOTER_ICON_BASE, ctx.scale);
+        if (x >= ctx.width - pad - icon and x < ctx.width - pad) return .collapse_toggle;
         if (x >= pad and x < pad + icon) return .bell_icon;
         const gear_left = pad + icon + pad;
         if (x >= gear_left and x < gear_left + icon) return .gear_icon;
@@ -869,6 +886,23 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
 
+        // Collapse chevron (right-aligned): runtime-hides the sidebar.
+        // "‹" (U+2039) reads as "tuck the panel away to the left". A
+        // text-style chevron, no tofu risk (BMP punctuation).
+        var collapse_rect = collapseSlotRect(footer_top, sidebar_w, win.scale);
+        _ = w32.SetTextColor(mem_dc, if (win.sidebar_hover == .collapse_toggle)
+            active_text_color
+        else
+            inactive_text_color);
+        const collapse_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{2039}");
+        _ = w32.DrawTextW(
+            mem_dc,
+            collapse_char,
+            collapse_char.len,
+            &collapse_rect,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+        );
+
         // Unread badge: amber square at the bell's top-right corner.
         const unread = win.app.notif_log.unread;
         if (unread > 0) {
@@ -1174,6 +1208,29 @@ test "sidebar hitTest: footer bell and gear slots" {
     try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(72, 368, ctx));
     try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(95, 399, ctx));
     try testing.expectEqual(@as(HitTarget, .none), hitTest(96, 368, ctx));
+}
+
+test "sidebar hitTest: footer collapse chevron (right-aligned slot)" {
+    const ctx = testCtx(3, false, 0);
+    // width=220, pad=8, icon=24 -> collapse slot x in [188, 212).
+    // Just left of the slot is a miss (no left-cluster icon reaches here).
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(187, 368, ctx));
+    try testing.expectEqual(@as(HitTarget, .collapse_toggle), hitTest(188, 368, ctx));
+    try testing.expectEqual(@as(HitTarget, .collapse_toggle), hitTest(211, 399, ctx));
+    // The pad gap right of the slot, before the strip edge, is a miss.
+    try testing.expectEqual(@as(HitTarget, .none), hitTest(212, 368, ctx));
+    // The collapse slot never collides with the left cluster (globe ends
+    // at x=96), so the globe still resolves.
+    try testing.expectEqual(@as(HitTarget, .browser_icon), hitTest(72, 368, ctx));
+}
+
+test "collapseSlotRect: right-aligned square in the footer" {
+    // footer_top=368 at client_h=400 (footerHeight 32); pad=8, icon=24.
+    const r = collapseSlotRect(368, 220, 1.0);
+    try testing.expectEqual(@as(i32, 188), r.left); // 220 - 8 - 24
+    try testing.expectEqual(@as(i32, 212), r.right); // 220 - 8
+    try testing.expectEqual(@as(i32, 24), r.right - r.left);
+    try testing.expectEqual(@as(i32, 24), r.bottom - r.top);
 }
 
 test "sidebar hitTest: footer boundary clips the row area" {

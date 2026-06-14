@@ -108,6 +108,14 @@ current_cursor: ?w32.HCURSOR = null,
 /// core surface toggles this for typing-while-mouse-still etc.
 mouse_visible: bool = true,
 
+/// Accumulated fractional wheel delta for Ctrl+scroll font zoom. Win32
+/// wheel notches are normally ±1.0 (WHEEL_DELTA), but high-resolution /
+/// precision touchpads deliver sub-notch deltas. We accumulate them here
+/// and only fire a font-size step once a full notch's worth has built up,
+/// so a slow scroll doesn't zoom on every tiny event. Reset whenever the
+/// scroll direction flips so a reversal responds immediately.
+font_zoom_accum: f64 = 0,
+
 /// Search popup HWND (a small top-level window containing an Edit
 /// control). Uses a popup instead of a child window because the
 /// OpenGL viewport covers the entire client area and would paint
@@ -2022,6 +2030,20 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, ho
     const raw_delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
     const delta: f64 = @as(f64, @floatFromInt(raw_delta)) / @as(f64, @floatFromInt(w32.WHEEL_DELTA));
 
+    // Ctrl+scroll zooms the font instead of scrolling (Windows/VS Code
+    // convention). We treat both axes as zoom so a horizontal-wheel mouse
+    // or a tilted touchpad scroll still zooms while Ctrl is held. Reading
+    // the live VK_CONTROL state matches getModifiers() / the rest of this
+    // file rather than the MK_CONTROL bit in wparam's low word.
+    if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) {
+        self.handleCtrlScrollZoom(delta);
+        return; // do NOT also scroll while zooming
+    }
+
+    // Any non-zoom scroll cancels a partial zoom accumulation so a later
+    // Ctrl+scroll starts fresh rather than firing on stale fractional delta.
+    self.font_zoom_accum = 0;
+
     const scroll_mods: input.ScrollMods = .{};
 
     // Win32 horizontal wheel positive-right; core API positive-right also.
@@ -2030,6 +2052,36 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, ho
     self.core_surface.scrollCallback(xoff, yoff, scroll_mods) catch |err| {
         log.err("scroll callback error: {}", .{err});
     };
+}
+
+/// Apply Ctrl+scroll font zoom for one wheel event. `delta` is the wheel
+/// movement normalized to notches (±1.0 per standard notch, fractional for
+/// precision devices). Each accumulated whole notch performs one
+/// increase/decrease_font_size step; positive zooms in, negative zooms out.
+fn handleCtrlScrollZoom(self: *Surface, delta: f64) void {
+    if (delta == 0) return;
+
+    // Reset the accumulator on a direction reversal so flipping from
+    // zoom-in to zoom-out responds on the first notch instead of having to
+    // first burn down the opposite-sign remainder.
+    if ((delta > 0) != (self.font_zoom_accum > 0)) self.font_zoom_accum = 0;
+    self.font_zoom_accum += delta;
+
+    // Fire one font-size step per whole notch that has built up. The
+    // remainder stays in the accumulator for the next event so sub-notch
+    // precision scrolling still eventually zooms.
+    while (@abs(self.font_zoom_accum) >= 1.0) {
+        const action: input.Binding.Action = if (self.font_zoom_accum > 0)
+            .{ .increase_font_size = 1 }
+        else
+            .{ .decrease_font_size = 1 };
+        _ = self.core_surface.performBindingAction(action) catch |err| {
+            log.err("ctrl+scroll font zoom error: {}", .{err});
+            self.font_zoom_accum = 0;
+            return;
+        };
+        self.font_zoom_accum -= if (self.font_zoom_accum > 0) 1.0 else -1.0;
+    }
 }
 
 /// Handle WM_IME_STARTCOMPOSITION — an IME composition session has begun.

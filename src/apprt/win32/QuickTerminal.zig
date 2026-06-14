@@ -326,7 +326,11 @@ fn getMonitor(self: *QuickTerminal) ?w32.HMONITOR {
 /// background process.
 fn forceForeground(self: *QuickTerminal) void {
     const hwnd = self.window.hwnd orelse return;
-    App.forceForegroundWindow(hwnd);
+    // Ungated raise: the quick terminal is summoned by an explicit user
+    // hotkey, so it intentionally comes forward over whatever app is
+    // foreground (unlike the programmatic raises that go through the
+    // foregroundIsOurs gate in forceForegroundWindow).
+    App.raiseForegroundWindow(hwnd);
     // Focus the terminal surface inside the window.
     if (self.window.getActiveSurface()) |s| {
         if (s.hwnd) |sh| _ = w32.SetFocus(sh);

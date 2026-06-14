@@ -347,6 +347,12 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Toggle the workspace sidebar's visibility (Windows apprt only;
+    /// a no-op elsewhere). Session-only runtime override of
+    /// `window-show-sidebar`. Appended at the end so the field order
+    /// matches the Key enum (CValue is built positionally from both).
+    toggle_sidebar,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -415,6 +421,9 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        // Appended at the end to keep the C ABI integer values of every
+        // preceding action stable (the ghostty.h test pins each value).
+        toggle_sidebar,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
