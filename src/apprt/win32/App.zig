@@ -11,6 +11,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const agent_session = @import("agent_session.zig");
 const BrowserPane = @import("BrowserPane.zig");
 const ipc = @import("ipc.zig");
 const Pane = @import("Pane.zig");
@@ -18,7 +19,9 @@ const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const taskbar = @import("taskbar.zig");
 const w32 = @import("win32.zig");
+const ws_meta = @import("ws_meta.zig");
 const wv2 = @import("webview2.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -38,6 +41,12 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 /// access. lparam carries the request pointer. WM_APP+2/+3 are the
 /// update/tray callbacks (see below); this is the next free slot.
 const WM_APP_IPC_REQUEST: u32 = w32.WM_APP + 4;
+
+/// Posted by a sidebar-metadata worker thread to hand a completed
+/// *ws_meta.Result to the GUI thread, which owns all Window/Workspace
+/// state. lparam carries the result pointer (ownership transferred). The
+/// worker only reads its own owned Job, never live Window/App state.
+const WM_APP_WS_META: u32 = w32.WM_APP + 5;
 
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
@@ -114,6 +123,28 @@ desktop_notif_next: usize = 0,
 /// drawn as the badge on the sidebar footer's bell icon.
 notif_log: NotifRing(NotifEntry, NOTIF_LOG_CAP) = .{},
 
+/// ITaskbarList3 COM object used to draw the unread-count overlay badge
+/// on each window's taskbar button (the Windows analog of cmux's dock
+/// badge). Created lazily on the first badge refresh (CoCreateInstance
+/// needs COM, initialized in init()); null when COM is unavailable, in
+/// which case badges are a silent no-op. Released in terminate().
+taskbar_list: ?taskbar.TaskbarList = null,
+/// Set once we've attempted to create `taskbar_list`, so a failed create
+/// is not retried on every notification.
+taskbar_tried: bool = false,
+
+/// Monotonic counter of sidebar-metadata refresh ticks. Drives the
+/// slow-cadence gh PR probe (every WS_META_PR_EVERY ticks) without a
+/// second timer.
+ws_meta_tick: u64 = 0,
+
+/// Monotonic token source for sidebar-metadata refresh jobs. Each
+/// dispatched job stamps the target workspace with the next value and
+/// echoes it back; a result is applied only if the workspace still bears
+/// that token (guards a recycled slot). 0 is reserved for "never
+/// dispatched" so a default-init workspace cannot accidentally match.
+ws_meta_token: u64 = 0,
+
 /// Shared WebView2 environment singleton. Created lazily by the first
 /// browser pane; all panes get controllers from the same environment.
 webview2_env: ?*wv2.ICoreWebView2Environment = null,
@@ -141,6 +172,14 @@ ipc_server: ?*ipc.Server = null,
 /// later navigate/eval commands can target a specific pane. Assigned in
 /// BrowserPane.create; never reused within a process run.
 next_browser_id: u32 = 1,
+
+/// Per-surface agent session store: maps a terminal surface (by its
+/// stable core Surface.id — the same value exported to shells as
+/// GHOSTTY_SURFACE_ID) to the agent running in it and that agent's native
+/// session id, for `+session capture`/`resume`. Initialized in init()
+/// with the core allocator; deinit'd in terminate(). Pure logic +
+/// (de)serialization live in agent_session.zig.
+session_store: agent_session.Store = undefined,
 
 pub fn init(
     self: *App,
@@ -186,6 +225,7 @@ pub fn init(
         .hinstance = hinstance,
         .bg_brush = bg_brush,
         .com_initialized = hr_coinit == 0 or hr_coinit == 1,
+        .session_store = agent_session.Store.init(alloc),
     };
 
     // Register the window container class (GDI painting, no CS_OWNDC).
@@ -308,6 +348,11 @@ pub fn init(
     // thread posts requests to it). A failure here only disables the
     // `ghostty +browser` CLI, so log and continue.
     self.startIpcServer();
+
+    // Start the periodic sidebar-metadata refresh (git branch / ports /
+    // PR). The timer fires on this msg_hwnd; each tick spawns a worker
+    // thread for the actual git/gh/TCP-table work.
+    _ = w32.SetTimer(self.msg_hwnd.?, WS_META_TIMER_ID, WS_META_INTERVAL_MS, null);
 
     // Register global hotkey for quick terminal (if configured).
     self.registerGlobalHotkey();
@@ -497,6 +542,10 @@ pub fn terminate(self: *App) void {
         self.ipc_server = null;
     }
 
+    // Free the agent session store (owned session-id strings). Safe after
+    // the IPC server stopped: no pipe-thread callback can still touch it.
+    self.session_store.deinit();
+
     if (self.msg_hwnd) |hwnd| {
         // Clear GWLP_USERDATA before destroying so msgWndProc sees
         // userdata=0 and falls through to DefWindowProc for any
@@ -548,6 +597,14 @@ pub fn terminate(self: *App) void {
     }
 
     self.config.deinit();
+
+    // Release the taskbar overlay COM object before CoUninitialize tears
+    // down the apartment it lives in.
+    if (self.taskbar_list) |*tl| {
+        tl.deinit();
+        self.taskbar_list = null;
+    }
+
     // Balance CoInitializeEx only when it actually succeeded —
     // CoUninitialize after RPC_E_CHANGED_MODE would tear down an
     // apartment we don't own.
@@ -1800,6 +1857,18 @@ const RELEASES_URL = "https://github.com/InsipidPoint/ghostty-windows/releases/l
 const NOTIF_UPDATE_UID: u32 = 2;
 const NOTIF_UPDATE_TIMER_ID: usize = 4;
 
+/// Periodic timer that refreshes the sidebar workspace metadata (git
+/// branch, listening ports, PR status). Fires on the UI thread; the actual
+/// git/gh/TCP-table work runs on a worker thread spawned per tick. Shares
+/// the msg_hwnd WM_TIMER namespace, distinct from the IDs above.
+const WS_META_TIMER_ID: usize = 5;
+
+/// Refresh cadence for sidebar metadata, in milliseconds. The git/port
+/// scan is cheap and runs every tick; the gh PR probe (network) runs only
+/// once every WS_META_PR_EVERY ticks.
+const WS_META_INTERVAL_MS: u32 = 4000;
+const WS_META_PR_EVERY: u64 = 8; // ~32s with a 4s tick
+
 /// Desktop notifications rotate through a small range of slots so that
 /// several balloons can be in flight at once, each with its own tray
 /// uID, cleanup timer, and recorded click target. Slot `i` uses uID
@@ -1834,6 +1903,13 @@ pub const NotifEntry = struct {
     title_len: usize,
     body: [128]u16,
     body_len: usize,
+    /// Per-entry lifecycle: false = Unread (contributes to the badge and is
+    /// a `+notify next` jump target), true = Read (the user viewed it, by
+    /// opening the panel or jumping to it). Distinct from the ring's
+    /// aggregate `unread` counter, which drives the bell badge: a freshly
+    /// pushed entry is Unread; markRead/opening the panel marks all live
+    /// entries Read; jumping to one marks just that one Read.
+    read: bool = false,
 };
 
 /// Fixed-capacity ring of optional entries with newest-first display
@@ -1883,6 +1959,35 @@ pub fn NotifRing(comptime Entry: type, comptime cap: usize) type {
                 if (slot != null) n += 1;
             }
             return n;
+        }
+
+        /// Count of live entries whose `read` field is false. Only valid
+        /// when `Entry` has a `read: bool` field (the notification log);
+        /// drives the taskbar unread-count badge. Pure so the read-flag
+        /// accounting is unit-testable.
+        pub fn unreadLive(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.slots) |slot| {
+                if (slot) |entry| {
+                    if (!entry.read) n += 1;
+                }
+            }
+            return n;
+        }
+
+        /// Display index (0 = newest) of the most-recent live entry whose
+        /// `read` field is false, or null when every live entry is read.
+        /// Walks newest-first using the same hole-skipping mapping as `at`.
+        pub fn firstUnread(self: *const Self) ?usize {
+            var display_idx: usize = 0;
+            for (0..cap) |offset| {
+                const idx = (self.next + cap - 1 - offset) % cap;
+                if (self.slots[idx]) |entry| {
+                    if (!entry.read) return display_idx;
+                    display_idx += 1;
+                }
+            }
+            return null;
         }
 
         /// The display_idx-th newest live entry (0 = newest), or null
@@ -2175,6 +2280,39 @@ pub fn parseAttentionOsc(body: []const u8) ?bool {
     return null;
 }
 
+/// Inputs to the smart desktop-toast suppression decision. Captured on the
+/// UI thread immediately before the toast call so the decision is a pure
+/// function of observable state (and thus unit-testable).
+pub const ToastContext = struct {
+    /// The Ghostty window owning the sending surface is the OS foreground
+    /// window (GetForegroundWindow() == window.hwnd).
+    window_foreground: bool,
+    /// The sending surface's workspace is the active workspace in its
+    /// window (the user is looking at that workspace's panes).
+    workspace_active: bool,
+    /// The notifications panel is open in the sending window (the user is
+    /// actively watching the in-app notification log).
+    panel_open: bool,
+};
+
+/// Decide whether to fire the Windows toast/balloon for a desktop
+/// notification. The in-app attention ring + sidebar panel ALWAYS record
+/// the event regardless; this governs only the OS-level interruption.
+///
+/// Suppress the toast only when the user is genuinely already looking at
+/// the source: the window is in the foreground AND either the sending
+/// workspace is the active one or the notifications panel is open. In every
+/// other case (window backgrounded, or a different workspace is active and
+/// the panel is closed) the toast fires so the user isn't left unaware.
+///
+/// Pure so the policy is unit-tested independent of any HWND/Win32 state.
+pub fn shouldToast(ctx: ToastContext) bool {
+    if (!ctx.window_foreground) return true;
+    // Foregrounded: only suppress if the user is plausibly already watching
+    // this notification's source.
+    return !(ctx.workspace_active or ctx.panel_open);
+}
+
 fn showDesktopNotification(
     self: *App,
     target: apprt.Target,
@@ -2197,19 +2335,66 @@ fn showDesktopNotification(
         return;
     }
 
-    // Record which surface notified so a click on the balloon can jump
-    // back to it. Slots rotate; if all are in flight the oldest balloon
-    // is replaced (NIM_ADD fails silently, NIM_MODIFY updates in place,
-    // SetTimer with the same id restarts the old timer).
-    const slot = self.desktop_notif_next;
-    self.desktop_notif_next = (slot + 1) % NOTIF_DESKTOP_SLOTS;
-    self.desktop_notifs[slot] = switch (target) {
+    // Convert title/body once (UTF-8 → UTF-16LE); reused by both the
+    // in-app log entry and the balloon. Local buffers so the in-app path
+    // works even when the balloon is suppressed.
+    var title_buf: [64]u16 = undefined;
+    var body_buf: [256]u16 = undefined;
+    var title_len = std.unicode.utf8ToUtf16Le(&title_buf, value.title) catch 0;
+    if (title_len >= title_buf.len) title_len = title_buf.len - 1;
+    title_buf[title_len] = 0;
+    var body_len = std.unicode.utf8ToUtf16Le(&body_buf, value.body) catch 0;
+    if (body_len >= body_buf.len) body_len = body_buf.len - 1;
+    body_buf[body_len] = 0;
+
+    // The in-app side (attention ring + sidebar notification panel) ALWAYS
+    // fires, regardless of the suppression decision below: a notification
+    // is recorded and the pane is ringed even when we skip the OS toast.
+    // Only a surface target carries a pane to ring / a window to address.
+    const sender: ?DesktopNotif = switch (target) {
         .app => null,
         .surface => |core_surface| .{
             .window = core_surface.rt_surface.parent_window,
             .surface = core_surface.rt_surface,
         },
     };
+    if (sender) |s| {
+        // Ring the originating pane (the cmux-style attention ring). Skips
+        // silently if the pane is the focused/visible one (you're already
+        // looking at it) — setAttentionForSurface validates by address.
+        s.window.setAttentionForSurface(s.surface, true);
+        self.pushNotif(.osc, s.window, s.surface, title_buf[0..title_len], body_buf[0..body_len]);
+    }
+
+    // Smart suppression: skip the OS toast when the user is genuinely
+    // already looking at the source. Decision captured from live UI state
+    // here on the UI thread (see shouldToast). App targets (no window)
+    // always toast.
+    if (sender) |s| {
+        const ctx: ToastContext = .{
+            .window_foreground = if (s.window.hwnd) |wh| w32.GetForegroundWindow() == wh else false,
+            .workspace_active = if (s.window.findLocOfSurface(s.surface)) |loc|
+                s.window.workspaceIndex(loc.ws) == s.window.active_workspace
+            else
+                false,
+            .panel_open = s.window.notif_panel_open,
+        };
+        if (!shouldToast(ctx)) {
+            log.debug("suppressing desktop toast (user is looking at the source)", .{});
+            // Keep the taskbar overlay in sync even when the toast is
+            // suppressed (the badge reflects the in-app unread count).
+            self.refreshTaskbarBadges();
+            return;
+        }
+    }
+
+    // Record which surface notified so a click on the balloon can jump
+    // back to it. Slots rotate; if all are in flight the oldest balloon
+    // is replaced (NIM_ADD fails silently, NIM_MODIFY updates in place,
+    // SetTimer with the same id restarts the old timer).
+    const slot = self.desktop_notif_next;
+    self.desktop_notif_next = (slot + 1) % NOTIF_DESKTOP_SLOTS;
+    self.desktop_notifs[slot] = sender;
 
     var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
@@ -2223,30 +2408,12 @@ fn showDesktopNotification(
     nid.dwInfoFlags = w32.NIIF_INFO;
     nid.uVersion_or_uTimeout = 5000; // 5 second timeout
 
-    // Copy title (UTF-8 → UTF-16LE)
-    const title_z = value.title;
-    var title_len = std.unicode.utf8ToUtf16Le(&nid.szInfoTitle, title_z) catch 0;
-    if (title_len >= nid.szInfoTitle.len) title_len = nid.szInfoTitle.len - 1;
-    nid.szInfoTitle[title_len] = 0;
-
-    // Copy body (UTF-8 → UTF-16LE)
-    const body_z = value.body;
-    var body_len = std.unicode.utf8ToUtf16Le(&nid.szInfo, body_z) catch 0;
-    if (body_len >= nid.szInfo.len) body_len = nid.szInfo.len - 1;
-    nid.szInfo[body_len] = 0;
-
-    // Mirror the balloon into the sidebar notification log, reusing
-    // the UTF-16 conversions above.
-    switch (target) {
-        .app => {},
-        .surface => |core_surface| self.pushNotif(
-            .osc,
-            core_surface.rt_surface.parent_window,
-            core_surface.rt_surface,
-            nid.szInfoTitle[0..title_len],
-            nid.szInfo[0..body_len],
-        ),
-    }
+    const ti_len = @min(title_len, nid.szInfoTitle.len - 1);
+    @memcpy(nid.szInfoTitle[0..ti_len], title_buf[0..ti_len]);
+    nid.szInfoTitle[ti_len] = 0;
+    const bo_len = @min(body_len, nid.szInfo.len - 1);
+    @memcpy(nid.szInfo[0..bo_len], body_buf[0..bo_len]);
+    nid.szInfo[bo_len] = 0;
 
     // Tooltip
     const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -2256,6 +2423,9 @@ fn showDesktopNotification(
     // Add the icon, show notification, then remove the icon.
     _ = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid);
     _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
+
+    // Update the taskbar unread-count overlay to match the new entry.
+    self.refreshTaskbarBadges();
 
     // Schedule icon removal via a timer (distinct from the update
     // notification's timer so the two don't trample each other).
@@ -2311,6 +2481,14 @@ pub fn jumpToSurface(self: *App, window: *Window, surface: *Surface) bool {
 /// (e.g. a stale pipe) leaves ipc_server null — the CLI is then
 /// unavailable but the app runs.
 fn startIpcServer(self: *App) void {
+    // `socket-control = off` disables the agent-control IPC entirely; the
+    // CLI verbs then report no running instance. `on`/`read-only` both
+    // start the server (read-only is enforced per-verb in
+    // handleIpcRequest, not by withholding the pipe).
+    if (self.config.@"socket-control" == .off) {
+        log.info("socket-control=off: agent IPC server not started", .{});
+        return;
+    }
     const alloc = self.core_app.alloc;
     var name_buf: [64]u8 = undefined;
     const name = ipc.defaultPipeName(&name_buf) catch return;
@@ -2513,6 +2691,193 @@ fn gitMessage(stderr: []const u8) []const u8 {
     return "git worktree add failed";
 }
 
+// ---------------------------------------------------------------------------
+// Sidebar workspace metadata (Stage 2): off-thread git branch / ports / PR.
+//
+// refreshWorkspaceMetadata runs on the UI thread (WS_META_TIMER_ID). It
+// snapshots each visible workspace into a self-contained ws_meta.Job (an
+// owned working_dir copy + the tabs' child PIDs read lock-free), stamps the
+// workspace with a fresh token, and spawns ONE detached worker thread for
+// the batch. The worker runs git/gh/the TCP table (never touching live
+// Window/App state) and PostMessageW's a *ws_meta.Result per workspace back
+// to msg_hwnd, where applyWorkspaceMetadata revalidates + stores it.
+// ---------------------------------------------------------------------------
+
+/// UI-thread timer tick: build refresh jobs for the active workspace of
+/// every live, non-quick window and dispatch them to a worker thread. Only
+/// the visible workspace per window is refreshed each tick (background
+/// workspaces refresh lazily when they become active — see selectWorkspace).
+fn refreshWorkspaceMetadata(self: *App) void {
+    if (!self.config.@"sidebar-metadata") return;
+    self.ws_meta_tick +%= 1;
+    const want_pr = (self.ws_meta_tick % WS_META_PR_EVERY) == 0;
+
+    var jobs: std.ArrayList(ws_meta.Job) = .empty;
+    defer jobs.deinit(self.core_app.alloc);
+
+    for (self.windows.items) |w| {
+        if (w.closing or w.is_quick_terminal) continue;
+        if (w.workspace_count == 0) continue;
+        const ws_idx = w.active_workspace;
+        if (ws_idx >= w.workspace_count) continue;
+        if (self.buildMetaJob(w, ws_idx, want_pr)) |job| {
+            jobs.append(self.core_app.alloc, job) catch |err| {
+                log.warn("ws-meta: failed to queue job: {}", .{err});
+                var j = job;
+                j.deinit(self.core_app.alloc);
+            };
+        }
+    }
+
+    if (jobs.items.len == 0) return;
+    self.dispatchMetaJobs(jobs.toOwnedSlice(self.core_app.alloc) catch return);
+}
+
+/// Refresh one workspace's metadata immediately (on focus / worktree bind),
+/// outside the periodic tick. Best-effort: a dispatch failure is silent.
+pub fn refreshWorkspaceMetadataNow(self: *App, w: *Window, ws_idx: usize) void {
+    if (!self.config.@"sidebar-metadata") return;
+    if (w.closing or w.is_quick_terminal) return;
+    if (ws_idx >= w.workspace_count) return;
+    const job = self.buildMetaJob(w, ws_idx, false) orelse return;
+    const jobs = self.core_app.alloc.alloc(ws_meta.Job, 1) catch {
+        var j = job;
+        j.deinit(self.core_app.alloc);
+        return;
+    };
+    jobs[0] = job;
+    self.dispatchMetaJobs(jobs);
+}
+
+/// Build a self-contained refresh job for workspace `ws_idx` of `w`, or
+/// null when there is nothing to scan (no working_dir AND no child PIDs).
+/// Stamps the workspace with a fresh token. Runs on the UI thread; all
+/// reads (working_dir, child PIDs) are lock-free/stable.
+fn buildMetaJob(self: *App, w: *Window, ws_idx: usize, want_pr: bool) ?ws_meta.Job {
+    const alloc = self.core_app.alloc;
+    const ws = &w.workspaces[ws_idx];
+
+    // Collect the per-tab ConPTY child PIDs (terminals only).
+    var pids: std.ArrayList(u32) = .empty;
+    errdefer pids.deinit(alloc);
+    for (0..ws.tab_count) |t| {
+        var it = ws.tab_trees[t].iterator();
+        while (it.next()) |entry| {
+            const surface = switch (entry.view.content) {
+                .terminal => |s| s,
+                .browser => continue,
+            };
+            if (surface.childPid()) |pid| pids.append(alloc, pid) catch {};
+        }
+    }
+
+    const has_dir = ws.working_dir != null;
+    if (!has_dir and pids.items.len == 0) {
+        pids.deinit(alloc);
+        return null;
+    }
+
+    const dir_copy: ?[]u8 = if (ws.working_dir) |d| (alloc.dupe(u8, d) catch null) else null;
+    const pid_slice = pids.toOwnedSlice(alloc) catch {
+        pids.deinit(alloc);
+        if (dir_copy) |d| alloc.free(d);
+        return null;
+    };
+
+    self.ws_meta_token +%= 1;
+    if (self.ws_meta_token == 0) self.ws_meta_token = 1; // 0 reserved
+    ws.meta_token = self.ws_meta_token;
+
+    return .{
+        .window = @ptrCast(w),
+        .ws_idx = ws_idx,
+        .token = self.ws_meta_token,
+        .working_dir = dir_copy,
+        .root_pids = pid_slice,
+        .want_pr = want_pr and has_dir,
+    };
+}
+
+/// Spawn the detached worker thread that processes `jobs` (ownership
+/// transferred). On a spawn failure the jobs are freed here so nothing
+/// leaks (the UI simply keeps the previous metadata).
+fn dispatchMetaJobs(self: *App, jobs: []ws_meta.Job) void {
+    const ctx = self.core_app.alloc.create(MetaWorkerCtx) catch {
+        freeMetaJobs(self.core_app.alloc, jobs);
+        return;
+    };
+    ctx.* = .{ .app = self, .jobs = jobs };
+    const thread = std.Thread.spawn(.{}, metaWorkerMain, .{ctx}) catch {
+        self.core_app.alloc.destroy(ctx);
+        freeMetaJobs(self.core_app.alloc, jobs);
+        return;
+    };
+    thread.detach();
+}
+
+const MetaWorkerCtx = struct {
+    app: *App,
+    jobs: []ws_meta.Job,
+};
+
+fn freeMetaJobs(alloc: Allocator, jobs: []ws_meta.Job) void {
+    for (jobs) |*j| j.deinit(alloc);
+    alloc.free(jobs);
+}
+
+/// Worker-thread entry: run every job and post each result back to the UI
+/// thread. Touches only `ctx` (its own owned jobs) and the allocator —
+/// NEVER live Window/App state. msg_hwnd is read once; it is stable for the
+/// app's lifetime. On a PostMessageW failure the result is freed here.
+fn metaWorkerMain(ctx: *MetaWorkerCtx) void {
+    const self = ctx.app;
+    const alloc = self.core_app.alloc;
+    defer {
+        freeMetaJobs(alloc, ctx.jobs);
+        alloc.destroy(ctx);
+    }
+
+    const hwnd = self.msg_hwnd orelse return;
+    for (ctx.jobs) |*job| {
+        const result = ws_meta.run(alloc, job) catch continue;
+        if (w32.PostMessageW(hwnd, WM_APP_WS_META, 0, @bitCast(@intFromPtr(result))) == 0) {
+            alloc.destroy(result);
+        }
+    }
+}
+
+/// UI-thread: apply a worker result to its workspace after revalidating the
+/// window still lives and the workspace still bears the job's token (so a
+/// result for a since-recycled slot is dropped). Frees the result.
+fn applyWorkspaceMetadata(self: *App, result: *ws_meta.Result) void {
+    defer self.core_app.alloc.destroy(result);
+
+    const target: *Window = @ptrCast(@alignCast(result.window));
+    // Validate the window pointer is still live (not freed since dispatch).
+    var alive = false;
+    for (self.windows.items) |w| {
+        if (w == target) {
+            alive = true;
+            break;
+        }
+    }
+    if (!alive or target.closing) return;
+    if (result.ws_idx >= target.workspace_count) return;
+
+    const ws = &target.workspaces[result.ws_idx];
+    // Token mismatch ⇒ the slot was recycled (closeWorkspace shift) since
+    // dispatch; drop rather than mis-apply.
+    if (ws.meta_token != result.token) return;
+
+    ws.setGitBranch(result.branch[0..result.branch_len]);
+    ws.setPorts(result.ports[0..result.port_count]);
+    // The gh probe runs on a slow cadence; only overwrite the PR cache on a
+    // tick that actually probed, so fast (git/port) ticks don't blank it.
+    if (result.pr_probed) ws.setPrStatus(result.pr_state, result.pr_number);
+
+    target.invalidateSidebar();
+}
+
 /// Handle one IPC request on the UI thread (from WM_APP_IPC_REQUEST).
 /// Drives the browser and answers via the server, then destroys the
 /// request. `eval` answers asynchronously (the ExecuteScript completion
@@ -2520,6 +2885,16 @@ fn gitMessage(stderr: []const u8) []const u8 {
 fn handleIpcRequest(self: *App, req: *ipc.Request) void {
     defer req.destroy();
     const server = self.ipc_server orelse return;
+
+    // read-only mode: refuse any verb that would change state, spawn a
+    // process, or inject input. The server still answers (with an error)
+    // so the client gets a clear signal rather than a hang.
+    if (self.config.@"socket-control" == .@"read-only" and
+        !commandIsReadOnly(req.cmd))
+    {
+        server.sendError(req.id, "socket-control=read-only: command refused") catch {};
+        return;
+    }
 
     switch (req.cmd) {
         .open => self.ipcOpen(req) catch |err| {
@@ -2578,7 +2953,58 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         .notify => self.ipcNotify(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
+
+        // Orchestration scripting. read-only mode refuses the mutating
+        // ones up front (see commandIsReadOnly); the read verbs always run.
+        .@"surface-list" => self.ipcSurfaceList(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"surface-focus" => self.ipcSurfaceFocus(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"new-split" => self.ipcNewSplit(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"set-status" => self.ipcSetStatus(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"set-progress" => self.ipcSetProgress(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .log => self.ipcLog(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"read-screen" => self.ipcReadScreen(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"session-capture" => self.ipcSessionCapture(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"session-resume" => self.ipcSessionResume(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"session-list" => self.ipcSessionList(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
     }
+}
+
+/// Whether a command only reads state (never mutates the model, spawns a
+/// process, or sends input). Under `socket-control = read-only` only these
+/// are honored; everything else is refused before dispatch. The browser
+/// CDP verbs (snapshot/eval) read a page but eval can run arbitrary JS, so
+/// only snapshot is treated as read-only; navigate/click/fill/open mutate.
+fn commandIsReadOnly(cmd: ipc.Command) bool {
+    return switch (cmd) {
+        .@"workspace-list",
+        .@"tab-list",
+        .snapshot,
+        .@"surface-list",
+        .@"read-screen",
+        .@"session-list",
+        => true,
+        else => false,
+    };
 }
 
 /// Request-level failures surfaced to the client as the error response
@@ -2600,6 +3026,17 @@ const IpcError = error{
     QuickTerminal,
     MissingAction,
     BadAction,
+    // Orchestration verbs.
+    UnknownPane,
+    UnknownSurface,
+    MissingDirection,
+    BadDirection,
+    MissingAgent,
+    MissingSession,
+    NoSession,
+    NoResumeRecipe,
+    BadProgress,
+    CoreNotReady,
 };
 
 /// Resolve the IPC target window: the foreground Ghostty window if one
@@ -3004,18 +3441,30 @@ fn ipcSend(self: *App, req: *ipc.Request) anyerror!void {
     server.sendOk(req.id, null) catch {};
 }
 
-/// notify {action: "ring"|"clear", [workspace], [tab]} → set or clear the
-/// notification-ring attention flag on the active pane of the addressed
-/// (or active) workspace's addressed (or active) tab. The explicit,
-/// reliable counterpart to the attention OSC: an agent that can't emit an
-/// escape (or a wrapper script) rings the pane it runs in via
-/// `ghostty +notify ring`. Browser panes have no terminal surface and
-/// answer NotATerminal. Targeting the currently visible+focused pane is
-/// accepted but the ring overlay won't draw on it (you'd be ringed around
-/// what you're looking at); the cross-level sidebar/tab dots still update.
+/// notify {action: "ring"|"clear"|"next", [workspace], [tab]} →
+///   * "ring"/"clear": set or clear the notification-ring attention flag on
+///     the active pane of the addressed (or active) workspace's addressed
+///     (or active) tab. The explicit, reliable counterpart to the attention
+///     OSC: an agent that can't emit an escape (or a wrapper script) rings
+///     the pane it runs in via `ghostty +notify ring`. Browser panes have
+///     no terminal surface and answer NotATerminal. Targeting the currently
+///     visible+focused pane is accepted but the ring overlay won't draw on
+///     it (you'd be ringed around what you're looking at); the cross-level
+///     sidebar/tab dots still update.
+///   * "next": jump to the most-recent UNREAD notification's surface
+///     (cross-workspace, via jumpToSurface), mark that one Read, and reply
+///     {jumped:true, surface:<id>}. With no unread entries, replies
+///     {jumped:false}. Ignores workspace/tab (the target is the notifying
+///     pane, wherever it lives).
 fn ipcNotify(self: *App, req: *ipc.Request) anyerror!void {
     const server = self.ipc_server orelse return;
     const action = ipcArgString(req, "action") orelse return IpcError.MissingAction;
+
+    if (std.mem.eql(u8, action, "next")) {
+        try self.ipcNotifyNext(req);
+        return;
+    }
+
     const on = if (std.mem.eql(u8, action, "ring"))
         true
     else if (std.mem.eql(u8, action, "clear"))
@@ -3032,6 +3481,472 @@ fn ipcNotify(self: *App, req: *ipc.Request) anyerror!void {
     const surface = pane.surface() orelse return IpcError.NotATerminal;
     target.window.setAttentionForSurface(surface, on);
     server.sendOk(req.id, null) catch {};
+}
+
+/// `+notify next`: jump to the most-recent unread notification's surface.
+/// Resolves the freshest Unread entry, validates its (window, surface) by
+/// address via jumpToSurface (the entry pointers may dangle), marks it Read
+/// (Unread→Read lifecycle, which also lowers the taskbar badge), and replies
+/// {jumped, surface}. The display index is recomputed against
+/// firstUnreadNotif so markNotifEntryRead targets the same entry we jumped to.
+fn ipcNotifyNext(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+
+    const display_idx = self.firstUnreadNotif() orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    const entry = self.notifAt(display_idx) orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    const window = entry.window;
+    const surface = entry.surface;
+
+    // The entry's (window, surface) pointers may dangle: dropDesktopNotifsForWindow
+    // scrubs entries only when their whole *window* is destroyed, NOT when an
+    // individual pane/tab closes inside a surviving window. So validate the
+    // surface by address BEFORE dereferencing it (mirrors jumpToSurface's own
+    // re-find). A stale entry is a clean no-op, never a use-after-free.
+    const live = blk: {
+        for (self.windows.items) |w| {
+            if (w == window) {
+                if (w.closing) break :blk false;
+                break :blk w.findLocOfSurface(surface) != null;
+            }
+        }
+        break :blk false;
+    };
+    if (!live) {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    }
+
+    // Now safe to read: snapshot the surface id before jumping (jumpToSurface
+    // may re-layout the pane tree, but the Surface object itself is stable).
+    const surface_id: u64 = if (surface.core_surface_initialized)
+        surface.core_surface.id
+    else
+        0;
+
+    const jumped = self.jumpToSurface(window, surface);
+    if (jumped) _ = self.markNotifEntryRead(display_idx);
+
+    var buf: [64]u8 = undefined;
+    const reply = std.fmt.bufPrint(
+        &buf,
+        "{{\"jumped\":{s},\"surface\":{d}}}",
+        .{ if (jumped) "true" else "false", surface_id },
+    ) catch "{\"jumped\":false}";
+    server.sendOk(req.id, reply) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// Agent IPC: orchestration scripting (surface/split/status/log/read-screen/
+// session). The agent-supervises-agent substrate. All run on the GUI thread
+// and reply synchronously (they touch the live model / core terminal).
+// ---------------------------------------------------------------------------
+
+/// Read the optional u64 "surface" arg: a stable surface id
+/// (GHOSTTY_SURFACE_ID). Pure logic in ipc.zig so the protocol tests cover it.
+const ipcArgU64 = ipc.argU64;
+
+/// A resolved (workspace, tab) target within the IPC target window. tab
+/// defaults to the workspace's active tab when "tab" is absent, and is
+/// range-validated. Workspace resolution reuses ipcResolveWorkspace.
+const IpcTabTarget = struct {
+    window: *Window,
+    ws: *Window.Workspace,
+    ws_idx: usize,
+    tab_idx: usize,
+};
+
+fn ipcResolveTab(self: *App, req: *ipc.Request) IpcError!IpcTabTarget {
+    const t = try self.ipcResolveWorkspace(req);
+    const tab_idx: usize = if (ipcArgU32(req, "tab")) |tab| tab else t.ws.active_tab;
+    if (tab_idx >= t.ws.tab_count) return IpcError.UnknownTab;
+    return .{ .window = t.window, .ws = t.ws, .ws_idx = t.ws_idx, .tab_idx = tab_idx };
+}
+
+/// A pane located across every live window, with the coordinates that
+/// address it. Returned by ipcFindSurfaceById.
+const SurfaceLoc = struct {
+    window: *Window,
+    ws_idx: usize,
+    tab_idx: usize,
+    surface: *Surface,
+};
+
+/// Find a terminal surface by its stable core id (GHOSTTY_SURFACE_ID)
+/// across all live windows. Only surfaces whose core is initialized have
+/// a valid id; the id is read WITHOUT touching unready cores. Returns the
+/// owning window + workspace/tab indices so callers can focus or address it.
+fn ipcFindSurfaceById(self: *App, want: u64) ?SurfaceLoc {
+    for (self.windows.items) |w| {
+        if (w.closing) continue;
+        for (w.workspaces[0..w.workspace_count], 0..) |*ws, wi| {
+            for (0..ws.tab_count) |t| {
+                var it = ws.tab_trees[t].iterator();
+                while (it.next()) |entry| {
+                    const surface = switch (entry.view.content) {
+                        .terminal => |s| s,
+                        .browser => continue,
+                    };
+                    if (!surface.core_surface_initialized) continue;
+                    if (surface.core_surface.id == want) {
+                        return .{ .window = w, .ws_idx = wi, .tab_idx = t, .surface = surface };
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/// The stable surface id of a terminal pane, or null if it is a browser
+/// or its core is not yet initialized (no id assigned).
+fn ipcSurfaceId(pane: *Pane) ?u64 {
+    const surface = pane.surface() orelse return null;
+    if (!surface.core_surface_initialized) return null;
+    return surface.core_surface.id;
+}
+
+/// surface-list {[workspace],[tab]} → [{id, kind, focused, title}] for
+/// every pane in the addressed (or active) tab. `id` is the stable surface
+/// id for terminals (GHOSTTY_SURFACE_ID) and the ipc_id for browsers
+/// (disjoint spaces, but kind disambiguates); a terminal whose core isn't
+/// ready yet reports id 0. `focused` marks the tab's active pane.
+fn ipcSurfaceList(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const ws = target.ws;
+    const alloc = self.core_app.alloc;
+    const active = ws.tab_active_pane[target.tab_idx];
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.append(alloc, '[');
+    var first = true;
+    var it = ws.tab_trees[target.tab_idx].iterator();
+    while (it.next()) |entry| {
+        const pane = entry.view;
+        if (!first) try buf.append(alloc, ',');
+        first = false;
+        switch (pane.content) {
+            .terminal => |surface| {
+                const sid: u64 = if (surface.core_surface_initialized) surface.core_surface.id else 0;
+                try buf.writer(alloc).print(
+                    "{{\"id\":{d},\"kind\":\"terminal\",\"focused\":{},\"title\":",
+                    .{ sid, pane == active },
+                );
+                // The window-level title buffer reflects the active pane;
+                // per-pane terminals don't carry an independent title here,
+                // so report the tab title (best-effort display text).
+                try self.ipcWriteJsonUtf16(&buf, ws.tab_titles[target.tab_idx][0..ws.tab_title_lens[target.tab_idx]]);
+                try buf.append(alloc, '}');
+            },
+            .browser => |browser| {
+                try buf.writer(alloc).print(
+                    "{{\"id\":{d},\"kind\":\"browser\",\"focused\":{},\"title\":",
+                    .{ browser.ipc_id, pane == active },
+                );
+                try self.ipcWriteJsonUtf16(&buf, ws.tab_titles[target.tab_idx][0..ws.tab_title_lens[target.tab_idx]]);
+                try buf.append(alloc, '}');
+            },
+        }
+    }
+    try buf.append(alloc, ']');
+    server.sendOk(req.id, buf.items) catch {};
+}
+
+/// surface-focus {surface} | {workspace, tab, pane} → focus a pane. With a
+/// `surface` id the owning window/workspace/tab is selected and the pane
+/// focused; otherwise the pane is addressed by (workspace, tab, pane-index
+/// within the tab tree, in iteration order).
+fn ipcSurfaceFocus(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+
+    if (ipcArgU64(req, "surface")) |sid| {
+        const loc = self.ipcFindSurfaceById(sid) orelse return IpcError.UnknownSurface;
+        loc.window.selectWorkspace(loc.ws_idx);
+        loc.window.selectTabIndex(loc.tab_idx);
+        // Focus the specific pane within the tab.
+        if (loc.ws_idx < loc.window.workspace_count) {
+            const ws = &loc.window.workspaces[loc.ws_idx];
+            if (ws.findHandle(loc.tab_idx, loc.surface.pane orelse return IpcError.UnknownSurface)) |_| {
+                ws.tab_active_pane[loc.tab_idx] = loc.surface.pane.?;
+            }
+        }
+        loc.surface.pane.?.focus();
+        server.sendOk(req.id, null) catch {};
+        return;
+    }
+
+    // Address by (workspace, tab, pane index in tree iteration order).
+    const target = try self.ipcResolveTab(req);
+    const pane_idx = ipcArgU32(req, "pane") orelse return IpcError.MissingIndex;
+    var i: usize = 0;
+    var found: ?*Pane = null;
+    var it = target.ws.tab_trees[target.tab_idx].iterator();
+    while (it.next()) |entry| : (i += 1) {
+        if (i == pane_idx) {
+            found = entry.view;
+            break;
+        }
+    }
+    const pane = found orelse return IpcError.UnknownPane;
+    target.window.selectWorkspace(target.ws_idx);
+    target.window.selectTabIndex(target.tab_idx);
+    target.ws.tab_active_pane[target.tab_idx] = pane;
+    pane.focus();
+    server.sendOk(req.id, null) catch {};
+}
+
+/// new-split {dir:"right"|"down", [workspace],[tab],[command]} → split the
+/// addressed (or active) tab's active pane and reply with the new pane's
+/// surface id. Selects the target workspace/tab first (newSplit* act on the
+/// active workspace), then splits. With `command`, the split runs that
+/// shell (split on whitespace); without it, it inherits the source pane's
+/// backend (matching the UI split UX).
+fn ipcNewSplit(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const dir_str = ipcArgString(req, "dir") orelse
+        ipcArgString(req, "direction") orelse return IpcError.MissingDirection;
+    const direction: SplitTree(Pane).Split.Direction = if (std.mem.eql(u8, dir_str, "right"))
+        .right
+    else if (std.mem.eql(u8, dir_str, "down"))
+        .down
+    else
+        return IpcError.BadDirection;
+
+    const target = try self.ipcResolveTab(req);
+    const window = target.window;
+    if (window.is_quick_terminal) return IpcError.QuickTerminal;
+
+    if (target.ws_idx != window.active_workspace) window.selectWorkspace(target.ws_idx);
+    if (target.tab_idx != target.ws.active_tab) window.selectTabIndex(target.tab_idx);
+
+    if (ipcArgString(req, "command")) |command_str| {
+        const alloc = self.core_app.alloc;
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(alloc);
+        var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
+        while (it.next()) |tok| try argv.append(alloc, tok);
+        if (argv.items.len > 0) {
+            try window.newSplitWithCommand(direction, argv.items);
+        } else {
+            try window.newSplit(direction);
+        }
+    } else {
+        try window.newSplit(direction);
+    }
+
+    // newSplit* focus the new pane: it is now the tab's active pane.
+    const new_pane = window.getActivePane() orelse return IpcError.NoWindow;
+    const sid: u64 = ipcSurfaceId(new_pane) orelse 0;
+    var data_buf: [32]u8 = undefined;
+    const data = std.fmt.bufPrint(&data_buf, "{{\"id\":{d}}}", .{sid}) catch
+        return error.NoSpaceLeft;
+    server.sendOk(req.id, data) catch {};
+}
+
+/// set-status {[workspace],[tab],[text]} → set (or clear, when text is
+/// empty/absent) the addressed tab's orchestration status string. Stored on
+/// the workspace; the sidebar renders it (Stage 2). Repaints the sidebar.
+fn ipcSetStatus(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const text = ipcArgString(req, "text") orelse "";
+    target.ws.setTabStatusText(target.tab_idx, text);
+    target.window.invalidateSidebar();
+    server.sendOk(req.id, null) catch {};
+}
+
+/// set-progress {[workspace],[tab], value} → set the addressed tab's
+/// progress percent (0..100), or clear it with value -1 (or absent).
+fn ipcSetProgress(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const value = ipc.argI64Named(req, "value") orelse -1;
+    if (value < 0) {
+        target.ws.setTabProgress(target.tab_idx, null);
+    } else if (value <= 100) {
+        target.ws.setTabProgress(target.tab_idx, @intCast(value));
+    } else {
+        return IpcError.BadProgress;
+    }
+    target.window.invalidateSidebar();
+    server.sendOk(req.id, null) catch {};
+}
+
+/// log {[workspace],[tab], text} → append a line to the addressed tab's
+/// ring log buffer (and the global notification panel). Repaints the
+/// sidebar. The line is truncated to the ring's per-line cap.
+fn ipcLog(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const text = ipcArgString(req, "text") orelse return IpcError.MissingText;
+    const target = try self.ipcResolveTab(req);
+    target.ws.pushTabLog(target.tab_idx, text);
+
+    // Also surface it in the global notif panel (reuses pushNotif), tied
+    // to the addressed tab's active pane when it is a terminal.
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    if (pane.surface()) |surface| {
+        const alloc = self.core_app.alloc;
+        const body_w = std.unicode.utf8ToUtf16LeAlloc(alloc, text[0..@min(text.len, 128)]) catch null;
+        defer if (body_w) |bw| alloc.free(bw);
+        const title_w = std.unicode.utf8ToUtf16LeStringLiteral("log");
+        self.pushNotif(.osc, target.window, surface, title_w, if (body_w) |bw| bw else &.{});
+    } else {
+        target.window.invalidateSidebar();
+    }
+    server.sendOk(req.id, null) catch {};
+}
+
+/// read-screen {[workspace],[tab],[lines],[scrollback]} → the addressed
+/// (or active) pane terminal's screen text as UTF-8. By default the visible
+/// active screen; with `scrollback:true` the full screen including
+/// scrollback history. The terminal screen is locked under the renderer
+/// mutex while it is dumped. The framer's 1 MiB cap bounds very long
+/// scrollback (truncated by the wire layer). This is the agent-reads-agent
+/// verb. `lines` (when given) keeps only the last N non-empty-trimmed
+/// physical lines of the dump (a cheap tail; v1 limitation noted in the
+/// CLI help).
+fn ipcReadScreen(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    const surface = pane.surface() orelse return IpcError.NotATerminal;
+    if (!surface.core_surface_ready) return IpcError.CoreNotReady;
+
+    const alloc = self.core_app.alloc;
+    const scrollback = ipcArgBool(req, "scrollback") orelse false;
+
+    // Dump under the renderer mutex: the screen is shared with the
+    // renderer/IO threads. dumpStringAlloc walks the active screen
+    // (visible) or the full screen (scrollback) as plain UTF-8.
+    const dump: []const u8 = dump: {
+        const cs = &surface.core_surface;
+        cs.renderer_state.mutex.lock();
+        defer cs.renderer_state.mutex.unlock();
+        // ScreenSet.active is already a *Screen.
+        const screen = cs.io.terminal.screens.active;
+        const point: @import("../../terminal/main.zig").point.Point =
+            if (scrollback) .{ .screen = .{ .x = 0, .y = 0 } } else .{ .active = .{ .x = 0, .y = 0 } };
+        break :dump try screen.dumpStringAlloc(alloc, point);
+    };
+    defer alloc.free(dump);
+
+    // Optional tail: keep only the last N lines.
+    const text: []const u8 = if (ipcArgU32(req, "lines")) |n| blk: {
+        if (n == 0) break :blk dump;
+        var count: usize = 0;
+        var i: usize = dump.len;
+        // Walk back over up to N newline-separated lines.
+        while (i > 0) {
+            const nl = std.mem.lastIndexOfScalar(u8, dump[0..i], '\n') orelse {
+                break;
+            };
+            count += 1;
+            if (count >= n) {
+                break :blk dump[nl + 1 ..];
+            }
+            i = nl;
+        }
+        break :blk dump;
+    } else dump;
+
+    // Reply as a JSON string (escaped). The dump can be large; cap it
+    // generously below the framer's 1 MiB so the response (with escaping
+    // overhead) still fits.
+    const max_payload: usize = 768 * 1024;
+    const clipped = if (text.len > max_payload) text[text.len - max_payload ..] else text;
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.json.Stringify.value(clipped, .{}, &aw.writer);
+    server.sendOk(req.id, aw.written()) catch {};
+}
+
+/// Resolve the surface a session verb targets: an explicit `surface` id, or
+/// the addressed (or active) tab's active terminal pane. Returns the surface
+/// id and a pointer to the surface (for relaunch). The id is the core
+/// Surface.id (stable, == GHOSTTY_SURFACE_ID).
+const SessionTarget = struct { id: u64, surface: *Surface };
+
+fn ipcResolveSessionTarget(self: *App, req: *ipc.Request) IpcError!SessionTarget {
+    if (ipcArgU64(req, "surface")) |sid| {
+        const loc = self.ipcFindSurfaceById(sid) orelse return IpcError.UnknownSurface;
+        return .{ .id = sid, .surface = loc.surface };
+    }
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    const surface = pane.surface() orelse return IpcError.NotATerminal;
+    if (!surface.core_surface_initialized) return IpcError.CoreNotReady;
+    return .{ .id = surface.core_surface.id, .surface = surface };
+}
+
+/// session-capture {agent, session, [surface]|[workspace,tab]} → record the
+/// (surface → agent + native session id) association in the store. Default
+/// target is the calling pane (the pane whose shell ran the hook); an
+/// explicit `surface` (GHOSTTY_SURFACE_ID, the hook's own pane) wins and
+/// removes the active-pane race.
+fn ipcSessionCapture(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const agent_name = ipcArgString(req, "agent") orelse return IpcError.MissingAgent;
+    const session = ipcArgString(req, "session") orelse return IpcError.MissingSession;
+    const target = try self.ipcResolveSessionTarget(req);
+
+    const kind = agent_session.AgentKind.parse(agent_name);
+    // put returns SessionIdTooLong for an oversized (hostile/garbled) id;
+    // surface it verbatim to the client rather than masking it as OOM.
+    try self.session_store.put(target.id, kind, session);
+    // Repaint so a sidebar "resumable" affordance (Stage 2) can reflect it.
+    if (self.ipcFindSurfaceById(target.id)) |loc| loc.window.invalidateSidebar();
+
+    // 20 (u64 max digits) + agent tag + JSON scaffold; 96 is ample.
+    var data_buf: [96]u8 = undefined;
+    const data = std.fmt.bufPrint(&data_buf, "{{\"surface\":{d},\"agent\":\"{s}\"}}", .{ target.id, @tagName(kind) }) catch
+        return error.NoSpaceLeft;
+    server.sendOk(req.id, data) catch {};
+}
+
+/// session-resume {[surface]|[workspace,tab]} → look up the target surface's
+/// captured agent + id and replay the agent's resume argv into that pane via
+/// the keystroke path (ipcSendText, +CR), so the agent relaunches in place.
+/// NoSession if nothing was captured for the surface; NoResumeRecipe if the
+/// captured agent has no resume command (`.unknown`).
+fn ipcSessionResume(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveSessionTarget(req);
+    const entry = self.session_store.get(target.id) orelse return IpcError.NoSession;
+
+    var argv_buf: [agent_session.max_resume_argv][]const u8 = undefined;
+    const n = entry.agent.resumeArgv(entry.session_id, &argv_buf) catch
+        return IpcError.NoResumeRecipe;
+
+    // Join argv into a single shell command line. The pieces are an exe
+    // name + flags + a session id (UUID/token), none of which contain
+    // spaces in the supported agents, so a plain space join is safe.
+    const alloc = self.core_app.alloc;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    for (argv_buf[0..n], 0..) |part, i| {
+        if (i > 0) try line.append(alloc, ' ');
+        try line.appendSlice(alloc, part);
+    }
+    try target.surface.ipcSendText(line.items, true);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// session-list → dump the whole agent-session store as JSON
+/// `[{surface, agent, session}]`.
+fn ipcSessionList(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const alloc = self.core_app.alloc;
+    const json = try self.session_store.serialize(alloc);
+    defer alloc.free(json);
+    server.sendOk(req.id, json) catch {};
 }
 
 /// Append an entry to the sidebar notification log, bump the unread
@@ -3058,18 +3973,102 @@ pub fn pushNotif(
     @memcpy(entry.body[0..entry.body_len], body[0..entry.body_len]);
     self.notif_log.push(entry);
     for (self.windows.items) |w| w.invalidateSidebar();
+    // Received → Unread: the new entry bumps the taskbar overlay count.
+    // (showDesktopNotification also refreshes after a balloon, but pushes
+    // from the bell/exit paths land here only, so refresh unconditionally.)
+    self.refreshTaskbarBadges();
 }
 
-/// Reset the unread badge (the sidebar bell was clicked).
+/// Reset the unread badge and mark every live entry Read (the user opened
+/// the notifications panel / clicked the bell — they have now "viewed" the
+/// log). Repaints only when something actually changed. This is the
+/// Unread→Read lifecycle transition for the whole log.
 pub fn markNotifsRead(self: *App) void {
-    if (!self.notif_log.markRead()) return;
+    var changed = self.notif_log.markRead();
+    for (&self.notif_log.slots) |*slot| {
+        if (slot.*) |*entry| {
+            if (!entry.read) {
+                entry.read = true;
+                changed = true;
+            }
+        }
+    }
+    if (!changed) return;
     for (self.windows.items) |w| w.invalidateSidebar();
+    // Unread → Read for the whole log: clear/lower the taskbar badge.
+    self.refreshTaskbarBadges();
+}
+
+/// Count of live notification-log entries still marked Unread. This is the
+/// number drawn on the taskbar overlay badge (cmux's dock-badge analog) and
+/// is distinct from `notif_log.unread`, which counts *pushes* since the
+/// last markRead and drives the sidebar bell badge. Counting live Unread
+/// entries means the taskbar badge clears correctly once the panel is
+/// opened (markNotifsRead flips every entry to Read) or each entry is
+/// jumped to.
+pub fn unreadNotifCount(self: *const App) usize {
+    return self.notif_log.unreadLive();
+}
+
+/// Update every window's taskbar-button overlay to reflect the current
+/// unread-notification count (0 clears the badge). Lazily creates the
+/// process-wide ITaskbarList3 on first use; a creation failure (no COM)
+/// makes this a silent no-op forever after. Called whenever the unread
+/// count can change: a push, a markRead, a jump, or a clear.
+pub fn refreshTaskbarBadges(self: *App) void {
+    if (self.taskbar_list == null) {
+        if (self.taskbar_tried) return;
+        self.taskbar_tried = true;
+        self.taskbar_list = taskbar.TaskbarList.create();
+        if (self.taskbar_list == null) return;
+    }
+    const tl = &self.taskbar_list.?;
+    const count = self.unreadNotifCount();
+    for (self.windows.items) |w| {
+        if (w.closing) continue;
+        if (w.hwnd) |hwnd| tl.setOverlayCount(hwnd, count);
+    }
+}
+
+/// Display index (0 = newest) of the most-recent Unread notification, or
+/// null when every live entry has been Read. Walks newest-first so the
+/// "jump to most recent unread" verb lands on the freshest pending entry.
+/// Uses the same hole-skipping display mapping as `notifAt`.
+pub fn firstUnreadNotif(self: *const App) ?usize {
+    return self.notif_log.firstUnread();
+}
+
+/// Mark a single entry (by display index) Read and adjust the unread badge
+/// down by one (saturating at 0) so the badge tracks the per-entry state.
+/// Used when the user jumps to one entry rather than viewing the whole
+/// panel. Returns true when the entry existed and flipped Unread→Read.
+pub fn markNotifEntryRead(self: *App, display_idx: usize) bool {
+    var seen: usize = 0;
+    const cap = NOTIF_LOG_CAP;
+    var offset: usize = 0;
+    while (offset < cap) : (offset += 1) {
+        const idx = (self.notif_log.next + cap - 1 - offset) % cap;
+        if (self.notif_log.slots[idx]) |*entry| {
+            if (seen == display_idx) {
+                if (entry.read) return false;
+                entry.read = true;
+                if (self.notif_log.unread > 0) self.notif_log.unread -= 1;
+                // Unread → Read for one entry: lower the taskbar badge.
+                self.refreshTaskbarBadges();
+                return true;
+            }
+            seen += 1;
+        }
+    }
+    return false;
 }
 
 /// Drop every notification log entry and the unread badge.
 pub fn clearNotifs(self: *App) void {
     self.notif_log.clear();
     for (self.windows.items) |w| w.invalidateSidebar();
+    // Cleared: remove the taskbar badge entirely.
+    self.refreshTaskbarBadges();
 }
 
 /// Number of live entries in the notification log.
@@ -3642,6 +4641,14 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == WM_APP_WS_META) {
+        // lparam is the *ws_meta.Result handed over by a worker thread; we
+        // own it now and applyWorkspaceMetadata frees it.
+        const result: *ws_meta.Result = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        app.applyWorkspaceMetadata(result);
+        return 0;
+    }
+
     if (msg == WM_APP_UPDATE_AVAILABLE) {
         // wparam = heap pointer to the version string, lparam = length.
         // We own the buffer and must free it after use.
@@ -3695,6 +4702,13 @@ fn msgWndProc(
         return 0;
     }
 
+    // Sidebar metadata refresh tick: kick off the off-thread git/port/PR
+    // scan for the visible workspaces.
+    if (msg == w32.WM_TIMER and wparam == WS_META_TIMER_ID) {
+        app.refreshWorkspaceMetadata();
+        return 0;
+    }
+
     // Notification icon cleanup timers. Each notification kind has its
     // own (uID, timer-id) pair so an in-flight balloon isn't removed by
     // an unrelated timeout.
@@ -3724,6 +4738,15 @@ fn msgWndProc(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test {
+    // Pull in the tests of modules App owns but only references by
+    // specific decls (so their `test` blocks would otherwise not be
+    // collected by the unit-test root). Mirrors Window.zig's
+    // `_ = WindowState`.
+    _ = ws_meta;
+    _ = agent_session;
+}
 
 test "unit: parseAttentionOsc recognizes the ring/clear sentinel" {
     // ring → true, clear → false.
@@ -3960,6 +4983,63 @@ test "unit: notif ring push after clear restarts from a wrapped state" {
     try testing.expectEqual(@as(u32, 7), ring.at(1).?.*);
     try testing.expectEqual(@as(?*const u32, null), ring.at(2));
     try testing.expectEqual(@as(usize, 2), ring.unread);
+}
+
+test "unit: shouldToast suppresses only when the user is looking at the source" {
+    // Backgrounded window: always toast regardless of workspace/panel.
+    try testing.expect(shouldToast(.{ .window_foreground = false, .workspace_active = false, .panel_open = false }));
+    try testing.expect(shouldToast(.{ .window_foreground = false, .workspace_active = true, .panel_open = false }));
+    try testing.expect(shouldToast(.{ .window_foreground = false, .workspace_active = true, .panel_open = true }));
+
+    // Foreground + sending workspace is the active one: suppress (the user
+    // is staring right at the source pane's workspace).
+    try testing.expect(!shouldToast(.{ .window_foreground = true, .workspace_active = true, .panel_open = false }));
+
+    // Foreground + a DIFFERENT workspace active + panel closed: toast (the
+    // user can't see the notifying pane and isn't watching the log).
+    try testing.expect(shouldToast(.{ .window_foreground = true, .workspace_active = false, .panel_open = false }));
+
+    // Foreground + different workspace + panel OPEN: suppress (the user is
+    // actively watching the in-app notification log).
+    try testing.expect(!shouldToast(.{ .window_foreground = true, .workspace_active = false, .panel_open = true }));
+
+    // Foreground + both true: suppress.
+    try testing.expect(!shouldToast(.{ .window_foreground = true, .workspace_active = true, .panel_open = true }));
+}
+
+test "unit: notif ring unreadLive and firstUnread track per-entry read state" {
+    const E = struct { v: u32, read: bool = false };
+    var ring: NotifRing(E, 4) = .{};
+
+    // Empty: nothing unread.
+    try testing.expectEqual(@as(usize, 0), ring.unreadLive());
+    try testing.expectEqual(@as(?usize, null), ring.firstUnread());
+
+    ring.push(.{ .v = 1 });
+    ring.push(.{ .v = 2 });
+    ring.push(.{ .v = 3 });
+    // All three Unread; newest (display 0) is the first unread.
+    try testing.expectEqual(@as(usize, 3), ring.unreadLive());
+    try testing.expectEqual(@as(?usize, 0), ring.firstUnread());
+
+    // Mark the newest (display 0 → v=3) Read: count drops, firstUnread
+    // advances to the next-newest still-unread entry (display 1 → v=2).
+    // Flip the slot holding v=3 (the newest, written last at next-1).
+    for (&ring.slots) |*slot| {
+        if (slot.*) |*e| if (e.v == 3) {
+            e.read = true;
+        };
+    }
+    try testing.expectEqual(@as(usize, 2), ring.unreadLive());
+    try testing.expectEqual(@as(?usize, 1), ring.firstUnread());
+
+    // Mark the rest Read: nothing unread, entries still live.
+    for (&ring.slots) |*slot| {
+        if (slot.*) |*e| e.read = true;
+    }
+    try testing.expectEqual(@as(usize, 0), ring.unreadLive());
+    try testing.expectEqual(@as(?usize, null), ring.firstUnread());
+    try testing.expectEqual(@as(usize, 3), ring.count());
 }
 
 test "unit: set command replaces the key on a final line without a newline" {

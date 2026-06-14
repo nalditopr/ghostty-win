@@ -1441,6 +1441,34 @@ pub extern "gdi32" fn CreateDIBSection(
 ) callconv(.winapi) ?HANDLE;
 
 // -----------------------------------------------------------------------
+// Icon construction (taskbar overlay badge)
+// -----------------------------------------------------------------------
+
+pub extern "gdi32" fn CreateBitmap(
+    nWidth: i32,
+    nHeight: i32,
+    nPlanes: u32,
+    nBitCount: u32,
+    lpBits: ?*const anyopaque,
+) callconv(.winapi) ?HANDLE;
+
+pub const ICONINFO = extern struct {
+    fIcon: i32,
+    xHotspot: u32,
+    yHotspot: u32,
+    hbmMask: ?HANDLE,
+    hbmColor: ?HANDLE,
+};
+
+pub extern "user32" fn CreateIconIndirect(
+    piconinfo: *ICONINFO,
+) callconv(.winapi) ?HICON;
+
+pub extern "user32" fn DestroyIcon(
+    hIcon: HICON,
+) callconv(.winapi) i32;
+
+// -----------------------------------------------------------------------
 // Mouse activate
 // -----------------------------------------------------------------------
 

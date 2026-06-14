@@ -1342,10 +1342,35 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        // Windows has no PTY-level foreground process group concept; the
+        // ConPTY child PID is the process Command spawned. The PID is read
+        // from the immutable process HANDLE captured at spawn, so it is a
+        // safe lock-free read (the value never changes after start). The
+        // sidebar port walker uses it as the root of its process-tree scan.
+        if (comptime builtin.os.tag == .windows) {
+            switch (info) {
+                .foreground_pid => {
+                    const proc = self.process orelse return null;
+                    const handle = switch (proc) {
+                        .fork_exec => |cmd| cmd.pid orelse return null,
+                        .flatpak => return null,
+                    };
+                    const pid = GetProcessId(handle);
+                    if (pid == 0) return null;
+                    return pid;
+                },
+                else => {},
+            }
+        }
         const pty = &(self.pty orelse return null);
         return pty.getProcessInfo(info);
     }
 };
+
+/// Map a process HANDLE to its numeric PID (Windows). Not declared in the
+/// std/internal_os windows bindings, so declared locally; used only by
+/// Subprocess.getProcessInfo on Windows.
+extern "kernel32" fn GetProcessId(Process: windows.HANDLE) callconv(.winapi) windows.DWORD;
 
 /// The read thread sits in a loop doing the following pseudo code:
 ///

@@ -5,7 +5,7 @@ const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 
 /// Options exists so the shared CLI machinery (completions, docs,
-/// `Action.options()`) has a type to reflect over. `+notify` parses its
+/// `Action.options()`) has a type to reflect over. `+status` parses its
 /// own positional subcommand and flags in `run`, so the only flag handled
 /// here is `--help`.
 pub const Options = struct {
@@ -20,38 +20,23 @@ pub const Options = struct {
     }
 };
 
-/// The `+notify` command sets or clears the per-pane notification ring (a
-/// "needs attention / waiting for input" indicator) of a running Ghostty
-/// instance over its per-process agent IPC pipe — the explicit,
-/// shell-agnostic counterpart to the attention OSC, alongside
-/// `+workspace`, `+tab`, `+send`, and `+browser`.
+/// The `+status` command sets the per-tab orchestration status string and
+/// progress of a running Ghostty instance over its per-process agent IPC
+/// pipe — the agent-pushed metadata the session sidebar renders, alongside
+/// `+log` and `+notify`.
 ///
-/// Subcommands (both accept `--workspace I` and `--tab J` to target a
-/// pane other than the active one):
+/// Subcommands (both accept `--workspace I` and `--tab J` to target a tab
+/// other than the active one):
 ///
-///   * `ring [--workspace I] [--tab J]`: Flag the target tab's active
-///     pane for attention. Its sidebar workspace row and top tab show a
-///     blue dot, and — when the pane is in a visible split but not the
-///     focused pane — a blue ring is drawn around it. The flag clears
-///     automatically when the pane gains focus or its tab+workspace
-///     become active.
+///   * `set <text>`: Set the addressed tab's status string ("running
+///     tests", "waiting", "blocked", ...). An empty `""` clears it.
 ///
-///   * `clear [--workspace I] [--tab J]`: Clear the attention flag on the
-///     target tab's active pane.
-///
-///   * `next`: Jump to the most-recent UNREAD entry in the notifications
-///     panel — raise its window, select its workspace+tab, and focus its
-///     pane (a cross-workspace jump), then mark that entry Read. Replies
-///     `{jumped:true,surface:<id>}` on success or `{jumped:false}` when
-///     there are no unread notifications. Ignores `--workspace`/`--tab`
-///     (the destination is wherever the notifying pane lives).
-///
-/// The target pane must be a terminal — a browser pane has no terminal
-/// surface and is rejected.
+///   * `progress <0-100|clear>`: Set the addressed tab's progress percent
+///     (rendered as a thin bar under the row), or `clear` to remove it.
 ///
 /// The target instance's IPC pipe is `ghostty-ipc-<pid>`. The pid is taken
 /// from the `GHOSTTY_PID` environment variable (exported into every shell
-/// Ghostty spawns); if it is unset, `+notify` connects to the sole
+/// Ghostty spawns); if it is unset, `+status` connects to the sole
 /// `ghostty-ipc-*` pipe present and errors if there are zero or more than
 /// one.
 ///
@@ -63,7 +48,7 @@ pub fn run(alloc: Allocator) !u8 {
         var buf: [256]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&buf);
         const stderr = &stderr_writer.interface;
-        try stderr.print("+notify is only supported on Windows.\n", .{});
+        try stderr.print("+status is only supported on Windows.\n", .{});
         stderr.flush() catch {};
         return 1;
     }
@@ -71,8 +56,6 @@ pub fn run(alloc: Allocator) !u8 {
     return windows_impl.run(alloc);
 }
 
-/// All Windows-specific machinery, kept in a struct so the whole thing is
-/// only semantically analyzed on Windows.
 const windows_impl = if (builtin.os.tag == .windows) struct {
     const agent_ipc = @import("agent_ipc.zig").impl;
 
@@ -93,7 +76,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         return code;
     }
 
-    const Command = enum { ring, clear, next };
+    const Command = enum { set, progress };
 
     fn runImpl(
         alloc: Allocator,
@@ -104,7 +87,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         defer iter.deinit();
 
         const sub_str = iter.next() orelse {
-            try stderr.print("usage: ghostty +notify <ring|clear|next> [--workspace I] [--tab J]\n", .{});
+            try stderr.print("usage: ghostty +status <set <text>|progress <0-100|clear>> [--workspace I] [--tab J]\n", .{});
             return 1;
         };
         if (std.mem.eql(u8, sub_str, "--help") or std.mem.eql(u8, sub_str, "-h")) {
@@ -115,6 +98,9 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             return 1;
         };
 
+        // The first non-flag positional is the value (status text or
+        // progress). Flags may appear before or after it.
+        var value: ?[]const u8 = null;
         var workspace: ?u32 = null;
         var tab: ?u32 = null;
         while (iter.next()) |arg| {
@@ -151,28 +137,62 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 try stderr.print("unknown flag '{s}'\n", .{arg});
                 return 1;
+            } else if (value == null) {
+                value = arg;
             } else {
                 try stderr.print("unexpected argument '{s}'\n", .{arg});
                 return 1;
             }
         }
 
-        // Build the args object: action is required; workspace/tab are
-        // optional and only emitted when present.
-        var argbuf: std.ArrayList(u8) = .empty;
-        defer argbuf.deinit(alloc);
-        try argbuf.writer(alloc).print("{{\"action\":\"{s}\"", .{@tagName(sub)});
-        if (workspace) |n| try argbuf.writer(alloc).print(",\"workspace\":{d}", .{n});
-        if (tab) |n| try argbuf.writer(alloc).print(",\"tab\":{d}", .{n});
-        try argbuf.append(alloc, '}');
-
-        const request = try std.fmt.allocPrint(
-            alloc,
-            "{{\"id\":1,\"cmd\":\"notify\",\"args\":{s}}}\n",
-            .{argbuf.items},
-        );
-        defer alloc.free(request);
-
-        return agent_ipc.sendRequest(alloc, request, stdout, stderr);
+        switch (sub) {
+            .set => {
+                // Empty/absent text clears the status.
+                const text = value orelse "";
+                var argbuf: std.ArrayList(u8) = .empty;
+                defer argbuf.deinit(alloc);
+                try argbuf.writer(alloc).print("{{\"text\":{f}", .{std.json.fmt(text, .{})});
+                if (workspace) |n| try argbuf.writer(alloc).print(",\"workspace\":{d}", .{n});
+                if (tab) |n| try argbuf.writer(alloc).print(",\"tab\":{d}", .{n});
+                try argbuf.append(alloc, '}');
+                const request = try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"id\":1,\"cmd\":\"set-status\",\"args\":{s}}}\n",
+                    .{argbuf.items},
+                );
+                defer alloc.free(request);
+                return agent_ipc.sendRequest(alloc, request, stdout, stderr);
+            },
+            .progress => {
+                const v = value orelse {
+                    try stderr.print("progress requires a value (0-100 or 'clear')\n", .{});
+                    return 1;
+                };
+                const num: i64 = if (std.mem.eql(u8, v, "clear"))
+                    -1
+                else
+                    std.fmt.parseInt(i64, v, 10) catch {
+                        try stderr.print("invalid progress value '{s}' (use 0-100 or 'clear')\n", .{v});
+                        return 1;
+                    };
+                if (num > 100) {
+                    try stderr.print("progress must be 0-100 or 'clear'\n", .{});
+                    return 1;
+                }
+                var argbuf: std.ArrayList(u8) = .empty;
+                defer argbuf.deinit(alloc);
+                try argbuf.writer(alloc).print("{{\"value\":{d}", .{num});
+                if (workspace) |n| try argbuf.writer(alloc).print(",\"workspace\":{d}", .{n});
+                if (tab) |n| try argbuf.writer(alloc).print(",\"tab\":{d}", .{n});
+                try argbuf.append(alloc, '}');
+                const request = try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"id\":1,\"cmd\":\"set-progress\",\"args\":{s}}}\n",
+                    .{argbuf.items},
+                );
+                defer alloc.free(request);
+                return agent_ipc.sendRequest(alloc, request, stdout, stderr);
+            },
+        }
     }
 } else struct {};

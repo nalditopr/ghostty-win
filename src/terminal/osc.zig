@@ -326,6 +326,7 @@ pub const Parser = struct {
         @"7",
         @"8",
         @"9",
+        @"99",
         @"30",
         @"300",
         @"3008",
@@ -724,11 +725,24 @@ pub const Parser = struct {
                 else => self.state = .invalid,
             },
 
+            .@"9" => switch (c) {
+                ';' => self.captureTrailing(.fixed),
+                // OSC 99 is the Kitty notification protocol; bridge "9" → "99".
+                '9' => self.state = .@"99",
+                else => self.state = .invalid,
+            },
+
+            // OSC 99 metadata + payload can be large (notification bodies),
+            // so capture allocating like the other free-text OSCs.
+            .@"99" => switch (c) {
+                ';' => if (self.ensureAllocator()) self.captureTrailing(.allocating),
+                else => self.state = .invalid,
+            },
+
             .@"0",
             .@"22",
             .@"777",
             .@"8",
-            .@"9",
             => switch (c) {
                 ';' => self.captureTrailing(.fixed),
                 else => self.state = .invalid,
@@ -785,6 +799,8 @@ pub const Parser = struct {
             .@"8" => parsers.hyperlink.parse(self, terminator_ch),
 
             .@"9" => parsers.osc9.parse(self, terminator_ch),
+
+            .@"99" => parsers.kitty_notification.parse(self, terminator_ch),
 
             .@"21" => parsers.kitty_color.parse(self, terminator_ch),
 

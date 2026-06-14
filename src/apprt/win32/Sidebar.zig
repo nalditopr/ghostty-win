@@ -10,6 +10,12 @@ const Window = @import("Window.zig");
 const testing = std.testing;
 
 const ITEM_HEIGHT_BASE: i32 = 36;
+/// Extra unscaled height added to a row when the metadata second line is
+/// shown (Stage 2). The taller row fits the dim branch/ports/status line
+/// below the name. Applied uniformly to every row when metadata rendering
+/// is active so the index-based row geometry (hitTest/itemRect/drag) stays
+/// a single fixed stride.
+const META_EXTRA_BASE: i32 = 16;
 const PAD_BASE: i32 = 8;
 const ACCENT_W_BASE: i32 = 3;
 const EDGE_BAND_BASE: i32 = 5;
@@ -55,9 +61,18 @@ fn scaled(base: i32, scale: f32) i32 {
     return @intFromFloat(@round(@as(f32, @floatFromInt(base)) * scale));
 }
 
-/// Row height in pixels at the given DPI scale.
+/// Base (single-line) row height in pixels at the given DPI scale.
 pub fn itemHeight(scale: f32) i32 {
     return scaled(ITEM_HEIGHT_BASE, scale);
+}
+
+/// Row height in pixels at the given DPI scale when the metadata second
+/// line is shown (Stage 2). Taller than itemHeight by the metadata band.
+/// Callers pick between the two via Window.sidebarItemHeight and pass the
+/// chosen value into the pure geometry helpers (hitTest/itemRect/...), so
+/// those stay metadata-agnostic and their tests unchanged.
+pub fn itemHeightMeta(scale: f32) i32 {
+    return scaled(ITEM_HEIGHT_BASE + META_EXTRA_BASE, scale);
 }
 
 /// Width of the drag-resize grab band along the sidebar's right edge,
@@ -240,6 +255,98 @@ pub fn newSessionDropdownRect(tab_count: usize, width: i32, item_h: i32, scale: 
     return .{ .left = width - pad - dd, .top = top, .right = width - pad, .bottom = top + dd };
 }
 
+/// Compose the workspace metadata second line into UTF-8 in `out` and
+/// return its byte length. Pure (reads only the workspace's cached
+/// fields), so the composition rule — segment order, the "·" separators,
+/// the "⎇"/":" sigils, and the PR marker — is unit tested without GDI.
+/// Segments are emitted in priority order and dropped once the buffer is
+/// nearly full so the most useful info (branch, then ports, then status)
+/// survives truncation.
+pub fn formatMetaLineUtf8(wsp: *const Window.Workspace, out: []u8) usize {
+    var len: usize = 0;
+    const sep = " \u{00B7} "; // " · "
+
+    const append = struct {
+        fn f(buf: []u8, n: *usize, s: []const u8) void {
+            if (n.* + s.len > buf.len) return;
+            @memcpy(buf[n.*..][0..s.len], s);
+            n.* += s.len;
+        }
+    }.f;
+
+    // Branch: "⎇ <branch>".
+    const branch = wsp.gitBranch();
+    if (branch.len > 0) {
+        append(out, &len, "\u{2387} "); // ⎇
+        append(out, &len, branch);
+    }
+
+    // PR marker: "PR #NN" with a state sigil.
+    if (wsp.pr_state != .none) {
+        if (len > 0) append(out, &len, sep);
+        const sigil: []const u8 = switch (wsp.pr_state) {
+            .open => "PR #",
+            .draft => "draft #",
+            .merged => "merged #",
+            .closed => "closed #",
+            .none => unreachable,
+        };
+        append(out, &len, sigil);
+        var num_buf: [10]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{wsp.pr_number}) catch num_buf[0..0];
+        append(out, &len, num);
+    }
+
+    // Ports: ":3000, 8080".
+    const ports = wsp.portsSlice();
+    if (ports.len > 0) {
+        if (len > 0) append(out, &len, sep);
+        append(out, &len, ":");
+        for (ports, 0..) |p, i| {
+            if (i > 0) append(out, &len, ", ");
+            var pb: [6]u8 = undefined;
+            const ps = std.fmt.bufPrint(&pb, "{d}", .{p}) catch pb[0..0];
+            append(out, &len, ps);
+        }
+    }
+
+    // Latest agent status text: the first non-empty per-tab status.
+    var status: []const u8 = "";
+    for (0..wsp.tab_count) |t| {
+        const s = wsp.tabStatusText(t);
+        if (s.len > 0) {
+            status = s;
+            break;
+        }
+    }
+    if (status.len > 0) {
+        if (len > 0) append(out, &len, sep);
+        append(out, &len, status);
+    }
+
+    return len;
+}
+
+/// Build the metadata line as UTF-16 in `out16`, returning the code-unit
+/// length. Routes through formatMetaLineUtf8 then transcodes; on a
+/// transcode error returns 0 (no line drawn).
+fn buildMetaLine(wsp: *const Window.Workspace, out16: []u16) usize {
+    var utf8_buf: [512]u8 = undefined;
+    var n = formatMetaLineUtf8(wsp, &utf8_buf);
+    if (n == 0) return 0;
+    // utf8ToUtf16Le does NOT bounds-check its output: it would write past
+    // out16 if the source transcoded to more units than out16 holds. Since
+    // UTF-16 units <= UTF-8 bytes always, capping the source byte length to
+    // out16.len guarantees the write fits. Truncate on a codepoint boundary
+    // so the transcode never fails on a split multi-byte sequence.
+    if (n > out16.len) {
+        n = out16.len;
+        while (n > 0 and (utf8_buf[n] & 0xC0) == 0x80) n -= 1; // back off into a lead byte
+    }
+    const w = std.unicode.utf8ToUtf16Le(out16, utf8_buf[0..n]) catch return 0;
+    return w;
+}
+
 /// Paint the full sidebar strip using double-buffered GDI painting.
 /// Draws workspace rows (status dot, number, name) and the
 /// "+ New workspace" row. The caller owns BeginPaint/EndPaint.
@@ -288,6 +395,9 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     // Text colors.
     const active_text_color = w32.RGB(230, 230, 230);
     const inactive_text_color = w32.RGB(150, 150, 150);
+    // Metadata second-line text: dimmer than the inactive name color so the
+    // branch/ports/status read as secondary.
+    const meta_text_color = w32.RGB(120, 120, 120);
 
     // Status dot colors.
     const bell_color = w32.RGB(255, 185, 0);
@@ -313,7 +423,10 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     // The sidebar lists WORKSPACES, one row each. The "+ New workspace"
     // row sits directly below the last workspace row.
     const ws_count = win.workspace_count;
-    const item_h = itemHeight(win.scale);
+    // Single source of truth for the row stride (matches hitTest); taller
+    // when the metadata second line is active.
+    const show_meta = win.sidebarShowMetadata();
+    const item_h = win.sidebarItemHeight();
     const pad = scaled(PAD_BASE, win.scale);
     const accent_w = scaled(ACCENT_W_BASE, win.scale);
     // Fixed-width status dot column so numbers/titles align across rows.
@@ -328,10 +441,18 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
     else
         footer_top;
 
+    // Height of the first (name) line within a row. When the metadata
+    // second line is shown the row is taller; the name/dot/close glyph all
+    // center in this top band and the metadata line fills the band below.
+    const line1_h = if (show_meta) itemHeight(win.scale) else item_h;
+
     // --- Draw each workspace row ---
     for (0..ws_count) |i| {
         const wsp = &win.workspaces[i];
         var row = itemRect(i, sidebar_w, item_h);
+        // The top band the name/dot/close occupy (== the whole row when
+        // metadata is off).
+        const line1_bottom = row.top + line1_h;
         const is_active = (i == win.active_workspace);
         // The row reads as hovered when the cursor is over its body or
         // its close 'x'; the close glyph itself only appears in either
@@ -413,7 +534,7 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
                 .left = accent_w + pad,
                 .top = row.top,
                 .right = accent_w + pad + dot_w,
-                .bottom = row.bottom,
+                .bottom = line1_bottom,
             };
             _ = w32.DrawTextW(
                 mem_dc,
@@ -465,7 +586,7 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
                 .left = accent_w + pad + dot_w,
                 .top = row.top,
                 .right = text_right,
-                .bottom = row.bottom,
+                .bottom = line1_bottom,
             };
             _ = w32.DrawTextW(
                 mem_dc,
@@ -477,11 +598,18 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         }
 
         // Close 'x' — revealed on row hover, like the tab bar. Red when
-        // the cursor is specifically over the glyph.
+        // the cursor is specifically over the glyph. Centered in the top
+        // (name) band so it stays beside the name on a two-line row; the
+        // hit band (in hitTest) still spans the whole row by x.
         if (is_hovered) {
             _ = w32.SetTextColor(mem_dc, if (close_hovered) exited_color else inactive_text_color);
             const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
-            var close_rect = rowCloseRect(i, sidebar_w, item_h, win.scale);
+            var close_rect = rowCloseRect(i, sidebar_w, line1_h, win.scale);
+            // rowCloseRect lays the glyph out relative to row index*line1_h;
+            // shift it down to this row's actual top (rows stride item_h).
+            const dy = row.top - @as(i32, @intCast(i)) * line1_h;
+            close_rect.top += dy;
+            close_rect.bottom += dy;
             _ = w32.DrawTextW(
                 mem_dc,
                 x_char,
@@ -489,6 +617,31 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
                 &close_rect,
                 w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
             );
+        }
+
+        // --- Metadata second line (Stage 2) ---
+        // A dim line below the name: "⎇ branch · :port,port · status".
+        // Only drawn when the row is tall enough (metadata mode) and the
+        // workspace has something to show. Truncated with an ellipsis.
+        if (show_meta) {
+            var meta_buf: [256]u16 = undefined;
+            const meta_len = buildMetaLine(wsp, &meta_buf);
+            if (meta_len > 0) {
+                _ = w32.SetTextColor(mem_dc, meta_text_color);
+                var meta_rect = w32.RECT{
+                    .left = accent_w + pad + dot_w,
+                    .top = line1_bottom,
+                    .right = sidebar_w - pad,
+                    .bottom = row.bottom,
+                };
+                _ = w32.DrawTextW(
+                    mem_dc,
+                    @ptrCast(&meta_buf),
+                    @intCast(meta_len),
+                    &meta_rect,
+                    w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+                );
+            }
         }
     }
 
@@ -1635,4 +1788,119 @@ test "sidebar hitTest: zero scale degenerates to none without crashing" {
     try testing.expectEqual(@as(HitTarget, .none), hitTest(10, 399, ctx));
     // Rows above the panel still resolve.
     try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(10, 0, ctx));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: metadata row height + second-line composition.
+// ---------------------------------------------------------------------------
+
+test "sidebar itemHeightMeta is taller than itemHeight and scales" {
+    // Base 36 + meta 16 = 52 at 1.0; scales together.
+    try testing.expectEqual(@as(i32, 52), itemHeightMeta(1.0));
+    try testing.expect(itemHeightMeta(1.0) > itemHeight(1.0));
+    try testing.expectEqual(@as(i32, 104), itemHeightMeta(2.0));
+    try testing.expectEqual(@as(i32, 65), itemHeightMeta(1.25));
+}
+
+test "sidebar hitTest agrees with the taller metadata row stride" {
+    // The pure geometry helpers take item_h, so a metadata-tall row just
+    // means callers pass itemHeightMeta. Row math must stay consistent at
+    // that stride: rows, the close band, and the new-session row.
+    const item_h = itemHeightMeta(1.0); // 52
+    const ctx: HitCtx = .{
+        .item_h = item_h,
+        .workspace_count = 3,
+        .client_h = item_h * 6 + footerHeight(1.0),
+        .width = 220,
+        .scale = 1.0,
+        .panel_open = false,
+        .notif_count = 0,
+    };
+    // Row boundaries at the taller stride.
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(10, 0, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 0 }, hitTest(10, item_h - 1, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 1 }, hitTest(10, item_h, ctx));
+    try testing.expectEqual(HitTarget{ .workspace = 2 }, hitTest(10, 2 * item_h, ctx));
+    // Close band on each tall row (x in [192,212)).
+    try testing.expectEqual(HitTarget{ .row_close = 1 }, hitTest(200, item_h + 5, ctx));
+    // The new-session row sits right below the 3 tall rows.
+    try testing.expectEqual(@as(HitTarget, .new_session), hitTest(10, 3 * item_h, ctx));
+    // itemRect and hitTest agree at the taller stride.
+    for (0..3) |i| {
+        const r = itemRect(i, 220, item_h);
+        try testing.expectEqual(HitTarget{ .workspace = i }, hitTest(10, r.top, ctx));
+        try testing.expectEqual(HitTarget{ .workspace = i }, hitTest(10, r.bottom - 1, ctx));
+    }
+}
+
+/// A bare workspace for metadata-line composition tests: only the fields
+/// formatMetaLineUtf8 reads are set; tab_count stays 0 unless a test wants
+/// a status (the status scan walks tab_status_text[0..tab_count]).
+fn metaTestWorkspace() Window.Workspace {
+    return .{};
+}
+
+test "sidebar formatMetaLineUtf8: empty workspace yields nothing" {
+    var ws = metaTestWorkspace();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), formatMetaLineUtf8(&ws, &buf));
+}
+
+test "sidebar formatMetaLineUtf8: branch only" {
+    var ws = metaTestWorkspace();
+    ws.setGitBranch("feat/agent");
+    var buf: [256]u8 = undefined;
+    const n = formatMetaLineUtf8(&ws, &buf);
+    // "⎇ feat/agent" — the branch text must appear verbatim after the sigil.
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "feat/agent") != null);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "\u{2387}") != null);
+}
+
+test "sidebar formatMetaLineUtf8: branch, ports, and status joined with separators" {
+    var ws = metaTestWorkspace();
+    ws.setGitBranch("main");
+    ws.setPorts(&.{ 3000, 8080 });
+    ws.tab_count = 1;
+    ws.setTabStatusText(0, "running tests");
+    var buf: [256]u8 = undefined;
+    const n = formatMetaLineUtf8(&ws, &buf);
+    const s = buf[0..n];
+    try testing.expect(std.mem.indexOf(u8, s, "main") != null);
+    try testing.expect(std.mem.indexOf(u8, s, ":3000, 8080") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "running tests") != null);
+    // Three segments → two " · " separators.
+    var seps: usize = 0;
+    var it = std.mem.window(u8, s, 3, 1);
+    while (it.next()) |w| {
+        if (std.mem.eql(u8, w, " \u{00B7} ")) seps += 1;
+    }
+    // "·" is 2 bytes so the 3-byte window above can't match it; count via
+    // indexOf occurrences instead.
+    seps = std.mem.count(u8, s, "\u{00B7}");
+    try testing.expectEqual(@as(usize, 2), seps);
+}
+
+test "sidebar formatMetaLineUtf8: PR marker reflects state" {
+    var ws = metaTestWorkspace();
+    ws.setGitBranch("x");
+    ws.setPrStatus(.draft, 42);
+    var buf: [256]u8 = undefined;
+    const n = formatMetaLineUtf8(&ws, &buf);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "draft #42") != null);
+
+    ws.setPrStatus(.open, 7);
+    const n2 = formatMetaLineUtf8(&ws, &buf);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n2], "PR #7") != null);
+}
+
+test "sidebar formatMetaLineUtf8: truncates without overflowing the buffer" {
+    var ws = metaTestWorkspace();
+    ws.setGitBranch("a-very-long-branch-name-that-keeps-going");
+    ws.setPorts(&.{ 3000, 3001, 3002, 3003 });
+    ws.tab_count = 1;
+    ws.setTabStatusText(0, "a long status message that should be dropped");
+    // Tiny buffer: composition must stop at the boundary, never overflow.
+    var small: [12]u8 = undefined;
+    const n = formatMetaLineUtf8(&ws, &small);
+    try testing.expect(n <= small.len);
 }

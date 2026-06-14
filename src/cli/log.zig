@@ -5,9 +5,9 @@ const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 
 /// Options exists so the shared CLI machinery (completions, docs,
-/// `Action.options()`) has a type to reflect over. `+notify` parses its
-/// own positional subcommand and flags in `run`, so the only flag handled
-/// here is `--help`.
+/// `Action.options()`) has a type to reflect over. `+log` parses its own
+/// positional text and flags in `run`, so the only flag handled here is
+/// `--help`.
 pub const Options = struct {
     pub fn deinit(self: *Options) void {
         self.* = undefined;
@@ -20,38 +20,20 @@ pub const Options = struct {
     }
 };
 
-/// The `+notify` command sets or clears the per-pane notification ring (a
-/// "needs attention / waiting for input" indicator) of a running Ghostty
-/// instance over its per-process agent IPC pipe — the explicit,
-/// shell-agnostic counterpart to the attention OSC, alongside
-/// `+workspace`, `+tab`, `+send`, and `+browser`.
+/// The `+log` command appends a line to a tab's ring log buffer of a
+/// running Ghostty instance over its per-process agent IPC pipe. The latest
+/// line is surfaced as the workspace row's "latest" text in the session
+/// sidebar and pushed into the notification panel, alongside `+status` and
+/// `+notify`.
 ///
-/// Subcommands (both accept `--workspace I` and `--tab J` to target a
-/// pane other than the active one):
+/// Usage: `ghostty +log <text> [--workspace I] [--tab J]`
 ///
-///   * `ring [--workspace I] [--tab J]`: Flag the target tab's active
-///     pane for attention. Its sidebar workspace row and top tab show a
-///     blue dot, and — when the pane is in a visible split but not the
-///     focused pane — a blue ring is drawn around it. The flag clears
-///     automatically when the pane gains focus or its tab+workspace
-///     become active.
-///
-///   * `clear [--workspace I] [--tab J]`: Clear the attention flag on the
-///     target tab's active pane.
-///
-///   * `next`: Jump to the most-recent UNREAD entry in the notifications
-///     panel — raise its window, select its workspace+tab, and focus its
-///     pane (a cross-workspace jump), then mark that entry Read. Replies
-///     `{jumped:true,surface:<id>}` on success or `{jumped:false}` when
-///     there are no unread notifications. Ignores `--workspace`/`--tab`
-///     (the destination is wherever the notifying pane lives).
-///
-/// The target pane must be a terminal — a browser pane has no terminal
-/// surface and is rejected.
+///   * `<text>`: the line to append (truncated to a small per-line cap).
+///   * `--workspace I` / `--tab J`: target a tab other than the active one.
 ///
 /// The target instance's IPC pipe is `ghostty-ipc-<pid>`. The pid is taken
 /// from the `GHOSTTY_PID` environment variable (exported into every shell
-/// Ghostty spawns); if it is unset, `+notify` connects to the sole
+/// Ghostty spawns); if it is unset, `+log` connects to the sole
 /// `ghostty-ipc-*` pipe present and errors if there are zero or more than
 /// one.
 ///
@@ -63,7 +45,7 @@ pub fn run(alloc: Allocator) !u8 {
         var buf: [256]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&buf);
         const stderr = &stderr_writer.interface;
-        try stderr.print("+notify is only supported on Windows.\n", .{});
+        try stderr.print("+log is only supported on Windows.\n", .{});
         stderr.flush() catch {};
         return 1;
     }
@@ -71,8 +53,6 @@ pub fn run(alloc: Allocator) !u8 {
     return windows_impl.run(alloc);
 }
 
-/// All Windows-specific machinery, kept in a struct so the whole thing is
-/// only semantically analyzed on Windows.
 const windows_impl = if (builtin.os.tag == .windows) struct {
     const agent_ipc = @import("agent_ipc.zig").impl;
 
@@ -93,8 +73,6 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         return code;
     }
 
-    const Command = enum { ring, clear, next };
-
     fn runImpl(
         alloc: Allocator,
         stdout: *std.Io.Writer,
@@ -103,18 +81,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         var iter = try args.argsIterator(alloc);
         defer iter.deinit();
 
-        const sub_str = iter.next() orelse {
-            try stderr.print("usage: ghostty +notify <ring|clear|next> [--workspace I] [--tab J]\n", .{});
-            return 1;
-        };
-        if (std.mem.eql(u8, sub_str, "--help") or std.mem.eql(u8, sub_str, "-h")) {
-            return Action.help_error;
-        }
-        const sub = std.meta.stringToEnum(Command, sub_str) orelse {
-            try stderr.print("unknown subcommand '{s}'\n", .{sub_str});
-            return 1;
-        };
-
+        var text: ?[]const u8 = null;
         var workspace: ?u32 = null;
         var tab: ?u32 = null;
         while (iter.next()) |arg| {
@@ -151,24 +118,29 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 try stderr.print("unknown flag '{s}'\n", .{arg});
                 return 1;
+            } else if (text == null) {
+                text = arg;
             } else {
                 try stderr.print("unexpected argument '{s}'\n", .{arg});
                 return 1;
             }
         }
 
-        // Build the args object: action is required; workspace/tab are
-        // optional and only emitted when present.
+        const line = text orelse {
+            try stderr.print("usage: ghostty +log <text> [--workspace I] [--tab J]\n", .{});
+            return 1;
+        };
+
         var argbuf: std.ArrayList(u8) = .empty;
         defer argbuf.deinit(alloc);
-        try argbuf.writer(alloc).print("{{\"action\":\"{s}\"", .{@tagName(sub)});
+        try argbuf.writer(alloc).print("{{\"text\":{f}", .{std.json.fmt(line, .{})});
         if (workspace) |n| try argbuf.writer(alloc).print(",\"workspace\":{d}", .{n});
         if (tab) |n| try argbuf.writer(alloc).print(",\"tab\":{d}", .{n});
         try argbuf.append(alloc, '}');
 
         const request = try std.fmt.allocPrint(
             alloc,
-            "{{\"id\":1,\"cmd\":\"notify\",\"args\":{s}}}\n",
+            "{{\"id\":1,\"cmd\":\"log\",\"args\":{s}}}\n",
             .{argbuf.items},
         );
         defer alloc.free(request);

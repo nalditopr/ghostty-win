@@ -2286,6 +2286,22 @@ keybind: Keybinds = .{},
 /// Currently only supported on Windows (win32).
 @"window-sidebar-width": u32 = 220,
 
+/// Show a second, dimmer metadata line on each sidebar workspace row:
+/// the workspace's git branch, latest agent-pushed status text, and any
+/// listening TCP ports of its tabs' child processes. The git branch and
+/// ports are populated off the UI thread on a periodic timer (and on
+/// workspace focus) and only for workspaces bound to a working directory
+/// (created with `+workspace new --worktree`); status text is pushed by
+/// agents via the `+status` verb. The row grows taller to fit the second
+/// line. Disable to keep the compact single-line rows.
+///
+/// This only takes effect if `window-show-sidebar` is enabled.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"sidebar-metadata": bool = true,
+
 /// Background color for the window titlebar. This only takes effect if
 /// window-theme is set to ghostty. Currently only supported in the GTK app
 /// runtime.
@@ -2409,6 +2425,26 @@ keybind: Keybinds = .{},
 ///
 /// Available since: 1.0.1
 @"title-report": bool = false,
+
+/// Controls the Windows agent-control IPC socket (the named pipe
+/// `ghostty-ipc-<pid>` that backs `ghostty +workspace`/`+tab`/`+send`/
+/// `+surface`/`+split`/`+status`/`+read-screen`/`+session`/`+browser`).
+/// This is the gate for the orchestration scripting layer that lets an
+/// agent drive — and read — other panes.
+///
+///   * `on` (default): the IPC server starts and every verb is allowed
+///     (the current behavior).
+///   * `read-only`: the IPC server starts but only non-mutating
+///     introspection verbs are honored — `surface-list`, `read-screen`,
+///     `session-list`, the browser `snapshot`/`eval`, and `workspace-list`/
+///     `tab-list`. Verbs that change state (new windows/splits/tabs, send
+///     keystrokes, set status, capture/resume sessions) are refused with
+///     an error. Useful when you want an agent to observe but not act.
+///   * `off`: the IPC server is not started at all; the CLI verbs report
+///     no running instance.
+///
+/// Only meaningful on Windows; ignored on other platforms.
+@"socket-control": SocketControl = .on,
 
 /// The total amount of bytes that can be used for image data (e.g. the Kitty
 /// image protocol) per terminal screen. The maximum value is 4,294,967,295
@@ -9233,6 +9269,17 @@ pub const ClipboardAccess = enum {
     allow,
     deny,
     ask,
+};
+
+/// See socket-control. Gates the Windows agent-control IPC pipe: whether
+/// the server starts and which verbs it honors.
+pub const SocketControl = enum {
+    /// Server runs; all verbs allowed (current behavior, the default).
+    on,
+    /// Server runs; only non-mutating introspection verbs are honored.
+    @"read-only",
+    /// Server is not started.
+    off,
 };
 
 /// See window-save-state

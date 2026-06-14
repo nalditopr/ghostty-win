@@ -78,6 +78,44 @@ pub const Command = enum {
     // indicator (the agent-waiting ring). Args: {action:"ring"|"clear",
     // [workspace], [tab]}.
     notify,
+
+    // Orchestration scripting (the agent-supervises-agent substrate). All
+    // run synchronously on the GUI thread and reply directly, like the
+    // workspace/tab verbs (they touch the live model). Indices follow the
+    // same defaulting as send/notify (absent workspace/tab => active).
+    //
+    // surface-list {[workspace],[tab]} -> JSON of panes in the addressed
+    //   tab: [{id, kind:"terminal"|"browser", focused, title}].
+    // surface-focus {surface | (workspace,tab,pane)} -> focus a pane by its
+    //   stable surface id, or by workspace/tab/pane index.
+    // new-split {dir:"right"|"down", [workspace],[tab],[command]} -> split
+    //   the addressed (or active) pane; reply {id} of the new pane.
+    // set-status {[workspace],[tab], [text]} -> set/clear a per-tab status
+    //   string the sidebar renders (empty/absent text clears it).
+    // set-progress {[workspace],[tab], value:0..100|-1} -> set a per-tab
+    //   progress percent; -1 (or "clear") clears it.
+    // log {[workspace],[tab], text} -> append a line to the addressed tab's
+    //   ring log buffer (and the global notif panel).
+    // read-screen {[workspace],[tab],[lines],[scrollback]} -> the addressed
+    //   pane terminal's screen text as UTF-8 (visible screen, or full
+    //   scrollback when scrollback:true). THE agent-reads-agent verb.
+    @"surface-list",
+    @"surface-focus",
+    @"new-split",
+    @"set-status",
+    @"set-progress",
+    log,
+    @"read-screen",
+
+    // Session capture/resume: record (per surface) which agent runs in a
+    // pane and its native session id, and replay the agent's resume argv.
+    // session-capture {agent, session, [surface]} -> Store.put.
+    // session-resume {[surface],[workspace],[tab]} -> relaunch via
+    //   AgentKind.resumeArgv into the pane (ipcSendText).
+    // session-list -> dump the whole store as JSON.
+    @"session-capture",
+    @"session-resume",
+    @"session-list",
 };
 
 /// Protocol-level failures that map to error responses.
@@ -186,6 +224,92 @@ pub fn argBool(req: *const Request, key: []const u8) ?bool {
         else => null,
     };
 }
+
+/// Read an optional u64 field by name: a stable surface id (the core
+/// Surface.id exported to shells as GHOSTTY_SURFACE_ID). A surface id is
+/// a random non-zero u64, which can exceed i64 range, so it arrives over
+/// JSON as either an .integer (<= i64 max) or a .number_string (beyond
+/// it); both are accepted. Negative, fractional, or non-numeric values
+/// yield null so handlers can answer a clean error. Distinct from argU32
+/// (workspace/tab indices, which stay small).
+pub fn argU64(req: *const Request, key: []const u8) ?u64 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        // std.json emits integers beyond i64 as .number_string; a surface
+        // id (full u64 range) can land here.
+        .number_string => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        else => null,
+    };
+}
+
+/// Read an optional i64 field by name with the same lenient typing as
+/// argU64 for the integer case (used by set-progress, where -1 means
+/// "clear"). number_string is parsed as i64; out-of-range/non-numeric
+/// yields null.
+pub fn argI64Named(req: *const Request, key: []const u8) ?i64 {
+    if (req.args != .object) return null;
+    const v = req.args.object.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| i,
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        else => null,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Status / progress / log ring (pure; the sidebar metadata model)
+// ---------------------------------------------------------------------------
+
+/// A small fixed-capacity ring of recent log lines for one tab. Pushed by
+/// the `log` IPC verb and rendered by the sidebar (Stage 2). Kept here, in
+/// the pure protocol layer, so the wrap/newest-first/truncation rules are
+/// unit-testable without a live Window. Each line is stored in an inline
+/// fixed buffer (no per-push allocation, matching the tab-title/name
+/// buffers on Workspace); over-long lines are byte-truncated.
+pub const max_log_line_bytes: usize = 160;
+pub const log_ring_capacity: usize = 8;
+
+pub const LogRing = struct {
+    /// Inline storage for each line + its used length.
+    lines: [log_ring_capacity][max_log_line_bytes]u8 = undefined,
+    lens: [log_ring_capacity]u16 = @splat(0),
+    /// Index where the next push lands (mod capacity).
+    head: usize = 0,
+    /// Number of live lines (<= capacity).
+    len: usize = 0,
+
+    /// Append a line, truncating to max_log_line_bytes and dropping the
+    /// oldest once full. Invalid UTF-8 is not the ring's concern (the
+    /// renderer is lossy); the byte truncation may split a codepoint, so
+    /// callers that care should pre-truncate on a boundary.
+    pub fn push(self: *LogRing, text: []const u8) void {
+        const n: u16 = @intCast(@min(text.len, max_log_line_bytes));
+        @memcpy(self.lines[self.head][0..n], text[0..n]);
+        self.lens[self.head] = n;
+        self.head = (self.head + 1) % log_ring_capacity;
+        if (self.len < log_ring_capacity) self.len += 1;
+    }
+
+    /// The display_idx-th newest line (0 = newest), or null past the end.
+    pub fn at(self: *const LogRing, display_idx: usize) ?[]const u8 {
+        if (display_idx >= self.len) return null;
+        // head points one past the newest; walk backward.
+        const slot = (self.head + log_ring_capacity - 1 - display_idx) % log_ring_capacity;
+        return self.lines[slot][0..self.lens[slot]];
+    }
+
+    /// The newest line, or null when empty (the sidebar's "latest" text).
+    pub fn latest(self: *const LogRing) ?[]const u8 {
+        return self.at(0);
+    }
+
+    pub fn clear(self: *LogRing) void {
+        self.head = 0;
+        self.len = 0;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Worktree-path construction (pure; used by workspace-new --worktree)
@@ -1493,6 +1617,79 @@ test "ipc: argBool reads the optional enter flag" {
         defer req.destroy();
         try testing.expectEqual(case.expect, argBool(req, "enter"));
     }
+}
+
+test "ipc: argU64 reads a full-range surface id" {
+    const alloc = testing.allocator;
+    const Case = struct { line: []const u8, expect: ?u64 };
+    const cases = [_]Case{
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{\"surface\":1}}", .expect = 1 },
+        // i64 max arrives as .integer.
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{\"surface\":9223372036854775807}}", .expect = 9223372036854775807 },
+        // Beyond i64: std.json yields .number_string; argU64 still parses it.
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{\"surface\":18446744073709551615}}", .expect = 18446744073709551615 },
+        // Negative / fractional / string-typed / absent -> null.
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{\"surface\":-1}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{\"surface\":1.5}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{\"surface\":\"7\"}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"surface-focus\",\"args\":{}}", .expect = null },
+    };
+    for (cases) |case| {
+        const result = try parseLine(alloc, case.line);
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(case.expect, argU64(req, "surface"));
+    }
+}
+
+test "ipc: argI64Named reads progress including the -1 clear sentinel" {
+    const alloc = testing.allocator;
+    const Case = struct { line: []const u8, expect: ?i64 };
+    const cases = [_]Case{
+        .{ .line = "{\"id\":1,\"cmd\":\"set-progress\",\"args\":{\"value\":0}}", .expect = 0 },
+        .{ .line = "{\"id\":1,\"cmd\":\"set-progress\",\"args\":{\"value\":100}}", .expect = 100 },
+        .{ .line = "{\"id\":1,\"cmd\":\"set-progress\",\"args\":{\"value\":-1}}", .expect = -1 },
+        .{ .line = "{\"id\":1,\"cmd\":\"set-progress\",\"args\":{\"value\":\"x\"}}", .expect = null },
+        .{ .line = "{\"id\":1,\"cmd\":\"set-progress\",\"args\":{}}", .expect = null },
+    };
+    for (cases) |case| {
+        const result = try parseLine(alloc, case.line);
+        const req = result.ok;
+        defer req.destroy();
+        try testing.expectEqual(case.expect, argI64Named(req, "value"));
+    }
+}
+
+test "ipc: LogRing newest-first, wraps, and truncates" {
+    var ring: LogRing = .{};
+    try testing.expect(ring.latest() == null);
+    try testing.expect(ring.at(0) == null);
+
+    ring.push("first");
+    ring.push("second");
+    try testing.expectEqualStrings("second", ring.latest().?);
+    try testing.expectEqualStrings("second", ring.at(0).?);
+    try testing.expectEqualStrings("first", ring.at(1).?);
+    try testing.expect(ring.at(2) == null);
+
+    // Fill past capacity; the oldest drops, newest-first order holds.
+    for (0..log_ring_capacity) |i| {
+        var buf: [8]u8 = undefined;
+        ring.push(std.fmt.bufPrint(&buf, "L{d}", .{i}) catch unreachable);
+    }
+    try testing.expectEqual(log_ring_capacity, ring.len);
+    var ebuf: [8]u8 = undefined;
+    const newest = std.fmt.bufPrint(&ebuf, "L{d}", .{log_ring_capacity - 1}) catch unreachable;
+    try testing.expectEqualStrings(newest, ring.latest().?);
+
+    // Over-long line is byte-truncated to the cap.
+    const big = [_]u8{'x'} ** (max_log_line_bytes + 50);
+    ring.push(&big);
+    try testing.expectEqual(@as(usize, max_log_line_bytes), ring.latest().?.len);
+
+    ring.clear();
+    try testing.expectEqual(@as(usize, 0), ring.len);
+    try testing.expect(ring.latest() == null);
 }
 
 test "ipc: send arg validation via argString/argU32/argBool" {

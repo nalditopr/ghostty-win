@@ -27,6 +27,13 @@ const workspace = @import("workspace.zig");
 const tab = @import("tab.zig");
 const send = @import("send.zig");
 const notify = @import("notify.zig");
+const surface = @import("surface.zig");
+const split = @import("split.zig");
+const status = @import("status.zig");
+const logcmd = @import("log.zig");
+const read_screen = @import("read_screen.zig");
+const session = @import("session.zig");
+const hooks = @import("hooks.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -100,6 +107,27 @@ pub const Action = enum {
 
     // Use IPC to set/clear a pane's notification ring (attention).
     notify,
+
+    // Use IPC to list/focus the panes of a running Ghostty (orchestration).
+    surface,
+
+    // Use IPC to split a terminal pane and print the new pane's id.
+    split,
+
+    // Use IPC to set a tab's orchestration status string / progress.
+    status,
+
+    // Use IPC to append a line to a tab's ring log buffer.
+    log,
+
+    // Use IPC to read a pane's terminal screen text (agent-reads-agent).
+    @"read-screen",
+
+    // Use IPC to capture/resume an agent's native session id for a pane.
+    session,
+
+    // Install per-agent SessionStart hooks that drive +session capture.
+    hooks,
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -187,6 +215,13 @@ pub const Action = enum {
             .tab => try tab.run(alloc),
             .send => try send.run(alloc),
             .notify => try notify.run(alloc),
+            .surface => try surface.run(alloc),
+            .split => try split.run(alloc),
+            .status => try status.run(alloc),
+            .log => try logcmd.run(alloc),
+            .@"read-screen" => try read_screen.run(alloc),
+            .session => try session.run(alloc),
+            .hooks => try hooks.run(alloc),
         };
     }
 
@@ -234,6 +269,13 @@ pub const Action = enum {
                 .tab => tab.Options,
                 .send => send.Options,
                 .notify => notify.Options,
+                .surface => surface.Options,
+                .split => split.Options,
+                .status => status.Options,
+                .log => logcmd.Options,
+                .@"read-screen" => read_screen.Options,
+                .session => session.Options,
+                .hooks => hooks.Options,
             };
         }
     }

@@ -2166,6 +2166,18 @@ pub fn isWin32InputMode(self: *Surface) bool {
     return self.core_surface.io.terminal.modes.get(.win32_input);
 }
 
+/// The numeric PID of this pane's ConPTY child process (the shell), or
+/// null when the core isn't ready / the process is gone. The PID is read
+/// from the immutable process handle captured at spawn, so this is a safe
+/// lock-free read off the UI thread. Used by the sidebar metadata refresh
+/// as the root of its listening-port process-tree scan.
+pub fn childPid(self: *Surface) ?u32 {
+    if (!self.core_surface_ready) return null;
+    const pid = self.core_surface.getProcessInfo(.foreground_pid) orelse return null;
+    if (pid == 0 or pid > std.math.maxInt(u32)) return null;
+    return @intCast(pid);
+}
+
 /// Encode and send a key event in Win32 Input Mode format.
 /// Format: \x1b[Vk;Sc;Uc;Kd;Cs;Rc_
 fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Action) void {

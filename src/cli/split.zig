@@ -5,9 +5,9 @@ const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 
 /// Options exists so the shared CLI machinery (completions, docs,
-/// `Action.options()`) has a type to reflect over. `+notify` parses its
-/// own positional subcommand and flags in `run`, so the only flag handled
-/// here is `--help`.
+/// `Action.options()`) has a type to reflect over. `+split` parses its own
+/// positional direction and flags in `run`, so the only flag handled here
+/// is `--help`.
 pub const Options = struct {
     pub fn deinit(self: *Options) void {
         self.* = undefined;
@@ -20,38 +20,28 @@ pub const Options = struct {
     }
 };
 
-/// The `+notify` command sets or clears the per-pane notification ring (a
-/// "needs attention / waiting for input" indicator) of a running Ghostty
-/// instance over its per-process agent IPC pipe — the explicit,
-/// shell-agnostic counterpart to the attention OSC, alongside
-/// `+workspace`, `+tab`, `+send`, and `+browser`.
+/// The `+split` command splits a terminal pane of a running Ghostty
+/// instance over its per-process agent IPC pipe and prints the new pane's
+/// surface id — the primitive an orchestrator uses to spawn a teammate pane
+/// next to an existing one, alongside `+surface`, `+send`, and `+tab`.
 ///
-/// Subcommands (both accept `--workspace I` and `--tab J` to target a
-/// pane other than the active one):
+/// Usage: `ghostty +split <right|down> [--workspace I] [--tab J] [--command "..."]`
 ///
-///   * `ring [--workspace I] [--tab J]`: Flag the target tab's active
-///     pane for attention. Its sidebar workspace row and top tab show a
-///     blue dot, and — when the pane is in a visible split but not the
-///     focused pane — a blue ring is drawn around it. The flag clears
-///     automatically when the pane gains focus or its tab+workspace
-///     become active.
+///   * `<right|down>`: split the addressed (or active) pane horizontally
+///     (right) or vertically (down).
+///   * `--workspace I` / `--tab J`: address a tab other than the active one;
+///     its active pane is the one that gets split.
+///   * `--command "prog arg ..."`: run this command in the new pane (split
+///     on whitespace). Without it, the new pane inherits the source pane's
+///     backend (the same shell), matching the UI split behavior.
 ///
-///   * `clear [--workspace I] [--tab J]`: Clear the attention flag on the
-///     target tab's active pane.
-///
-///   * `next`: Jump to the most-recent UNREAD entry in the notifications
-///     panel — raise its window, select its workspace+tab, and focus its
-///     pane (a cross-workspace jump), then mark that entry Read. Replies
-///     `{jumped:true,surface:<id>}` on success or `{jumped:false}` when
-///     there are no unread notifications. Ignores `--workspace`/`--tab`
-///     (the destination is wherever the notifying pane lives).
-///
-/// The target pane must be a terminal — a browser pane has no terminal
-/// surface and is rejected.
+/// On success, prints `{"id":<surface-id>}` — the new pane's stable surface
+/// id (the same value the pane's shell sees as `GHOSTTY_SURFACE_ID`), or 0
+/// if its core has not finished starting up.
 ///
 /// The target instance's IPC pipe is `ghostty-ipc-<pid>`. The pid is taken
 /// from the `GHOSTTY_PID` environment variable (exported into every shell
-/// Ghostty spawns); if it is unset, `+notify` connects to the sole
+/// Ghostty spawns); if it is unset, `+split` connects to the sole
 /// `ghostty-ipc-*` pipe present and errors if there are zero or more than
 /// one.
 ///
@@ -63,7 +53,7 @@ pub fn run(alloc: Allocator) !u8 {
         var buf: [256]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&buf);
         const stderr = &stderr_writer.interface;
-        try stderr.print("+notify is only supported on Windows.\n", .{});
+        try stderr.print("+split is only supported on Windows.\n", .{});
         stderr.flush() catch {};
         return 1;
     }
@@ -71,8 +61,6 @@ pub fn run(alloc: Allocator) !u8 {
     return windows_impl.run(alloc);
 }
 
-/// All Windows-specific machinery, kept in a struct so the whole thing is
-/// only semantically analyzed on Windows.
 const windows_impl = if (builtin.os.tag == .windows) struct {
     const agent_ipc = @import("agent_ipc.zig").impl;
 
@@ -93,8 +81,6 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         return code;
     }
 
-    const Command = enum { ring, clear, next };
-
     fn runImpl(
         alloc: Allocator,
         stdout: *std.Io.Writer,
@@ -103,20 +89,21 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         var iter = try args.argsIterator(alloc);
         defer iter.deinit();
 
-        const sub_str = iter.next() orelse {
-            try stderr.print("usage: ghostty +notify <ring|clear|next> [--workspace I] [--tab J]\n", .{});
+        const dir_str = iter.next() orelse {
+            try stderr.print("usage: ghostty +split <right|down> [--workspace I] [--tab J] [--command \"...\"]\n", .{});
             return 1;
         };
-        if (std.mem.eql(u8, sub_str, "--help") or std.mem.eql(u8, sub_str, "-h")) {
+        if (std.mem.eql(u8, dir_str, "--help") or std.mem.eql(u8, dir_str, "-h")) {
             return Action.help_error;
         }
-        const sub = std.meta.stringToEnum(Command, sub_str) orelse {
-            try stderr.print("unknown subcommand '{s}'\n", .{sub_str});
+        if (!std.mem.eql(u8, dir_str, "right") and !std.mem.eql(u8, dir_str, "down")) {
+            try stderr.print("direction must be 'right' or 'down', got '{s}'\n", .{dir_str});
             return 1;
-        };
+        }
 
         var workspace: ?u32 = null;
         var tab: ?u32 = null;
+        var command: ?[]const u8 = null;
         while (iter.next()) |arg| {
             if (std.mem.startsWith(u8, arg, "--workspace=")) {
                 workspace = std.fmt.parseInt(u32, arg["--workspace=".len..], 10) catch {
@@ -146,29 +133,35 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
                     try stderr.print("invalid --tab value\n", .{});
                     return 1;
                 };
+            } else if (std.mem.startsWith(u8, arg, "--command=")) {
+                command = arg["--command=".len..];
+            } else if (std.mem.eql(u8, arg, "--command")) {
+                command = iter.next() orelse {
+                    try stderr.print("--command requires a value\n", .{});
+                    return 1;
+                };
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 return Action.help_error;
-            } else if (std.mem.startsWith(u8, arg, "--")) {
-                try stderr.print("unknown flag '{s}'\n", .{arg});
-                return 1;
             } else {
                 try stderr.print("unexpected argument '{s}'\n", .{arg});
                 return 1;
             }
         }
 
-        // Build the args object: action is required; workspace/tab are
-        // optional and only emitted when present.
+        // Build the args object. dir is required; the rest are optional.
         var argbuf: std.ArrayList(u8) = .empty;
         defer argbuf.deinit(alloc);
-        try argbuf.writer(alloc).print("{{\"action\":\"{s}\"", .{@tagName(sub)});
+        try argbuf.writer(alloc).print("{{\"dir\":\"{s}\"", .{dir_str});
         if (workspace) |n| try argbuf.writer(alloc).print(",\"workspace\":{d}", .{n});
         if (tab) |n| try argbuf.writer(alloc).print(",\"tab\":{d}", .{n});
+        if (command) |c| {
+            try argbuf.writer(alloc).print(",\"command\":{f}", .{std.json.fmt(c, .{})});
+        }
         try argbuf.append(alloc, '}');
 
         const request = try std.fmt.allocPrint(
             alloc,
-            "{{\"id\":1,\"cmd\":\"notify\",\"args\":{s}}}\n",
+            "{{\"id\":1,\"cmd\":\"new-split\",\"args\":{s}}}\n",
             .{argbuf.items},
         );
         defer alloc.free(request);

@@ -16,7 +16,28 @@ const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
 const WindowState = @import("WindowState.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const ipc = @import("ipc.zig");
 const w32 = @import("win32.zig");
+
+/// Maximum bytes of a per-tab status string (set-status). Inline, like
+/// tab titles, so set-status never allocates; over-long text is byte
+/// truncated by the setter.
+const MAX_STATUS_BYTES: usize = 96;
+
+/// Maximum bytes of a workspace's cached git branch name (Stage 2 sidebar
+/// metadata). Inline so the async refresh result never allocates on apply;
+/// over-long branch names are byte truncated.
+pub const MAX_BRANCH_BYTES: usize = 64;
+
+/// Maximum number of distinct listening TCP ports cached per workspace for
+/// the sidebar metadata line. The walker dedups and caps at this; extra
+/// ports are dropped (the row only has room for a few anyway).
+pub const MAX_PORTS: usize = 8;
+
+/// PR review/merge state cached per workspace from `gh pr view`. `none`
+/// covers "no gh / not authed / no PR for the branch"; the sidebar only
+/// renders a marker for the non-none states.
+pub const PrState = enum { none, open, draft, merged, closed };
 
 const log = std.log.scoped(.win32);
 
@@ -61,6 +82,21 @@ pub const Workspace = struct {
     /// be @splat(false) on value-init (see the struct doc), which the
     /// `= @splat(false)` default guarantees alongside tab_status.
     tab_attention: [MAX_TABS]bool = @splat(false),
+    /// Per-tab orchestration status string (set-status): a short
+    /// agent-pushed label ("running tests", "waiting", "blocked") the
+    /// sidebar renders. UTF-8 in an inline buffer (no alloc on push),
+    /// length-prefixed like tab titles. Empty (len 0) = no status. Set by
+    /// setTabStatusText; moves verbatim through tab-array shifts.
+    tab_status_text: [MAX_TABS][MAX_STATUS_BYTES]u8 = undefined,
+    tab_status_text_len: [MAX_TABS]u16 = @splat(0),
+    /// Per-tab progress percent (set-progress), 0..100, or null for none.
+    /// Rendered by the sidebar as a thin bar (Stage 2).
+    tab_progress: [MAX_TABS]?u8 = @splat(null),
+    /// Per-tab ring log buffer (log): the last few agent log lines, newest
+    /// first. The sidebar surfaces the latest line as the row's
+    /// "latest-notification" text (Stage 2). Pure ring lives in ipc.zig so
+    /// the wrap/truncation rules are unit-tested there.
+    tab_log: [MAX_TABS]ipc.LogRing = @splat(.{}),
     /// Workspace name shown on its sidebar row.
     name: [64]u16 = undefined,
     /// Length of the workspace name in UTF-16 code units.
@@ -73,6 +109,32 @@ pub const Workspace = struct {
     /// (addTabWithCommand), so it is moved verbatim through workspace-slot
     /// shifts (closeWorkspace) without re-validation.
     working_dir: ?[]const u8 = null,
+
+    // --- Stage 2 orchestration metadata (sidebar second line) ----------
+    // All best-effort, populated off the UI thread (git/gh/TCP table) and
+    // applied via setMetadata; null/empty when unknown or not yet
+    // refreshed. Inline fixed buffers (like name/status_text) so the async
+    // apply never allocates and the values move verbatim through
+    // workspace-slot shifts (closeWorkspace) exactly like name/working_dir.
+
+    /// Cached git branch of working_dir (rev-parse --abbrev-ref HEAD).
+    /// Empty (len 0) = unknown / not a worktree workspace.
+    git_branch: [MAX_BRANCH_BYTES]u8 = undefined,
+    git_branch_len: u8 = 0,
+    /// Cached listening TCP ports of this workspace's tabs' child process
+    /// trees, sorted ascending and deduped. ports[0..port_count] are live.
+    ports: [MAX_PORTS]u16 = undefined,
+    port_count: u8 = 0,
+    /// Cached PR state + number for the branch (gh pr view), best-effort.
+    pr_state: PrState = .none,
+    pr_number: u32 = 0,
+    /// Monotonic token stamped when an async metadata refresh job is
+    /// dispatched for this workspace and echoed back in the result. The UI
+    /// thread applies a result only if the token still matches, so a result
+    /// for a since-recycled slot (closeWorkspace shifted a different
+    /// workspace into this index) is dropped instead of mis-applied. Bumped
+    /// by markMetadataDirty on dispatch.
+    meta_token: u64 = 0,
 
     /// The parallel per-tab arrays as a tuple of array pointers. EVERY
     /// per-tab array must be listed here: the mutation sites
@@ -87,6 +149,10 @@ pub const Workspace = struct {
         *[MAX_TABS]u16,
         *[MAX_TABS]TabStatus,
         *[MAX_TABS]bool,
+        *[MAX_TABS][MAX_STATUS_BYTES]u8,
+        *[MAX_TABS]u16,
+        *[MAX_TABS]?u8,
+        *[MAX_TABS]ipc.LogRing,
     } {
         return .{
             &self.tab_trees,
@@ -95,6 +161,10 @@ pub const Workspace = struct {
             &self.tab_title_lens,
             &self.tab_status,
             &self.tab_attention,
+            &self.tab_status_text,
+            &self.tab_status_text_len,
+            &self.tab_progress,
+            &self.tab_log,
         };
     }
 
@@ -119,6 +189,86 @@ pub const Workspace = struct {
     /// the cross-level surfacing rule is unit-testable.
     pub fn hasAttention(self: *const Workspace) bool {
         return aggregateAttention(self.tab_attention[0..self.tab_count]);
+    }
+
+    /// Set (or clear, when `text` is empty) the orchestration status
+    /// string for tab `tab_idx`. UTF-8 byte-truncated to MAX_STATUS_BYTES.
+    /// Caller validates tab_idx < tab_count. No allocation.
+    pub fn setTabStatusText(self: *Workspace, tab_idx: usize, text: []const u8) void {
+        const n: u16 = @intCast(@min(text.len, MAX_STATUS_BYTES));
+        @memcpy(self.tab_status_text[tab_idx][0..n], text[0..n]);
+        self.tab_status_text_len[tab_idx] = n;
+    }
+
+    /// The status string for tab `tab_idx` (empty when none).
+    pub fn tabStatusText(self: *const Workspace, tab_idx: usize) []const u8 {
+        return self.tab_status_text[tab_idx][0..self.tab_status_text_len[tab_idx]];
+    }
+
+    /// Set or clear (null) the progress percent for tab `tab_idx`. A value
+    /// is clamped to 0..100.
+    pub fn setTabProgress(self: *Workspace, tab_idx: usize, value: ?u8) void {
+        self.tab_progress[tab_idx] = if (value) |v| @min(v, 100) else null;
+    }
+
+    /// Append a line to tab `tab_idx`'s ring log (newest-first; wraps).
+    pub fn pushTabLog(self: *Workspace, tab_idx: usize, text: []const u8) void {
+        self.tab_log[tab_idx].push(text);
+    }
+
+    /// The cached git branch (empty when unknown). Stage 2 metadata.
+    pub fn gitBranch(self: *const Workspace) []const u8 {
+        return self.git_branch[0..self.git_branch_len];
+    }
+
+    /// Store the cached git branch, UTF-8 byte-truncated to the buffer.
+    /// Empty `branch` clears it. No allocation.
+    pub fn setGitBranch(self: *Workspace, branch: []const u8) void {
+        const n: u8 = @intCast(@min(branch.len, MAX_BRANCH_BYTES));
+        @memcpy(self.git_branch[0..n], branch[0..n]);
+        self.git_branch_len = n;
+    }
+
+    /// The cached listening ports (ascending, deduped). Stage 2 metadata.
+    pub fn portsSlice(self: *const Workspace) []const u16 {
+        return self.ports[0..self.port_count];
+    }
+
+    /// Store the cached listening ports, capped at MAX_PORTS. `src` is
+    /// expected sorted+deduped by the caller (the off-thread walker).
+    pub fn setPorts(self: *Workspace, src: []const u16) void {
+        const n: u8 = @intCast(@min(src.len, MAX_PORTS));
+        @memcpy(self.ports[0..n], src[0..n]);
+        self.port_count = n;
+    }
+
+    /// Store the cached PR state + number.
+    pub fn setPrStatus(self: *Workspace, state: PrState, number: u32) void {
+        self.pr_state = state;
+        self.pr_number = number;
+    }
+
+    /// Reset Stage 2 metadata to its unknown state. Called when a tab is
+    /// inserted into a fresh workspace and when a workspace slot is reused,
+    /// so a recycled row never shows the previous occupant's branch/ports.
+    pub fn resetMetadata(self: *Workspace) void {
+        self.git_branch_len = 0;
+        self.port_count = 0;
+        self.pr_state = .none;
+        self.pr_number = 0;
+    }
+
+    /// True when this workspace has any metadata worth a second sidebar
+    /// line: a git branch, a listening port, a PR, or an agent status. Used
+    /// to decide whether to render the taller two-line row.
+    pub fn hasMetadata(self: *const Workspace) bool {
+        if (self.git_branch_len > 0) return true;
+        if (self.port_count > 0) return true;
+        if (self.pr_state != .none) return true;
+        for (0..self.tab_count) |t| {
+            if (self.tab_status_text_len[t] > 0) return true;
+        }
+        return false;
     }
 
     /// Find the Node.Handle for a pane in this workspace's tab tree.
@@ -670,6 +820,31 @@ pub fn sidebarWidth(self: *const Window) i32 {
     return @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
 }
 
+/// Whether the sidebar should render the metadata second line on its rows
+/// right now: the config toggle is on AND at least one workspace has
+/// metadata to show. Computed once and used to pick the row height so the
+/// taller stride is uniform across all rows (the index-based hit-testing /
+/// drag math assumes a single fixed row height).
+pub fn sidebarShowMetadata(self: *const Window) bool {
+    if (!self.app.config.@"sidebar-metadata") return false;
+    for (self.workspaces[0..self.workspace_count]) |*ws| {
+        if (ws.hasMetadata()) return true;
+    }
+    return false;
+}
+
+/// The current sidebar row height: the taller two-line height when the
+/// metadata line is active, else the compact single-line height. THE
+/// single source of truth for the row stride — every sidebar geometry call
+/// site (hitTest, itemRect, drag target, paint) routes through this so
+/// painting and hit-testing always agree.
+pub fn sidebarItemHeight(self: *const Window) i32 {
+    return if (self.sidebarShowMetadata())
+        Sidebar.itemHeightMeta(self.scale)
+    else
+        Sidebar.itemHeight(self.scale);
+}
+
 /// Returns the client rect available for the active surface, which is
 /// the full client area minus the tab bar height from the top and the
 /// sidebar width from the left.
@@ -892,6 +1067,13 @@ pub fn addTabWithCommand(
     ws.tab_trees[pos] = tree;
     ws.tab_active_pane[pos] = pane;
     ws.tab_status[pos] = .normal;
+    // Reset orchestration metadata for the freshly-occupied slot: the gap
+    // insert leaves the old [pos] values in place (it shifts toward the
+    // tail), so a new tab must not inherit a prior tab's status/progress/
+    // log, exactly as tab_status is reset above.
+    ws.tab_status_text_len[pos] = 0;
+    ws.tab_progress[pos] = null;
+    ws.tab_log[pos].clear();
     ws.tab_count += 1;
 
     // Set the initial title: the picked backend name when given (so the
@@ -987,6 +1169,9 @@ pub fn addBrowserTab(self: *Window) !void {
     ws.tab_trees[pos] = tree;
     ws.tab_active_pane[pos] = browser_pane;
     ws.tab_status[pos] = .normal;
+    ws.tab_status_text_len[pos] = 0;
+    ws.tab_progress[pos] = null;
+    ws.tab_log[pos].clear();
     ws.tab_count += 1;
 
     const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Browser");
@@ -1335,6 +1520,12 @@ pub fn selectWorkspace(self: *Window, idx: usize) void {
     self.invalidateTabBar();
     self.invalidateSidebar();
     self.updateAttentionRings();
+
+    // Refresh the now-visible workspace's sidebar metadata off-thread (the
+    // periodic timer only scans the active workspace, so a freshly-focused
+    // one would otherwise wait a full tick — and background ones never
+    // refresh until focused).
+    self.app.refreshWorkspaceMetadataNow(self, idx);
 }
 
 /// Pure guard for createAndSelectWorkspace: a new workspace slot may be
@@ -1408,6 +1599,11 @@ pub fn newWorkspaceWithDir(self: *Window, working_dir: []const u8) ?usize {
         return null;
     };
     self.invalidateSidebar();
+    // Surface the git branch for the freshly-bound worktree right away
+    // rather than waiting for the first periodic tick. The child shell may
+    // not have a PID yet (ports come on a later tick), but rev-parse only
+    // needs the directory.
+    self.app.refreshWorkspaceMetadataNow(self, idx);
     return idx;
 }
 
@@ -1940,7 +2136,7 @@ fn endSidebarRowDrag(self: *Window) void {
 /// range (the sidebar lists workspaces, one row each).
 fn sidebarDragTarget(self: *const Window, y: i32) usize {
     if (self.workspace_count == 0) return 0;
-    const item_h = Sidebar.itemHeight(self.scale);
+    const item_h = self.sidebarItemHeight();
     if (item_h <= 0) return 0;
     var target: usize = 0;
     for (0..self.workspace_count) |i| {
@@ -3130,7 +3326,7 @@ fn sidebarHitTest(self: *Window, x: i32, y: i32) Sidebar.HitTarget {
     var rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &rect) == 0) return .none;
     return Sidebar.hitTest(x, y, .{
-        .item_h = Sidebar.itemHeight(self.scale),
+        .item_h = self.sidebarItemHeight(),
         // The sidebar renders one row per workspace.
         .workspace_count = self.workspace_count,
         .client_h = rect.bottom - rect.top,
@@ -3172,7 +3368,7 @@ fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
             const row = Sidebar.itemRect(
                 self.workspace_count,
                 self.sidebarWidth(),
-                Sidebar.itemHeight(self.scale),
+                self.sidebarItemHeight(),
             );
             self.showBackendMenu(row.left, row.bottom, .new_workspace);
         },
@@ -3187,7 +3383,14 @@ fn handleSidebarClick(self: *Window, x: i32, y: i32) void {
         },
         .notif_entry => |i| {
             if (self.app.notifAt(i)) |entry| {
-                _ = self.app.jumpToSurface(entry.window, entry.surface);
+                const window = entry.window;
+                const surface = entry.surface;
+                if (self.app.jumpToSurface(window, surface)) {
+                    // Unread → Read for the clicked entry (and lower the
+                    // taskbar badge). Opening the panel already marks all
+                    // entries Read, but a click is an explicit per-entry view.
+                    _ = self.app.markNotifEntryRead(i);
+                }
             }
         },
         .notif_clear => {
@@ -3650,7 +3853,7 @@ pub fn renameWorkspace(self: *Window, ws_idx: usize) void {
     if (self.is_quick_terminal) return;
     if (ws_idx >= self.workspace_count) return;
     const wsp = &self.workspaces[ws_idx];
-    const rect = Sidebar.itemRect(ws_idx, self.sidebarWidth(), Sidebar.itemHeight(self.scale));
+    const rect = Sidebar.itemRect(ws_idx, self.sidebarWidth(), self.sidebarItemHeight());
     self.startRename(rect, wsp.name[0..wsp.name_len], .{ .workspace = ws_idx });
 }
 
@@ -4640,6 +4843,92 @@ test "unit: workspace attention is orthogonal to bell/exited status" {
     ws.tab_attention[2] = false;
     try testing.expectEqual(TabStatus.exited, ws.aggregateStatus());
     try testing.expect(!ws.hasAttention());
+}
+
+test "unit: workspace status/progress/log setters store and clear per tab" {
+    var ws: Workspace = .{};
+    ws.tab_count = 2;
+
+    // Defaults: empty status, no progress, empty log.
+    try testing.expectEqualStrings("", ws.tabStatusText(0));
+    try testing.expectEqual(@as(?u8, null), ws.tab_progress[0]);
+    try testing.expect(ws.tab_log[0].latest() == null);
+
+    ws.setTabStatusText(0, "running tests");
+    try testing.expectEqualStrings("running tests", ws.tabStatusText(0));
+    // Tab 1 is untouched.
+    try testing.expectEqualStrings("", ws.tabStatusText(1));
+    // Empty text clears.
+    ws.setTabStatusText(0, "");
+    try testing.expectEqualStrings("", ws.tabStatusText(0));
+
+    // Progress clamps to 0..100; null clears.
+    ws.setTabProgress(1, 42);
+    try testing.expectEqual(@as(?u8, 42), ws.tab_progress[1]);
+    ws.setTabProgress(1, 200);
+    try testing.expectEqual(@as(?u8, 100), ws.tab_progress[1]);
+    ws.setTabProgress(1, null);
+    try testing.expectEqual(@as(?u8, null), ws.tab_progress[1]);
+
+    // Log ring newest-first per tab.
+    ws.pushTabLog(0, "line one");
+    ws.pushTabLog(0, "line two");
+    try testing.expectEqualStrings("line two", ws.tab_log[0].latest().?);
+    try testing.expectEqualStrings("line one", ws.tab_log[0].at(1).?);
+    // Tab 1's log is independent.
+    try testing.expect(ws.tab_log[1].latest() == null);
+}
+
+test "unit: workspace metadata setters store and report hasMetadata" {
+    var ws: Workspace = .{};
+
+    // Fresh workspace has no metadata.
+    try testing.expect(!ws.hasMetadata());
+    try testing.expectEqualStrings("", ws.gitBranch());
+    try testing.expectEqual(@as(usize, 0), ws.portsSlice().len);
+    try testing.expectEqual(PrState.none, ws.pr_state);
+
+    // Branch round-trips and flips hasMetadata.
+    ws.setGitBranch("feat/x");
+    try testing.expectEqualStrings("feat/x", ws.gitBranch());
+    try testing.expect(ws.hasMetadata());
+
+    // Ports store sorted-as-given and dedup is the caller's job (setter
+    // copies verbatim, capped at MAX_PORTS).
+    ws.setPorts(&.{ 3000, 8080 });
+    try testing.expectEqualSlices(u16, &.{ 3000, 8080 }, ws.portsSlice());
+
+    // Over-cap input is truncated to MAX_PORTS.
+    var many: [MAX_PORTS + 3]u16 = undefined;
+    for (&many, 0..) |*p, i| p.* = @intCast(i);
+    ws.setPorts(&many);
+    try testing.expectEqual(MAX_PORTS, ws.portsSlice().len);
+
+    // PR status.
+    ws.setPrStatus(.draft, 42);
+    try testing.expectEqual(PrState.draft, ws.pr_state);
+    try testing.expectEqual(@as(u32, 42), ws.pr_number);
+
+    // resetMetadata clears the lot back to unknown.
+    ws.resetMetadata();
+    try testing.expectEqualStrings("", ws.gitBranch());
+    try testing.expectEqual(@as(usize, 0), ws.portsSlice().len);
+    try testing.expectEqual(PrState.none, ws.pr_state);
+    try testing.expect(!ws.hasMetadata());
+
+    // A per-tab status alone also counts as metadata (the second-line
+    // status segment).
+    ws.tab_count = 1;
+    ws.setTabStatusText(0, "waiting");
+    try testing.expect(ws.hasMetadata());
+}
+
+test "unit: branch over-long byte truncation never overruns the buffer" {
+    var ws: Workspace = .{};
+    var long: [MAX_BRANCH_BYTES + 10]u8 = undefined;
+    @memset(&long, 'a');
+    ws.setGitBranch(&long);
+    try testing.expectEqual(MAX_BRANCH_BYTES, ws.gitBranch().len);
 }
 
 test "unit: tab arrays stress at workspace capacity" {
