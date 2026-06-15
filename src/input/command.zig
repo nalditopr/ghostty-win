@@ -458,6 +458,16 @@ fn actionCommands(action: Action.Key) []const Command {
             .action = .edit_workspace_description,
             .title = "Edit Workspace Description",
             .description = "Edit the description shown below the workspace name in the sidebar.",
+        .toggle_right_sidebar => comptime &.{.{
+            .action = .toggle_right_sidebar,
+            .title = "Toggle Right Sidebar",
+            .description = "Show or hide the right sidebar panel.",
+        }},
+
+        .focus_right_sidebar => comptime &.{.{
+            .action = .focus_right_sidebar,
+            .title = "Focus Right Sidebar",
+            .description = "Toggle focus between the right sidebar and the terminal.",
         }},
 
         .prompt_surface_title => comptime &.{.{

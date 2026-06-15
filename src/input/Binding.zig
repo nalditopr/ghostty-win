@@ -629,6 +629,16 @@ pub const Action = union(enum) {
     /// line shown below the workspace name in the sidebar). Windows apprt
     /// only; a no-op on other platforms.
     edit_workspace_description,
+    /// Toggle the right sidebar panel's visibility. The right sidebar
+    /// displays per-tab contextual information: status text, progress
+    /// bars, and log entries pushed by agents. Session-only override of
+    /// `window-show-right-sidebar`. Currently Windows only.
+    toggle_right_sidebar,
+
+    /// Toggle focus between the right sidebar and the terminal. When
+    /// focused, keyboard input can scroll the log view. Currently
+    /// Windows only.
+    focus_right_sidebar,
 
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
@@ -1492,6 +1502,8 @@ pub const Action = union(enum) {
             .toggle_notification_unread,
             .mark_oldest_unread_jump,
             .edit_workspace_description,
+            .toggle_right_sidebar,
+            .focus_right_sidebar,
             .new_split,
             .goto_split,
             .goto_window,

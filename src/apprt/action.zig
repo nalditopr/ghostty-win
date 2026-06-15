@@ -395,6 +395,15 @@ pub const Action = union(Key) {
     /// (Windows apprt only; a no-op elsewhere). The description appears
     /// below the workspace name in the sidebar.
     edit_workspace_description,
+    /// Toggle the right sidebar panel's visibility (Windows apprt only;
+    /// a no-op elsewhere). Session-only runtime override of
+    /// `window-show-right-sidebar`.
+    toggle_right_sidebar,
+
+    /// Toggle focus between the right sidebar and the terminal (Windows
+    /// apprt only; a no-op elsewhere). When the right sidebar is focused,
+    /// keyboard input could scroll the log or navigate entries.
+    focus_right_sidebar,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -478,6 +487,8 @@ pub const Action = union(Key) {
         toggle_notification_unread,
         mark_oldest_unread_jump,
         edit_workspace_description,
+        toggle_right_sidebar,
+        focus_right_sidebar,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

@@ -992,6 +992,11 @@ pub fn performAction(
                 .surface => |core_surface| {
                     const pw = core_surface.rt_surface.parent_window;
                     pw.editWorkspaceDescription(pw.active_workspace);
+        .toggle_right_sidebar => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.toggleRightSidebar();
                 },
             }
             return true;
@@ -1002,6 +1007,13 @@ pub fn performAction(
             SessionState.restore(alloc, self) catch |err| {
                 log.err("session restore failed: {}", .{err});
             };
+        .focus_right_sidebar => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.focusRightSidebar();
+                },
+            }
             return true;
         },
 
@@ -1590,6 +1602,7 @@ pub fn performAction(
         },
 
         // All apprt actions are now handled above.
+        // All 68 apprt actions are now handled above.
     }
 }
 
@@ -3157,6 +3170,14 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         },
         .@"workspace-set-description" => self.ipcWorkspaceSetDescription(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"toggle-right-sidebar" => {
+            // Toggle the right sidebar on the first window (or the window
+            // owning the active surface). A simple toggle: no args needed.
+            if (self.windows.items.len > 0) {
+                self.windows.items[0].toggleRightSidebar();
+            }
+            server.sendOk(req.id, null) catch {};
         },
     }
 }

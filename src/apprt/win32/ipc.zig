@@ -135,6 +135,8 @@ pub const Command = enum {
     // shown below the workspace name in the sidebar.
     // workspace-set-description {workspace, text} -> ok.
     @"workspace-set-description",
+    // Right sidebar toggle (mirrors toggle_sidebar for the right panel).
+    @"toggle-right-sidebar",
 };
 
 /// Protocol-level failures that map to error responses.

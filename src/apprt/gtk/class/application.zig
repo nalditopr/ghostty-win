@@ -792,6 +792,8 @@ pub const Application = extern struct {
             .toggle_notification_unread,
             .mark_oldest_unread_jump,
             .edit_workspace_description,
+            .toggle_right_sidebar,
+            .focus_right_sidebar,
             .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,

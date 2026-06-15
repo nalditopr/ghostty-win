@@ -5521,6 +5521,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .edit_workspace_description => return try self.rt_app.performAction(
             .{ .surface = self },
             .edit_workspace_description,
+        .toggle_right_sidebar => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_right_sidebar,
+            {},
+        ),
+
+        .focus_right_sidebar => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .focus_right_sidebar,
             {},
         ),
 

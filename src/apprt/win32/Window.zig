@@ -15,6 +15,7 @@ const BrowserPane = @import("BrowserPane.zig");
 const PaneButtonsMod = @import("PaneButtons.zig");
 const PaneButtons = PaneButtonsMod.PaneButtons;
 const Pane = @import("Pane.zig");
+const RightSidebar = @import("RightSidebar.zig");
 const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
 const SessionState = @import("SessionState.zig");
@@ -493,6 +494,17 @@ dragging_sidebar: bool = false,
 /// sidebar_width_override is dropped on reload).
 sidebar_hidden: bool = false,
 
+/// Session-only runtime hide of the right sidebar, toggled by
+/// `toggle_right_sidebar`. Overrides `window-show-right-sidebar` for
+/// the life of the window; NOT persisted. Reset to false in
+/// onConfigChange so a config reload re-asserts the configured
+/// visibility.
+right_sidebar_hidden: bool = false,
+
+/// Whether the right sidebar currently has focus (keyboard input goes
+/// to the right sidebar for scrolling log entries etc.).
+right_sidebar_focused: bool = false,
+
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
 /// and the dispatch, queued mouse/keyboard messages can otherwise reach
@@ -571,9 +583,13 @@ pub fn onConfigChange(self: *Window) void {
     // session-only and re-asserts the configured visibility on reload.
     self.sidebar_width_override = null;
     self.sidebar_hidden = false;
+    // Right sidebar: re-assert configured visibility on reload.
+    self.right_sidebar_hidden = false;
+    self.right_sidebar_focused = false;
     self.updateTabBarVisibility();
     self.handleResize();
     self.invalidateSidebar();
+    self.invalidateRightSidebar();
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -927,6 +943,53 @@ pub fn toggleSidebar(self: *Window) void {
     if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
 }
 
+/// Returns the right sidebar width in pixels, accounting for DPI scale.
+/// Returns 0 when the right sidebar is disabled, for quick terminals, or
+/// once the window is closing.
+pub fn rightSidebarWidth(self: *const Window) i32 {
+    if (self.closing or self.is_quick_terminal) return 0;
+    if (!self.app.config.@"window-show-right-sidebar") return 0;
+    if (self.right_sidebar_hidden) return 0;
+    const unscaled = self.app.config.@"window-right-sidebar-width";
+    const width = std.math.clamp(unscaled, RightSidebar.MIN_WIDTH, RightSidebar.MAX_WIDTH);
+    return @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
+}
+
+/// Toggle the runtime (session-only) right sidebar hide. No-op on a
+/// quick terminal. Flips the bool, then relays out the panes + repaints.
+pub fn toggleRightSidebar(self: *Window) void {
+    if (self.is_quick_terminal) return;
+    self.right_sidebar_hidden = !self.right_sidebar_hidden;
+    // When hiding the right sidebar, also drop focus from it.
+    if (self.right_sidebar_hidden) self.right_sidebar_focused = false;
+    self.handleResize();
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
+}
+
+/// Toggle focus between the right sidebar and the terminal. If the
+/// right sidebar is not visible, this is a no-op.
+pub fn focusRightSidebar(self: *Window) void {
+    if (self.rightSidebarWidth() <= 0) return;
+    self.right_sidebar_focused = !self.right_sidebar_focused;
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
+}
+
+/// Invalidate the right sidebar region so it gets repainted.
+pub fn invalidateRightSidebar(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const rs_w = self.rightSidebarWidth();
+    if (rs_w <= 0) return;
+    var client_rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
+    var rect = w32.RECT{
+        .left = client_rect.right - rs_w,
+        .top = 0,
+        .right = client_rect.right,
+        .bottom = 32767,
+    };
+    _ = w32.InvalidateRect(hwnd, &rect, 0);
+}
+
 /// Whether the sidebar should render the metadata second line on its rows
 /// right now: the config toggle is on AND at least one workspace has
 /// metadata to show. Computed once and used to pick the row height so the
@@ -953,8 +1016,8 @@ pub fn sidebarItemHeight(self: *const Window) i32 {
 }
 
 /// Returns the client rect available for the active surface, which is
-/// the full client area minus the tab bar height from the top and the
-/// sidebar width from the left.
+/// the full client area minus the tab bar height from the top, the
+/// sidebar width from the left, and the right sidebar width from the right.
 pub fn surfaceRect(self: *const Window) w32.RECT {
     const hwnd = self.hwnd orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     var rect: w32.RECT = undefined;
@@ -963,6 +1026,7 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
     }
     rect.top += self.tabBarHeight();
     rect.left += self.sidebarWidth();
+    rect.right -= self.rightSidebarWidth();
     // While the sidebar is runtime-hidden, reserve the thin re-show strip
     // at the left edge so the GL/WebView2 child does not cover it (a
     // parent-window GDI strip painted inside the surface rect would be
@@ -3449,6 +3513,7 @@ fn paintChrome(self: *Window) void {
     self.paintTabBar(hdc_screen);
     if (self.sidebarWidth() > 0) Sidebar.paint(self, hdc_screen);
     if (self.sidebarReshowStripVisible()) self.paintReshowStrip(hdc_screen);
+    if (self.rightSidebarWidth() > 0) RightSidebar.paint(self, hdc_screen);
 }
 
 /// Paint the thin re-show strip at the window's left edge while the

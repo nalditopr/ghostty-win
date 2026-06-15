@@ -2302,6 +2302,27 @@ keybind: Keybinds = .{},
 /// Currently only supported on Windows (win32).
 @"sidebar-metadata": bool = true,
 
+/// Show the right sidebar panel. The right sidebar displays per-tab
+/// contextual information: the tab's title, agent-pushed status text
+/// (from `set-status`), progress bars (from `set-progress`), and
+/// log entries (from `log`). Hidden by default.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"window-show-right-sidebar": bool = false,
+
+/// The width of the right sidebar panel in pixels. This is the unscaled
+/// width; the actual width is scaled by the display's DPI. The value
+/// is clamped to the range 120 to 500.
+///
+/// This only takes effect if `window-show-right-sidebar` is enabled.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"window-right-sidebar-width": u32 = 300,
+
 /// Background color for the window titlebar. This only takes effect if
 /// window-theme is set to ghostty. Currently only supported in the GTK app
 /// runtime.
@@ -6757,6 +6778,20 @@ pub const Keybinds = struct {
                     alloc,
                     .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true } },
                     .{ .toggle_sidebar = {} },
+                );
+                // Toggle the right sidebar: alt+ctrl+b (mirrors cmux's
+                // ⌥⌘B for the right panel).
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true, .alt = true } },
+                    .{ .toggle_right_sidebar = {} },
+                );
+                // Focus the right sidebar: ctrl+shift+e (mirrors cmux's
+                // ⌘⇧E for right-sidebar focus).
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
+                    .{ .focus_right_sidebar = {} },
                 );
                 try self.set.putFlags(
                     alloc,
