@@ -1521,6 +1521,11 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     core_surface.rt_surface.parent_window.toggleSynchronizedInput();
+                },
+            }
+            return true;
+        },
+
         .break_pane => {
             switch (target) {
                 .app => {},

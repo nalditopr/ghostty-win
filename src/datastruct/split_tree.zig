@@ -2814,9 +2814,6 @@ test "SplitTree: swap siblings" {
 }
 
 test "SplitTree: swap cross-parent" {
-}
-
-test "SplitTree: selectLayout even_horizontal" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -2874,6 +2871,24 @@ test "SplitTree: selectLayout even_horizontal" {
         \\+--------+
         \\|    A   |
         \\+--------+
+        \\
+    );
+}
+
+test "SplitTree: selectLayout even_horizontal" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
     // Build A | B vertical (intentionally not horizontal).
     var split1 = try t1.split(alloc, .root, .down, 0.5, &t2);
     defer split1.deinit();
@@ -2897,9 +2912,6 @@ test "SplitTree: selectLayout even_horizontal" {
 }
 
 test "SplitTree: swap same node" {
-}
-
-test "SplitTree: selectLayout even_vertical" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -2925,6 +2937,23 @@ test "SplitTree: selectLayout even_vertical" {
     defer alloc.free(str);
     try testing.expectEqualStrings(str,
         \\split (layout: horizontal, ratio: 0.50)
+        \\  leaf: A
+        \\  leaf: B
+        \\
+    );
+}
+
+test "SplitTree: selectLayout even_vertical" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
     // Build A | B horizontal (intentionally not vertical).
     var split = try t1.split(alloc, .root, .right, 0.5, &t2);
     defer split.deinit();
