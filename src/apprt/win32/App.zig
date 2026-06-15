@@ -1446,6 +1446,16 @@ pub fn performAction(
             return true;
         },
 
+        .select_layout => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.selectLayout(value);
+                },
+            }
+            return true;
+        },
+
         .toggle_split_zoom => {
             switch (target) {
                 .app => {},
@@ -3018,6 +3028,9 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         .@"session-list" => self.ipcSessionList(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
+        .@"select-layout" => self.ipcSelectLayout(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
     }
 }
 
@@ -4030,6 +4043,18 @@ fn ipcSessionList(self: *App, req: *ipc.Request) anyerror!void {
     const json = try self.session_store.serialize(alloc);
     defer alloc.free(json);
     server.sendOk(req.id, json) catch {};
+}
+
+/// select-layout {layout} → rearrange splits into a predefined layout.
+fn ipcSelectLayout(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const name = ipc.argString(req, "layout") orelse
+        return server.sendError(req.id, "missing \"layout\" argument") catch {};
+    const layout = std.meta.stringToEnum(apprt.action.SelectLayout, name) orelse
+        return server.sendError(req.id, "unknown layout") catch {};
+    const window = self.ipcTargetWindow() orelse return;
+    window.selectLayout(layout);
+    server.sendOk(req.id, null) catch {};
 }
 
 /// Append an entry to the sidebar notification log, bump the unread

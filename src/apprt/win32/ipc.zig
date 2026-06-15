@@ -117,6 +117,8 @@ pub const Command = enum {
     @"session-capture",
     @"session-resume",
     @"session-list",
+
+    @"select-layout",
 };
 
 /// Protocol-level failures that map to error responses.

@@ -673,6 +673,12 @@ pub const Action = union(enum) {
     /// Equalize the size of all splits in the current window.
     equalize_splits,
 
+    /// Rearrange all splits into a predefined layout pattern.
+    ///
+    /// Valid arguments: `even_horizontal`, `even_vertical`,
+    /// `main_horizontal`, `main_vertical`, `tiled`.
+    select_layout: SelectLayout,
+
     /// Reset the window to the default size. The "default size" is the
     /// size that a new window would be created with. This has no effect
     /// if the window is fullscreen.
@@ -1050,6 +1056,14 @@ pub const Action = union(enum) {
         auto, // splits along the larger direction
 
         pub const default: SplitDirection = .auto;
+    };
+
+    pub const SelectLayout = enum {
+        even_horizontal,
+        even_vertical,
+        main_horizontal,
+        main_vertical,
+        tiled,
     };
 
     pub const SplitFocusDirection = enum {
@@ -1440,6 +1454,7 @@ pub const Action = union(enum) {
             .resize_split,
             .swap_split,
             .equalize_splits,
+            .select_layout,
             .inspector,
             => .surface,
         };

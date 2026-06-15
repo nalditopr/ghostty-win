@@ -148,6 +148,9 @@ pub const Action = union(Key) {
     /// Equalize all the splits in the target window.
     equalize_splits,
 
+    /// Rearrange all splits in the target window into a predefined layout.
+    select_layout: SelectLayout,
+
     /// Toggle whether a split is zoomed or not. A zoomed split is resized
     /// to take up the entire window.
     toggle_split_zoom,
@@ -428,6 +431,7 @@ pub const Action = union(Key) {
         // preceding action stable (the ghostty.h test pins each value).
         toggle_sidebar,
         swap_split,
+        select_layout,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1017,6 +1021,18 @@ pub const SearchSelected = struct {
         return .{
             .selected = if (self.selected) |s| @intCast(s) else -1,
         };
+    }
+};
+
+pub const SelectLayout = enum(c_int) {
+    even_horizontal,
+    even_vertical,
+    main_horizontal,
+    main_vertical,
+    tiled,
+
+    test "ghostty.h SelectLayout" {
+        try lib.checkGhosttyHEnum(SelectLayout, "GHOSTTY_ACTION_SELECT_LAYOUT_");
     }
 };
 

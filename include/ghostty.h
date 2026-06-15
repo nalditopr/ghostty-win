@@ -828,6 +828,15 @@ typedef enum {
   GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT,
 } ghostty_action_close_tab_mode_e;
 
+// apprt.action.SelectLayout
+typedef enum {
+  GHOSTTY_ACTION_SELECT_LAYOUT_EVEN_HORIZONTAL,
+  GHOSTTY_ACTION_SELECT_LAYOUT_EVEN_VERTICAL,
+  GHOSTTY_ACTION_SELECT_LAYOUT_MAIN_HORIZONTAL,
+  GHOSTTY_ACTION_SELECT_LAYOUT_MAIN_VERTICAL,
+  GHOSTTY_ACTION_SELECT_LAYOUT_TILED,
+} ghostty_action_select_layout_e;
+
 // apprt.surface.Message.ChildExited
 typedef struct {
   uint32_t exit_code;
@@ -951,6 +960,7 @@ typedef enum {
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_TOGGLE_SIDEBAR,
   GHOSTTY_ACTION_SWAP_SPLIT,
+  GHOSTTY_ACTION_SELECT_LAYOUT,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -993,6 +1003,7 @@ typedef union {
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
   ghostty_action_goto_split_e swap_split;
+  ghostty_action_select_layout_e select_layout;
 } ghostty_action_u;
 
 typedef struct {

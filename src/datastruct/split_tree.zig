@@ -183,6 +183,16 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        /// Returns the number of leaf nodes in the tree.
+        pub fn leafCount(self: *const Self) usize {
+            var count: usize = 0;
+            for (self.nodes) |node| switch (node) {
+                .leaf => count += 1,
+                .split => {},
+            };
+            return count;
+        }
+
         /// An iterator over all the views in the tree.
         pub fn iterator(
             self: *const Self,
@@ -840,6 +850,216 @@ pub fn SplitTree(comptime V: type) type {
                 else
                     1,
             };
+        }
+
+        pub const PredefinedLayout = enum {
+            even_horizontal,
+            even_vertical,
+            main_horizontal,
+            main_vertical,
+            tiled,
+        };
+
+        /// Rearrange existing leaf nodes into a predefined layout pattern,
+        /// returning a new tree. The set of leaves is preserved; only the
+        /// tree structure and ratios change.
+        pub fn selectLayout(
+            self: *const Self,
+            gpa: Allocator,
+            layout: PredefinedLayout,
+        ) Allocator.Error!Self {
+            if (self.isEmpty()) return .empty;
+
+            var arena = ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Collect all leaf views in iteration order.
+            const leaves = try alloc.alloc(*View, self.leafCount());
+
+            var leaf_count: usize = 0;
+            for (self.nodes) |node| switch (node) {
+                .leaf => |v| {
+                    leaves[leaf_count] = v;
+                    leaf_count += 1;
+                },
+                .split => {},
+            };
+
+            if (leaf_count <= 1) {
+                arena.deinit();
+                return self.clone(gpa);
+            }
+
+            const node_count = leaf_count + leaf_count - 1;
+            if (node_count > std.math.maxInt(Node.Handle.Backing)) return error.OutOfMemory;
+            const nodes = try alloc.alloc(Node, node_count);
+
+            switch (layout) {
+                .even_horizontal => buildChain(nodes, 0, leaves, .horizontal),
+                .even_vertical => buildChain(nodes, 0, leaves, .vertical),
+                .main_horizontal => buildMainLayout(nodes, leaves, .vertical),
+                .main_vertical => buildMainLayout(nodes, leaves, .horizontal),
+                .tiled => try buildTiled(alloc, nodes, leaves),
+            }
+
+            try refNodes(gpa, nodes);
+
+            return .{
+                .arena = arena,
+                .nodes = nodes,
+                .zoomed = null,
+            };
+        }
+
+        /// Build a right-leaning chain: all leaves connected by splits of
+        /// the same direction with equal ratios.
+        ///
+        /// For N leaves the tree has N-1 split nodes. Node layout in the
+        /// array starting at `base`:
+        ///   [split0] [leaf0] [split1] [leaf1] ... [leafN-1]
+        /// where split_i.left = leaf_i, split_i.right = split_{i+1} (or
+        /// the last leaf). Handles are absolute (offset by `base`).
+        fn buildChain(
+            nodes: []Node,
+            base: usize,
+            leaves: []*View,
+            direction: Split.Layout,
+        ) void {
+            const n = leaves.len;
+            for (0..n - 1) |i| {
+                const split_idx = i * 2;
+                const leaf_idx = i * 2 + 1;
+                nodes[split_idx + base] = .{ .split = .{
+                    .layout = direction,
+                    .ratio = 1.0 / @as(f16, @floatFromInt(n - i)),
+                    .left = @enumFromInt(base + leaf_idx),
+                    .right = if (i == n - 2)
+                        @enumFromInt(base + leaf_idx + 1)
+                    else
+                        @enumFromInt(base + split_idx + 2),
+                } };
+                nodes[leaf_idx + base] = .{ .leaf = leaves[i] };
+            }
+            nodes[base + 2 * n - 2] = .{ .leaf = leaves[n - 1] };
+        }
+
+        /// Build a main layout: one large pane (the first leaf) taking up
+        /// a larger portion, with the remaining panes chained equally in
+        /// the perpendicular direction.
+        ///
+        /// main_vertical:   main pane on left  (horizontal split), rest
+        ///                  chained vertically on the right.
+        /// main_horizontal: main pane on top   (vertical split), rest
+        ///                  chained horizontally on the bottom.
+        ///
+        /// The `primary_dir` parameter is the direction of the top-level
+        /// split (horizontal for main_vertical, vertical for
+        /// main_horizontal). The secondary chain uses the opposite.
+        fn buildMainLayout(
+            nodes: []Node,
+            leaves: []*View,
+            primary_dir: Split.Layout,
+        ) void {
+            const n = leaves.len;
+            const secondary_dir: Split.Layout = switch (primary_dir) {
+                .horizontal => .vertical,
+                .vertical => .horizontal,
+            };
+
+            // Node 0: top-level split.
+            // Node 1: the main leaf.
+            // Nodes 2...: chain of remaining leaves.
+            nodes[1] = .{ .leaf = leaves[0] };
+
+            if (n == 2) {
+                nodes[2] = .{ .leaf = leaves[1] };
+                nodes[0] = .{ .split = .{
+                    .layout = primary_dir,
+                    .ratio = 0.5,
+                    .left = @enumFromInt(1),
+                    .right = @enumFromInt(2),
+                } };
+                return;
+            }
+
+            // Build the secondary chain starting at index 2.
+            buildChain(nodes, 2, leaves[1..], secondary_dir);
+
+            // Top-level split: main pane gets more space.
+            nodes[0] = .{ .split = .{
+                .layout = primary_dir,
+                .ratio = 0.5,
+                .left = @enumFromInt(1),
+                .right = @enumFromInt(2),
+            } };
+        }
+
+        /// Build a tiled (grid) layout. Arranges N leaves into rows x cols
+        /// as close to square as possible. Uses `alloc` for temporary
+        /// bookkeeping (row root handles).
+        fn buildTiled(
+            alloc: Allocator,
+            nodes: []Node,
+            leaves: []*View,
+        ) Allocator.Error!void {
+            const n = leaves.len;
+
+            // Find the best grid dimensions.
+            const cols = cols: {
+                var c: usize = @intFromFloat(@ceil(@sqrt(@as(f64, @floatFromInt(n)))));
+                if (c < 1) c = 1;
+                break :cols c;
+            };
+            const rows = (n + cols - 1) / cols;
+
+            if (rows == 1) {
+                buildChain(nodes, 0, leaves, .horizontal);
+                return;
+            }
+            if (cols == 1) {
+                buildChain(nodes, 0, leaves, .vertical);
+                return;
+            }
+
+            // Strategy: build row chains, then chain the rows vertically.
+            //
+            // Array layout:
+            //   [row_splits...] [row0_nodes...] [row1_nodes...] ...
+            //
+            // We need (rows - 1) split nodes for the vertical chain of
+            // rows, then each row needs its own nodes.
+            var offset: usize = 0;
+
+            // Reserve space for the vertical chain splits.
+            const row_chain_start = offset;
+            offset += rows - 1;
+
+            // Build each row's horizontal chain.
+            const row_roots = try alloc.alloc(Node.Handle, rows);
+            for (0..rows) |r| {
+                const start = r * cols;
+                const end = @min(start + cols, n);
+                const row_leaves = leaves[start..end];
+                buildChain(nodes, offset, row_leaves, .horizontal);
+                row_roots[r] = @enumFromInt(offset);
+                offset += row_leaves.len + row_leaves.len - 1;
+            }
+
+            // Build the vertical chain connecting row roots.
+            for (0..rows - 1) |i| {
+                const split_idx = row_chain_start + i;
+                const remaining: f16 = @floatFromInt(rows - i);
+                nodes[split_idx] = .{ .split = .{
+                    .layout = .vertical,
+                    .ratio = 1.0 / remaining,
+                    .left = row_roots[i],
+                    .right = if (i == rows - 2)
+                        row_roots[i + 1]
+                    else
+                        @enumFromInt(split_idx + 1),
+                } };
+            }
         }
 
         /// Resize the nearest split matching the layout by the given ratio.
@@ -2594,6 +2814,7 @@ test "SplitTree: swap siblings" {
 }
 
 test "SplitTree: swap cross-parent" {
+test "SplitTree: selectLayout even_horizontal" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -2651,11 +2872,30 @@ test "SplitTree: swap cross-parent" {
         \\+--------+
         \\|    A   |
         \\+--------+
+    // Build A | B vertical (intentionally not horizontal).
+    var split1 = try t1.split(alloc, .root, .down, 0.5, &t2);
+    defer split1.deinit();
+    var split2 = try split1.split(alloc, .root, .down, 0.5, &t3);
+    defer split2.deinit();
+
+    // Rearrange into even_horizontal.
+    var result = try split2.selectLayout(alloc, .even_horizontal);
+    defer result.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(result, .formatText)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\split (layout: horizontal, ratio: 0.33)
+        \\  leaf: A
+        \\  split (layout: horizontal, ratio: 0.50)
+        \\    leaf: B
+        \\    leaf: C
         \\
     );
 }
 
 test "SplitTree: swap same node" {
+test "SplitTree: selectLayout even_vertical" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -2681,8 +2921,140 @@ test "SplitTree: swap same node" {
     defer alloc.free(str);
     try testing.expectEqualStrings(str,
         \\split (layout: horizontal, ratio: 0.50)
+    // Build A | B horizontal (intentionally not vertical).
+    var split = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer split.deinit();
+
+    var result = try split.selectLayout(alloc, .even_vertical);
+    defer result.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(result, .formatText)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\split (layout: vertical, ratio: 0.50)
         \\  leaf: A
         \\  leaf: B
+        \\
+    );
+}
+
+test "SplitTree: selectLayout main_vertical" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    // Build some tree shape.
+    var split1 = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer split1.deinit();
+    var split2 = try split1.split(alloc, .root, .down, 0.5, &t3);
+    defer split2.deinit();
+
+    // Rearrange into main_vertical: A on left, B and C stacked on right.
+    var result = try split2.selectLayout(alloc, .main_vertical);
+    defer result.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(result, .formatText)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\split (layout: horizontal, ratio: 0.50)
+        \\  leaf: A
+        \\  split (layout: vertical, ratio: 0.50)
+        \\    leaf: B
+        \\    leaf: C
+        \\
+    );
+}
+
+test "SplitTree: selectLayout tiled" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    var v4: TestTree.View = .{ .label = "D" };
+    var t4: TestTree = try .init(alloc, &v4);
+    defer t4.deinit();
+
+    // Build a chain of 4.
+    var s1 = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+    var it = s1.iterator();
+    var s2 = try s1.split(
+        alloc,
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) {
+                break entry.handle;
+            }
+        } else return error.NotFound,
+        .right,
+        0.5,
+        &t3,
+    );
+    defer s2.deinit();
+    it = s2.iterator();
+    var s3 = try s2.split(
+        alloc,
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "C")) {
+                break entry.handle;
+            }
+        } else return error.NotFound,
+        .right,
+        0.5,
+        &t4,
+    );
+    defer s3.deinit();
+
+    // Rearrange into tiled (2x2 grid).
+    var result = try s3.selectLayout(alloc, .tiled);
+    defer result.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(result, .formatDiagram)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\+---++---+
+        \\| A || B |
+        \\+---++---+
+        \\+---++---+
+        \\| C || D |
+        \\+---++---+
+        \\
+    );
+}
+
+test "SplitTree: selectLayout single leaf" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+
+    var result = try t1.selectLayout(alloc, .tiled);
+    defer result.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(result, .formatDiagram)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\+---+
+        \\| A |
+        \\+---+
         \\
     );
 }

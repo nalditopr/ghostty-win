@@ -2927,6 +2927,24 @@ pub fn equalizeSplits(self: *Window) void {
     self.layoutSplits();
 }
 
+/// Rearrange all splits in the active tab into a predefined layout.
+pub fn selectLayout(self: *Window, layout: apprt.action.SelectLayout) void {
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const alloc = self.app.core_app.alloc;
+    const tab = ws.active_tab;
+
+    const Tree = SplitTree(Pane);
+    const tree_layout: Tree.PredefinedLayout = switch (layout) {
+        inline else => |tag| @field(Tree.PredefinedLayout, @tagName(tag)),
+    };
+    const new_tree = ws.tab_trees[tab].selectLayout(alloc, tree_layout) catch return;
+    var old_tree = ws.tab_trees[tab];
+    old_tree.deinit();
+    ws.tab_trees[tab] = new_tree;
+    self.layoutSplits();
+}
+
 /// Toggle zoom on the active split surface.
 pub fn toggleSplitZoom(self: *Window) void {
     const ws = self.activeWorkspace();
