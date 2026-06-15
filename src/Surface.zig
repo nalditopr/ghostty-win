@@ -5436,6 +5436,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .toggle_synchronized_input => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_synchronized_input,
+            {},
+        ),
+
         .toggle_readonly => {
             self.readonly = !self.readonly;
             _ = try self.rt_app.performAction(

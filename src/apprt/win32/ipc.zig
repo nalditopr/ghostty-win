@@ -119,6 +119,9 @@ pub const Command = enum {
     @"session-list",
 
     @"select-layout",
+    // Toggle synchronized input for a tab. Args: {action:"toggle"|"on"|
+    // "off", [workspace], [tab]}. Defaults to the active workspace/tab.
+    @"sync-input",
 };
 
 /// Protocol-level failures that map to error responses.

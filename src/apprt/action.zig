@@ -358,6 +358,10 @@ pub const Action = union(Key) {
 
     /// Swap the focused split with the split in the given direction.
     swap_split: GotoSplit,
+    /// Toggle synchronized input for the current tab (Windows apprt
+    /// only). When active, keyboard input to the focused pane is
+    /// broadcast to all terminal panes in the same tab.
+    toggle_synchronized_input,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -432,6 +436,7 @@ pub const Action = union(Key) {
         toggle_sidebar,
         swap_split,
         select_layout,
+        toggle_synchronized_input,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

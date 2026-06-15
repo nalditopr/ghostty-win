@@ -662,6 +662,12 @@ pub const Action = union(enum) {
     ///     process is not running
     toggle_readonly,
 
+    /// Toggle synchronized input for the current tab. When active,
+    /// keyboard input to the focused pane is broadcast to all terminal
+    /// panes in the same tab simultaneously. Similar to tmux
+    /// `synchronize-panes`.
+    toggle_synchronized_input,
+
     /// Resize the current split in the specified direction and amount in
     /// pixels. The two arguments should be joined with a comma (`,`),
     /// like in `resize_split:up,10`.
@@ -1451,6 +1457,7 @@ pub const Action = union(enum) {
             .goto_window,
             .toggle_split_zoom,
             .toggle_readonly,
+            .toggle_synchronized_input,
             .resize_split,
             .swap_split,
             .equalize_splits,

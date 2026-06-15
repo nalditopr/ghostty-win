@@ -104,6 +104,9 @@ pub const Workspace = struct {
     /// "latest-notification" text (Stage 2). Pure ring lives in ipc.zig so
     /// the wrap/truncation rules are unit-tested there.
     tab_log: [MAX_TABS]ipc.LogRing = @splat(.{}),
+    /// Per-tab synchronized input flag. When true, keyboard input to the
+    /// focused pane is broadcast to all other terminal panes in the tab.
+    tab_synchronized: [MAX_TABS]bool = @splat(false),
     /// Workspace name shown on its sidebar row.
     name: [64]u16 = undefined,
     /// Length of the workspace name in UTF-16 code units.
@@ -160,6 +163,7 @@ pub const Workspace = struct {
         *[MAX_TABS]u16,
         *[MAX_TABS]?u8,
         *[MAX_TABS]ipc.LogRing,
+        *[MAX_TABS]bool,
     } {
         return .{
             &self.tab_trees,
@@ -172,6 +176,7 @@ pub const Workspace = struct {
             &self.tab_status_text_len,
             &self.tab_progress,
             &self.tab_log,
+            &self.tab_synchronized,
         };
     }
 
@@ -2969,6 +2974,14 @@ pub fn toggleSplitZoom(self: *Window) void {
     self.layoutSplits();
 }
 
+pub fn toggleSynchronizedInput(self: *Window) void {
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const tab = ws.active_tab;
+    ws.tab_synchronized[tab] = !ws.tab_synchronized[tab];
+    self.invalidateTabBar();
+}
+
 /// Navigate to a tab by GotoTab target (previous, next, last, or index).
 pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
     const ws = self.activeWorkspace();
@@ -3425,12 +3438,34 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             );
         }
 
+        // Sync indicator: a small orange glyph when synchronized input
+        // is active on this tab, drawn between the attention dot and the
+        // title so the user has a persistent visual cue.
+        const sync_indicator_w: i32 = if (ws.tab_synchronized[i]) @intFromFloat(@round(14.0 * self.scale)) else 0;
+        if (sync_indicator_w > 0) {
+            _ = w32.SetTextColor(mem_dc, w32.RGB(0xE8, 0x9C, 0x20));
+            const sync_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{21C4}");
+            var sync_rect = w32.RECT{
+                .left = x + text_pad + attn_dot_w,
+                .top = 0,
+                .right = x + text_pad + attn_dot_w + sync_indicator_w,
+                .bottom = bar_h,
+            };
+            _ = w32.DrawTextW(
+                mem_dc,
+                sync_char,
+                1,
+                &sync_rect,
+                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+            );
+        }
+
         // Draw tab title text.
         const title_len = ws.tab_title_lens[i];
         if (title_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
             var text_rect = w32.RECT{
-                .left = x + text_pad + attn_dot_w,
+                .left = x + text_pad + attn_dot_w + sync_indicator_w,
                 .top = 0,
                 .right = x + this_tab_w - close_btn_w - text_pad,
                 .bottom = bar_h,

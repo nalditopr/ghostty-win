@@ -490,7 +490,7 @@ pub fn run(self: *App) !void {
                     break :blk null;
                 };
                 if (target_surface) |s| {
-                    s.handleKeyEvent(msg.wParam, msg.lParam, .press);
+                    _ = s.handleKeyEvent(msg.wParam, msg.lParam, .press);
                     continue :loop;
                 }
             }
@@ -1461,6 +1461,16 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     core_surface.rt_surface.parent_window.toggleSplitZoom();
+                },
+            }
+            return true;
+        },
+
+        .toggle_synchronized_input => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.toggleSynchronizedInput();
                 },
             }
             return true;
@@ -3029,6 +3039,7 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
             server.sendError(req.id, @errorName(err)) catch {};
         },
         .@"select-layout" => self.ipcSelectLayout(req) catch |err| {
+        .@"sync-input" => self.ipcSyncInput(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
     }
@@ -4054,6 +4065,27 @@ fn ipcSelectLayout(self: *App, req: *ipc.Request) anyerror!void {
         return server.sendError(req.id, "unknown layout") catch {};
     const window = self.ipcTargetWindow() orelse return;
     window.selectLayout(layout);
+/// sync-input {action:"toggle"|"on"|"off", [workspace], [tab]} → toggle or
+/// set synchronized input for the addressed tab. Defaults to active
+/// workspace/tab.
+fn ipcSyncInput(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const action_str = ipcArgString(req, "action") orelse "toggle";
+    const target = try self.ipcResolveWorkspace(req);
+    const ws = target.ws;
+    const tab_idx: usize = if (ipcArgU32(req, "tab")) |t| t else ws.active_tab;
+    if (tab_idx >= ws.tab_count) return IpcError.UnknownTab;
+
+    if (std.mem.eql(u8, action_str, "toggle")) {
+        ws.tab_synchronized[tab_idx] = !ws.tab_synchronized[tab_idx];
+    } else if (std.mem.eql(u8, action_str, "on")) {
+        ws.tab_synchronized[tab_idx] = true;
+    } else if (std.mem.eql(u8, action_str, "off")) {
+        ws.tab_synchronized[tab_idx] = false;
+    } else {
+        return IpcError.BadAction;
+    }
+    target.window.invalidateTabBar();
     server.sendOk(req.id, null) catch {};
 }
 
@@ -4392,6 +4424,45 @@ fn tick(self: *App) void {
     };
 }
 
+/// Broadcast a key event (WM_KEYDOWN/WM_KEYUP) from the focused surface
+/// to all other terminal panes in the same tab when synchronized input is
+/// active. Skipped when the surface is already receiving a broadcast (the
+/// sync_broadcast guard prevents infinite loops).
+fn broadcastKeyEvent(source: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
+    const pw = source.parent_window;
+    const ws = pw.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const tab = ws.active_tab;
+    if (!ws.tab_synchronized[tab]) return;
+
+    var it = ws.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        const sibling = entry.view.surface() orelse continue;
+        if (sibling == source) continue;
+        sibling.sync_broadcast = true;
+        _ = sibling.handleKeyEvent(wparam, lparam, action);
+        sibling.sync_broadcast = false;
+    }
+}
+
+/// Broadcast a WM_CHAR event to synchronized sibling panes.
+fn broadcastCharEvent(source: *Surface, wparam: usize) void {
+    const pw = source.parent_window;
+    const ws = pw.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const tab = ws.active_tab;
+    if (!ws.tab_synchronized[tab]) return;
+
+    var it = ws.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        const sibling = entry.view.surface() orelse continue;
+        if (sibling == source) continue;
+        sibling.sync_broadcast = true;
+        sibling.handleCharEvent(wparam);
+        sibling.sync_broadcast = false;
+    }
+}
+
 /// Window procedure for terminal surface child HWNDs (GhosttyTerminal class).
 /// GWLP_USERDATA stores a *Surface pointer.
 fn surfaceWndProc(
@@ -4507,12 +4578,16 @@ fn surfaceWndProc(
         },
 
         w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => {
-            surface.handleKeyEvent(wparam, lparam, .press);
+            const consumed = surface.handleKeyEvent(wparam, lparam, .press);
+            if (!consumed and !surface.sync_broadcast)
+                broadcastKeyEvent(surface, wparam, lparam, .press);
             return 0;
         },
 
         w32.WM_KEYUP, w32.WM_SYSKEYUP => {
-            surface.handleKeyEvent(wparam, lparam, .release);
+            const consumed = surface.handleKeyEvent(wparam, lparam, .release);
+            if (!consumed and !surface.sync_broadcast)
+                broadcastKeyEvent(surface, wparam, lparam, .release);
             return 0;
         },
 
@@ -4552,6 +4627,8 @@ fn surfaceWndProc(
                 return 0;
             }
             surface.handleCharEvent(wparam);
+            if (!surface.sync_broadcast)
+                broadcastCharEvent(surface, wparam);
             return 0;
         },
 
