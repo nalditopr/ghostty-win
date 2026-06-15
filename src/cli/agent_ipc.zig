@@ -197,13 +197,15 @@ pub const impl = if (builtin.os.tag == .windows) struct {
         const first = try alloc.dupe(u8, name_buf[0..first_len]);
         errdefer alloc.free(first);
 
-        // If a second match exists, the target is ambiguous.
+        // If a second match exists, the target is ambiguous. The errdefer
+        // above frees `first` on this error return — do NOT also free it
+        // here, or the block is freed twice (a double-free that crashes when
+        // the allocator has unmapped the page, e.g. a large/own-page block).
         if (FindNextFileW(find, &find_data) != 0) {
             stderr.print(
                 "multiple Ghostty instances found; set GHOSTTY_PID to choose one\n",
                 .{},
             ) catch {};
-            alloc.free(first);
             return error.MultipleInstances;
         }
 
