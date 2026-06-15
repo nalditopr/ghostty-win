@@ -1471,6 +1471,23 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     core_surface.rt_surface.parent_window.toggleSynchronizedInput();
+        .break_pane => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const pane = core_surface.rt_surface.pane orelse return true;
+                    core_surface.rt_surface.parent_window.breakPane(pane);
+                },
+            }
+            return true;
+        },
+
+        .move_pane => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const pane = core_surface.rt_surface.pane orelse return true;
+                    core_surface.rt_surface.parent_window.movePaneToTab(pane, value);
                 },
             }
             return true;
@@ -1521,6 +1538,7 @@ pub fn performAction(
         },
 
         // All 67 apprt actions are now handled above.
+        // All 68 apprt actions are now handled above.
     }
 }
 
@@ -3040,6 +3058,10 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         },
         .@"select-layout" => self.ipcSelectLayout(req) catch |err| {
         .@"sync-input" => self.ipcSyncInput(req) catch |err| {
+        .@"break-pane" => self.ipcBreakPane(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"move-pane" => self.ipcMovePaneToTab(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
     }
@@ -4086,6 +4108,39 @@ fn ipcSyncInput(self: *App, req: *ipc.Request) anyerror!void {
         return IpcError.BadAction;
     }
     target.window.invalidateTabBar();
+/// break-pane: break the active pane of the addressed (or active) tab
+/// out of its split into a new tab.
+fn ipcBreakPane(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    target.window.breakPane(pane);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// move-pane: move the active pane of the addressed (or active) tab to
+/// an adjacent tab. Args: {direction:"next"|"prev"|"new", [workspace],
+/// [tab]}.
+fn ipcMovePaneToTab(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+
+    const dir_str: ?[]const u8 = if (req.args == .object)
+        if (req.args.object.get("direction")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null
+    else
+        null;
+    const move_target: apprt.action.MovePaneTarget = if (dir_str) |d| blk: {
+        if (std.mem.eql(u8, d, "next")) break :blk .next_tab;
+        if (std.mem.eql(u8, d, "prev")) break :blk .prev_tab;
+        if (std.mem.eql(u8, d, "new")) break :blk .new_tab;
+        return IpcError.BadDirection;
+    } else .next_tab;
+
+    target.window.movePaneToTab(pane, move_target);
     server.sendOk(req.id, null) catch {};
 }
 

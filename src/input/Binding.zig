@@ -652,6 +652,10 @@ pub const Action = union(enum) {
     /// reflect this by displaying an icon indicating the zoomed state.
     toggle_split_zoom,
 
+    /// Break the focused pane out of its split into a new tab.
+    /// Only effective when the pane is part of a split.
+    break_pane,
+
     /// Toggle read-only mode for the current surface.
     ///
     /// When a surface is in read-only mode:
@@ -1456,6 +1460,7 @@ pub const Action = union(enum) {
             .goto_split,
             .goto_window,
             .toggle_split_zoom,
+            .break_pane,
             .toggle_readonly,
             .toggle_synchronized_input,
             .resize_split,

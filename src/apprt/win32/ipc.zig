@@ -122,6 +122,10 @@ pub const Command = enum {
     // Toggle synchronized input for a tab. Args: {action:"toggle"|"on"|
     // "off", [workspace], [tab]}. Defaults to the active workspace/tab.
     @"sync-input",
+    // Pane movement: break a pane out of its split into a new tab, or
+    // move it to an adjacent/specific tab.
+    @"break-pane",
+    @"move-pane",
 };
 
 /// Protocol-level failures that map to error responses.

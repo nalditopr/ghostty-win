@@ -362,6 +362,11 @@ pub const Action = union(Key) {
     /// only). When active, keyboard input to the focused pane is
     /// broadcast to all terminal panes in the same tab.
     toggle_synchronized_input,
+    /// Break the focused pane out of its split into a new tab.
+    break_pane,
+
+    /// Move the focused pane to an adjacent tab.
+    move_pane: MovePaneTarget,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -437,6 +442,8 @@ pub const Action = union(Key) {
         swap_split,
         select_layout,
         toggle_synchronized_input,
+        break_pane,
+        move_pane,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -963,6 +970,16 @@ pub const CloseTabMode = enum(c_int) {
 
     test "ghostty.h CloseTabMode" {
         try lib.checkGhosttyHEnum(CloseTabMode, "GHOSTTY_ACTION_CLOSE_TAB_MODE_");
+    }
+};
+
+pub const MovePaneTarget = enum(c_int) {
+    next_tab,
+    prev_tab,
+    new_tab,
+
+    test "ghostty.h MovePaneTarget" {
+        try lib.checkGhosttyHEnum(MovePaneTarget, "GHOSTTY_ACTION_MOVE_PANE_TARGET_");
     }
 };
 

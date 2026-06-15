@@ -6730,6 +6730,11 @@ pub const Keybinds = struct {
                 .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_split = .down },
             );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = '!' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .break_pane = {} },
+            );
             // Sidebar toggle + smart Ctrl+C / Ctrl+V: ALL win32 apprt only.
             // On Linux/GTK there is no sidebar and ctrl+c must stay SIGINT
             // (copy is ctrl+shift+c there), so none of these may be

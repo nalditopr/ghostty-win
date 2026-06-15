@@ -836,6 +836,12 @@ typedef enum {
   GHOSTTY_ACTION_SELECT_LAYOUT_MAIN_VERTICAL,
   GHOSTTY_ACTION_SELECT_LAYOUT_TILED,
 } ghostty_action_select_layout_e;
+// apprt.action.MovePaneTarget
+typedef enum {
+  GHOSTTY_ACTION_MOVE_PANE_TARGET_NEXT_TAB,
+  GHOSTTY_ACTION_MOVE_PANE_TARGET_PREV_TAB,
+  GHOSTTY_ACTION_MOVE_PANE_TARGET_NEW_TAB,
+} ghostty_action_move_pane_target_e;
 
 // apprt.surface.Message.ChildExited
 typedef struct {
@@ -962,6 +968,8 @@ typedef enum {
   GHOSTTY_ACTION_SWAP_SPLIT,
   GHOSTTY_ACTION_SELECT_LAYOUT,
   GHOSTTY_ACTION_TOGGLE_SYNCHRONIZED_INPUT,
+  GHOSTTY_ACTION_BREAK_PANE,
+  GHOSTTY_ACTION_MOVE_PANE,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1005,6 +1013,7 @@ typedef union {
   ghostty_action_readonly_e readonly;
   ghostty_action_goto_split_e swap_split;
   ghostty_action_select_layout_e select_layout;
+  ghostty_action_move_pane_target_e move_pane;
 } ghostty_action_u;
 
 typedef struct {

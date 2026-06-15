@@ -1615,6 +1615,178 @@ pub fn closeSplitPane(self: *Window, pane: *Pane) void {
     }
 }
 
+/// Break the focused pane out of its split into a new tab in the same
+/// workspace. The pane's HWND/surface is NOT destroyed — it is detached
+/// from the source tree and becomes the sole root of a fresh tab. If the
+/// pane is the only pane in its tab (not split), this is a no-op.
+pub fn breakPane(self: *Window, pane: *Pane) void {
+    const alloc = self.app.core_app.alloc;
+    const loc = self.findLoc(pane) orelse return;
+    const ws = loc.ws;
+    const src_tab = loc.tab;
+    const tree = &ws.tab_trees[src_tab];
+
+    if (!tree.isSplit()) return;
+    if (ws.tab_count >= MAX_TABS) return;
+
+    const handle = ws.findHandle(src_tab, pane) orelse return;
+
+    const next_handle = (tree.goto(alloc, handle, .next) catch null) orelse
+        (tree.goto(alloc, handle, .previous) catch null);
+    const next_pane: ?*Pane = if (next_handle) |nh| switch (tree.nodes[nh.idx()]) {
+        .leaf => |v| v,
+        .split => null,
+    } else null;
+
+    // Bump the pane's ref count: tree.remove will unref all surviving
+    // nodes (they get re-reffed into the new tree), and the removed node
+    // gets unreffed too. We need the pane to survive the remove+deinit
+    // cycle, so add an extra ref that balances the unref the old tree's
+    // deinit will perform on the removed node.
+    _ = pane.ref(alloc) catch return;
+
+    const new_tree = tree.remove(alloc, handle) catch {
+        pane.unref(alloc);
+        return;
+    };
+
+    var old_tree = ws.tab_trees[src_tab];
+    ws.tab_trees[src_tab] = new_tree;
+    if (next_pane) |np| ws.tab_active_pane[src_tab] = np;
+    old_tree.deinit();
+
+    // Build a single-node tree for the detached pane. SplitTree.init
+    // calls ref(), giving the pane a fresh ownership ref in the new tree.
+    var pane_tree = SplitTree(Pane).init(alloc, pane) catch {
+        pane.unref(alloc);
+        return;
+    };
+    // The extra ref we took above is no longer needed — the new tree's
+    // init ref now owns the pane. Drop the spare.
+    pane.unref(alloc);
+
+    const pos: usize = src_tab + 1;
+    tabArraysInsertGap(ws.tabArrays(), ws.tab_count, pos);
+    ws.tab_trees[pos] = pane_tree;
+    ws.tab_active_pane[pos] = pane;
+    ws.tab_status[pos] = .normal;
+    ws.tab_attention[pos] = false;
+    ws.tab_status_text_len[pos] = 0;
+    ws.tab_progress[pos] = null;
+    ws.tab_log[pos].clear();
+    ws.tab_count += 1;
+
+    // Copy the source tab's title to the new tab.
+    @memcpy(
+        ws.tab_titles[pos][0..ws.tab_title_lens[src_tab]],
+        ws.tab_titles[src_tab][0..ws.tab_title_lens[src_tab]],
+    );
+    ws.tab_title_lens[pos] = ws.tab_title_lens[src_tab];
+
+    const ws_idx = self.workspaceIndex(ws);
+    if (ws_idx == self.active_workspace) {
+        // Re-layout the source tab (it lost a pane).
+        self.layoutSplits();
+        // Switch to the new tab.
+        self.selectTabIndex(pos);
+        self.updateTabBarVisibility();
+    } else {
+        ws.active_tab = pos;
+        self.invalidateSidebar();
+    }
+}
+
+/// Move the focused pane to an adjacent tab as a split. The pane is
+/// detached from its current tree without destroying its surface and
+/// joined into the target tab's tree. If it was the only pane in the
+/// source tab, that tab is closed.
+pub fn movePaneToTab(self: *Window, pane: *Pane, target_enum: apprt.action.MovePaneTarget) void {
+    const alloc = self.app.core_app.alloc;
+    const loc = self.findLoc(pane) orelse return;
+    const ws = loc.ws;
+    const src_tab = loc.tab;
+
+    const target_tab: ?usize = switch (target_enum) {
+        .next_tab => if (src_tab + 1 < ws.tab_count) src_tab + 1 else null,
+        .prev_tab => if (src_tab > 0) src_tab - 1 else null,
+        .new_tab => blk: {
+            self.breakPane(pane);
+            return;
+        },
+    };
+    const dst_tab = target_tab orelse return;
+
+    const is_split = ws.tab_trees[src_tab].isSplit();
+
+    // Bump ref to keep the pane alive through the tree rebuild.
+    _ = pane.ref(alloc) catch return;
+
+    if (is_split) {
+        const handle = ws.findHandle(src_tab, pane) orelse {
+            pane.unref(alloc);
+            return;
+        };
+        const next_handle = (ws.tab_trees[src_tab].goto(alloc, handle, .next) catch null) orelse
+            (ws.tab_trees[src_tab].goto(alloc, handle, .previous) catch null);
+        const next_pane: ?*Pane = if (next_handle) |nh| switch (ws.tab_trees[src_tab].nodes[nh.idx()]) {
+            .leaf => |v| v,
+            .split => null,
+        } else null;
+
+        const new_src = ws.tab_trees[src_tab].remove(alloc, handle) catch {
+            pane.unref(alloc);
+            return;
+        };
+        var old_src = ws.tab_trees[src_tab];
+        ws.tab_trees[src_tab] = new_src;
+        if (next_pane) |np| ws.tab_active_pane[src_tab] = np;
+        old_src.deinit();
+    }
+
+    // Build a single-node insert tree for the pane.
+    var insert_tree = SplitTree(Pane).init(alloc, pane) catch {
+        pane.unref(alloc);
+        return;
+    };
+    defer insert_tree.deinit();
+    // Drop the spare ref; the insert tree now owns one.
+    pane.unref(alloc);
+
+    // If the source tab was the only pane, close it BEFORE inserting
+    // into the destination so that tab indices remain consistent. The
+    // pane survives because SplitTree.init took a ref above.
+    var actual_dst = dst_tab;
+    if (!is_split) {
+        const ws_idx = self.workspaceIndex(ws);
+        self.closeTabInWorkspace(ws_idx, src_tab);
+        if (src_tab < dst_tab) actual_dst = dst_tab - 1;
+    }
+
+    // Insert into the destination tab's tree at its root.
+    const dst_tree = &ws.tab_trees[actual_dst];
+    const new_dst = dst_tree.split(
+        alloc,
+        .root,
+        .right,
+        @as(f16, 0.5),
+        &insert_tree,
+    ) catch return;
+
+    var old_dst = ws.tab_trees[actual_dst];
+    ws.tab_trees[actual_dst] = new_dst;
+    ws.tab_active_pane[actual_dst] = pane;
+    old_dst.deinit();
+
+    const ws_idx = self.workspaceIndex(ws);
+    if (ws_idx == self.active_workspace) {
+        self.selectTabIndex(actual_dst);
+        self.updateTabBarVisibility();
+    } else {
+        ws.active_tab = actual_dst;
+        self.invalidateSidebar();
+    }
+}
+
 /// Switch to the tab at the given index in the active workspace.
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     const ws = self.activeWorkspace();
