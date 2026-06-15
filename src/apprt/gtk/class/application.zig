@@ -779,6 +779,21 @@ pub const Application = extern struct {
             .float_window,
             // Windows-only sidebar; GTK has no workspace sidebar.
             .toggle_sidebar,
+            .swap_split,
+            // Windows-only pane movement.
+            .break_pane,
+            .move_pane,
+            // Windows-only session save/restore.
+            .save_session,
+            .restore_session,
+            // Windows-only flash overlay.
+            .flash_pane,
+            // Windows-only notification read/unread toggle.
+            .toggle_notification_unread,
+            .mark_oldest_unread_jump,
+            .edit_workspace_description,
+            .toggle_right_sidebar,
+            .focus_right_sidebar,
             .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,

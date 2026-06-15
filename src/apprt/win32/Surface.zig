@@ -108,6 +108,10 @@ current_cursor: ?w32.HCURSOR = null,
 /// core surface toggles this for typing-while-mouse-still etc.
 mouse_visible: bool = true,
 
+/// Guard: set while this surface is receiving a broadcasted key/char
+/// event from synchronized input, preventing re-broadcast loops.
+sync_broadcast: bool = false,
+
 /// Accumulated fractional wheel delta for Ctrl+scroll font zoom. Win32
 /// wheel notches are normally ±1.0 (WHEEL_DELTA), but high-resolution /
 /// precision touchpads deliver sub-notch deltas. We accumulate them here
@@ -160,6 +164,8 @@ palette_filtered: [palette_entries.len]u16 = undefined,
 /// HWND's GWLP_USERDATA) and Pane.create — message handlers running
 /// in that gap must not dereference it.
 pane: ?*Pane = null,
+
+title: ?[:0]const u8 = null,
 
 /// "Needs attention" flag (the notification ring). Set by an explicit
 /// signal — the attention OSC (see App.handleAttentionOsc) or the
@@ -367,6 +373,11 @@ pub fn deinit(self: *Surface) void {
         self.spawn_command = null;
     }
 
+    if (self.title) |t| {
+        self.app.core_app.alloc.free(t);
+        self.title = null;
+    }
+
     if (self.core_surface_initialized) {
         log.debug("surface deinit: core_surface.deinit start", .{});
         self.core_surface.deinit();
@@ -520,9 +531,7 @@ pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
 }
 
 pub fn getTitle(self: *const Surface) ?[:0]const u8 {
-    _ = self;
-    // TODO: Store and return the title set via setTitle.
-    return null;
+    return self.title;
 }
 
 pub fn close(self: *Surface, process_active: bool) void {
@@ -706,6 +715,9 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
 
 /// Set the window title. Called from performAction(.set_title).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
+    const alloc = self.app.core_app.alloc;
+    if (self.title) |old| alloc.free(old);
+    self.title = alloc.dupeZ(u8, title) catch null;
     self.parent_window.onTabTitleChanged(self, title);
 }
 
@@ -983,6 +995,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Focus Previous Split", .action = .{ .goto_split = .previous } },
     .{ .name = "Focus Next Split", .action = .{ .goto_split = .next } },
     .{ .name = "Toggle Split Zoom", .action = .toggle_split_zoom },
+    .{ .name = "Toggle Synchronized Input", .action = .toggle_synchronized_input },
     .{ .name = "Equalize Splits", .action = .equalize_splits },
     .{ .name = "Toggle Fullscreen", .action = .toggle_fullscreen },
     .{ .name = "Toggle Maximize", .action = .toggle_maximize },
@@ -1599,20 +1612,22 @@ pub fn handleDpiChange(self: *Surface) void {
 }
 
 /// Handle WM_KEYDOWN / WM_SYSKEYDOWN / WM_KEYUP / WM_SYSKEYUP.
-pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
-    if (!self.core_surface_ready) return;
+/// Returns true when the key was consumed by a keybinding (callers
+/// should not broadcast a consumed event to synchronized siblings).
+pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) bool {
+    if (!self.core_surface_ready) return false;
     const vk: u16 = @intCast(wparam & 0xFFFF);
 
     // When the IME is active, physical key presses arrive as VK_PROCESSKEY.
     // The IME will produce the composed text via WM_IME_COMPOSITION — skip
     // the key event so we don't feed garbage to the terminal.
-    if (vk == w32.VK_PROCESSKEY) return;
+    if (vk == w32.VK_PROCESSKEY) return false;
 
     // VK_PACKET is sent by SendInput with KEYEVENTF_UNICODE (used by
     // accessibility tools, on-screen keyboards, and Unicode injection).
     // The actual character follows as WM_CHAR — don't set the
     // key_event_produced_text flag so WM_CHAR is allowed through.
-    if (vk == w32.VK_PACKET) return;
+    if (vk == w32.VK_PACKET) return false;
 
     // Determine left/right for modifier keys using the extended key flag
     // (bit 24 of lparam) and specific left/right VK codes.
@@ -1650,15 +1665,15 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
                 .unshifted_codepoint = unshifted_cp,
             }) catch |err| {
                 log.err("key callback error: {}", .{err});
-                return;
+                return true;
             };
             // If a keybinding consumed the event, don't send Win32 input.
-            if (effect == .consumed or effect == .closed) return;
+            if (effect == .consumed or effect == .closed) return true;
         }
 
         // No binding matched — send as Win32 input sequence.
         self.sendWin32InputEvent(vk, lparam, action);
-        return;
+        return false;
     }
 
     // Check if the key is a repeat (bit 30 of lparam is set for KEYDOWN
@@ -1728,9 +1743,11 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
         .unshifted_codepoint = unshifted_codepoint,
     };
 
-    _ = self.core_surface.keyCallback(event) catch |err| {
+    const effect = self.core_surface.keyCallback(event) catch |err| {
         log.err("key callback error: {}", .{err});
+        return true;
     };
+    return effect == .consumed or effect == .closed;
 }
 
 /// Handle WM_CHAR — character input after translation.

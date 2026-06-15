@@ -603,6 +603,43 @@ pub const Action = union(enum) {
     /// a no-op. Bound to `ctrl+b` by default on Windows.
     toggle_sidebar,
 
+    /// Save the current session layout (workspaces, tabs, working
+    /// directories) to disk. The saved state can be restored later
+    /// with `restore_session`. Only implemented on Windows.
+    save_session,
+
+    /// Restore a previously saved session layout from disk. Creates
+    /// workspaces and tabs to match the saved state.
+    /// Only implemented on Windows.
+    restore_session,
+    /// Toggle the read/unread state of a notification. If the
+    /// notifications panel is open with an entry selected, toggle that
+    /// entry; otherwise toggle the most recent notification.
+    ///
+    /// Only implemented on Windows.
+    toggle_notification_unread,
+
+    /// Find the oldest unread notification, mark it as read, and jump
+    /// to the next unread notification's source pane. If there are no
+    /// more unread notifications, this is a no-op.
+    ///
+    /// Only implemented on Windows.
+    mark_oldest_unread_jump,
+    /// Start inline editing of the active workspace's description (the
+    /// line shown below the workspace name in the sidebar). Windows apprt
+    /// only; a no-op on other platforms.
+    edit_workspace_description,
+    /// Toggle the right sidebar panel's visibility. The right sidebar
+    /// displays per-tab contextual information: status text, progress
+    /// bars, and log entries pushed by agents. Session-only override of
+    /// `window-show-right-sidebar`. Currently Windows only.
+    toggle_right_sidebar,
+
+    /// Toggle focus between the right sidebar and the terminal. When
+    /// focused, keyboard input can scroll the log view. Currently
+    /// Windows only.
+    focus_right_sidebar,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -652,6 +689,10 @@ pub const Action = union(enum) {
     /// reflect this by displaying an icon indicating the zoomed state.
     toggle_split_zoom,
 
+    /// Break the focused pane out of its split into a new tab.
+    /// Only effective when the pane is part of a split.
+    break_pane,
+
     /// Toggle read-only mode for the current surface.
     ///
     /// When a surface is in read-only mode:
@@ -662,13 +703,32 @@ pub const Action = union(enum) {
     ///     process is not running
     toggle_readonly,
 
+    /// Toggle synchronized input for the current tab. When active,
+    /// keyboard input to the focused pane is broadcast to all terminal
+    /// panes in the same tab simultaneously. Similar to tmux
+    /// `synchronize-panes`.
+    toggle_synchronized_input,
+
     /// Resize the current split in the specified direction and amount in
     /// pixels. The two arguments should be joined with a comma (`,`),
     /// like in `resize_split:up,10`.
     resize_split: SplitResizeParameter,
 
+    /// Swap the focused split with the split in the given direction.
+    swap_split: SplitFocusDirection,
+
     /// Equalize the size of all splits in the current window.
     equalize_splits,
+
+    /// Rearrange all splits into a predefined layout pattern.
+    ///
+    /// Valid arguments: `even_horizontal`, `even_vertical`,
+    /// `main_horizontal`, `main_vertical`, `tiled`.
+    select_layout: SelectLayout,
+    /// Flash the focused pane with a brief visual highlight so the
+    /// user can quickly see which pane has focus. The flash auto-
+    /// dismisses after ~200ms.
+    flash_pane,
 
     /// Reset the window to the default size. The "default size" is the
     /// size that a new window would be created with. This has no effect
@@ -1047,6 +1107,14 @@ pub const Action = union(enum) {
         auto, // splits along the larger direction
 
         pub const default: SplitDirection = .auto;
+    };
+
+    pub const SelectLayout = enum {
+        even_horizontal,
+        even_vertical,
+        main_horizontal,
+        main_vertical,
+        tiled,
     };
 
     pub const SplitFocusDirection = enum {
@@ -1429,13 +1497,25 @@ pub const Action = union(enum) {
             .move_tab,
             .toggle_tab_overview,
             .toggle_sidebar,
+            .save_session,
+            .restore_session,
+            .toggle_notification_unread,
+            .mark_oldest_unread_jump,
+            .edit_workspace_description,
+            .toggle_right_sidebar,
+            .focus_right_sidebar,
             .new_split,
             .goto_split,
             .goto_window,
             .toggle_split_zoom,
+            .break_pane,
             .toggle_readonly,
+            .toggle_synchronized_input,
             .resize_split,
+            .swap_split,
             .equalize_splits,
+            .select_layout,
+            .flash_pane,
             .inspector,
             => .surface,
         };

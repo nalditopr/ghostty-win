@@ -10,12 +10,15 @@ const internal_os = @import("../../os/main.zig");
 
 const App = @import("App.zig");
 const AttentionRing = @import("AttentionRing.zig").AttentionRing;
+const FlashOverlay = @import("FlashOverlay.zig").FlashOverlay;
 const BrowserPane = @import("BrowserPane.zig");
 const PaneButtonsMod = @import("PaneButtons.zig");
 const PaneButtons = PaneButtonsMod.PaneButtons;
 const Pane = @import("Pane.zig");
+const RightSidebar = @import("RightSidebar.zig");
 const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
+const SessionState = @import("SessionState.zig");
 const WindowState = @import("WindowState.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const ipc = @import("ipc.zig");
@@ -104,10 +107,20 @@ pub const Workspace = struct {
     /// "latest-notification" text (Stage 2). Pure ring lives in ipc.zig so
     /// the wrap/truncation rules are unit-tested there.
     tab_log: [MAX_TABS]ipc.LogRing = @splat(.{}),
+    /// Per-tab synchronized input flag. When true, keyboard input to the
+    /// focused pane is broadcast to all other terminal panes in the tab.
+    tab_synchronized: [MAX_TABS]bool = @splat(false),
     /// Workspace name shown on its sidebar row.
     name: [64]u16 = undefined,
     /// Length of the workspace name in UTF-16 code units.
     name_len: u16 = 0,
+    /// Optional workspace description shown below the name in the sidebar.
+    /// UTF-16, inline like name (no allocation). Edited via the
+    /// edit_workspace_description action or the IPC workspace-set-description
+    /// command.
+    description: [256]u16 = undefined,
+    /// Length of the workspace description in UTF-16 code units.
+    description_len: u16 = 0,
     /// Optional working directory this workspace's tabs spawn in (a git
     /// worktree bound via `+workspace new --worktree`). Owned heap copy,
     /// allocated by setWorkingDir and freed by freeWorkingDir. Null = the
@@ -160,6 +173,7 @@ pub const Workspace = struct {
         *[MAX_TABS]u16,
         *[MAX_TABS]?u8,
         *[MAX_TABS]ipc.LogRing,
+        *[MAX_TABS]bool,
     } {
         return .{
             &self.tab_trees,
@@ -172,6 +186,7 @@ pub const Workspace = struct {
             &self.tab_status_text_len,
             &self.tab_progress,
             &self.tab_log,
+            &self.tab_synchronized,
         };
     }
 
@@ -223,6 +238,11 @@ pub const Workspace = struct {
         self.tab_log[tab_idx].push(text);
     }
 
+    /// The workspace description as a UTF-16 slice (empty when unset).
+    pub fn descriptionSlice(self: *const Workspace) []const u16 {
+        return self.description[0..self.description_len];
+    }
+
     /// The cached git branch (empty when unknown). Stage 2 metadata.
     pub fn gitBranch(self: *const Workspace) []const u8 {
         return self.git_branch[0..self.git_branch_len];
@@ -269,6 +289,7 @@ pub const Workspace = struct {
     /// line: a git branch, a listening port, a PR, or an agent status. Used
     /// to decide whether to render the taller two-line row.
     pub fn hasMetadata(self: *const Workspace) bool {
+        if (self.description_len > 0) return true;
         if (self.git_branch_len > 0) return true;
         if (self.port_count > 0) return true;
         if (self.pr_state != .none) return true;
@@ -329,10 +350,11 @@ pub const Loc = struct {
 
 /// What an in-progress inline rename writes back to. `.tab` is an index
 /// into the active workspace's tab arrays; `.workspace` is an index into
-/// the window's workspaces.
+/// the window's workspaces; `.description` edits a workspace's description.
 pub const RenameTarget = union(enum) {
     tab: usize,
     workspace: usize,
+    description: usize,
 };
 
 /// The parent App.
@@ -472,6 +494,17 @@ dragging_sidebar: bool = false,
 /// sidebar_width_override is dropped on reload).
 sidebar_hidden: bool = false,
 
+/// Session-only runtime hide of the right sidebar, toggled by
+/// `toggle_right_sidebar`. Overrides `window-show-right-sidebar` for
+/// the life of the window; NOT persisted. Reset to false in
+/// onConfigChange so a config reload re-asserts the configured
+/// visibility.
+right_sidebar_hidden: bool = false,
+
+/// Whether the right sidebar currently has focus (keyboard input goes
+/// to the right sidebar for scrolling log entries etc.).
+right_sidebar_focused: bool = false,
+
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
 /// and the dispatch, queued mouse/keyboard messages can otherwise reach
@@ -493,6 +526,11 @@ max_track_h: i32 = 0,
 /// active tab; surplus rings are hidden. Created lazily so windows that
 /// never see an attention signal pay nothing. Freed in deinit().
 attention_rings: std.ArrayList(*AttentionRing) = .empty,
+
+/// Flash overlay (layered popup) for the "flash focused pane" action.
+/// Created lazily on first use; destroyed in deinit()/onDestroy(). At
+/// most one per window — the flash always targets the focused pane.
+flash_overlay: ?*FlashOverlay = null,
 
 /// Pool of per-pane corner-button overlays (clickable layered popups),
 /// grown on demand by updatePaneButtons and reused across layouts. v1
@@ -545,9 +583,13 @@ pub fn onConfigChange(self: *Window) void {
     // session-only and re-asserts the configured visibility on reload.
     self.sidebar_width_override = null;
     self.sidebar_hidden = false;
+    // Right sidebar: re-assert configured visibility on reload.
+    self.right_sidebar_hidden = false;
+    self.right_sidebar_focused = false;
     self.updateTabBarVisibility();
     self.handleResize();
     self.invalidateSidebar();
+    self.invalidateRightSidebar();
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -819,6 +861,12 @@ pub fn deinit(self: *Window) void {
     for (self.attention_rings.items) |ring| ring.destroy();
     self.attention_rings.deinit(self.app.core_app.alloc);
 
+    // Destroy the flash overlay (owned popup) before the owner window.
+    if (self.flash_overlay) |fo| {
+        fo.destroy();
+        self.flash_overlay = null;
+    }
+
     // Destroy the per-pane corner-button overlays (owned popups) before
     // the owner window so they never outlive it.
     for (self.pane_buttons.items) |pb| pb.destroy();
@@ -895,6 +943,53 @@ pub fn toggleSidebar(self: *Window) void {
     if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
 }
 
+/// Returns the right sidebar width in pixels, accounting for DPI scale.
+/// Returns 0 when the right sidebar is disabled, for quick terminals, or
+/// once the window is closing.
+pub fn rightSidebarWidth(self: *const Window) i32 {
+    if (self.closing or self.is_quick_terminal) return 0;
+    if (!self.app.config.@"window-show-right-sidebar") return 0;
+    if (self.right_sidebar_hidden) return 0;
+    const unscaled = self.app.config.@"window-right-sidebar-width";
+    const width = std.math.clamp(unscaled, RightSidebar.MIN_WIDTH, RightSidebar.MAX_WIDTH);
+    return @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
+}
+
+/// Toggle the runtime (session-only) right sidebar hide. No-op on a
+/// quick terminal. Flips the bool, then relays out the panes + repaints.
+pub fn toggleRightSidebar(self: *Window) void {
+    if (self.is_quick_terminal) return;
+    self.right_sidebar_hidden = !self.right_sidebar_hidden;
+    // When hiding the right sidebar, also drop focus from it.
+    if (self.right_sidebar_hidden) self.right_sidebar_focused = false;
+    self.handleResize();
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
+}
+
+/// Toggle focus between the right sidebar and the terminal. If the
+/// right sidebar is not visible, this is a no-op.
+pub fn focusRightSidebar(self: *Window) void {
+    if (self.rightSidebarWidth() <= 0) return;
+    self.right_sidebar_focused = !self.right_sidebar_focused;
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
+}
+
+/// Invalidate the right sidebar region so it gets repainted.
+pub fn invalidateRightSidebar(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const rs_w = self.rightSidebarWidth();
+    if (rs_w <= 0) return;
+    var client_rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
+    var rect = w32.RECT{
+        .left = client_rect.right - rs_w,
+        .top = 0,
+        .right = client_rect.right,
+        .bottom = 32767,
+    };
+    _ = w32.InvalidateRect(hwnd, &rect, 0);
+}
+
 /// Whether the sidebar should render the metadata second line on its rows
 /// right now: the config toggle is on AND at least one workspace has
 /// metadata to show. Computed once and used to pick the row height so the
@@ -921,8 +1016,8 @@ pub fn sidebarItemHeight(self: *const Window) i32 {
 }
 
 /// Returns the client rect available for the active surface, which is
-/// the full client area minus the tab bar height from the top and the
-/// sidebar width from the left.
+/// the full client area minus the tab bar height from the top, the
+/// sidebar width from the left, and the right sidebar width from the right.
 pub fn surfaceRect(self: *const Window) w32.RECT {
     const hwnd = self.hwnd orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     var rect: w32.RECT = undefined;
@@ -931,6 +1026,7 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
     }
     rect.top += self.tabBarHeight();
     rect.left += self.sidebarWidth();
+    rect.right -= self.rightSidebarWidth();
     // While the sidebar is runtime-hidden, reserve the thin re-show strip
     // at the left edge so the GL/WebView2 child does not cover it (a
     // parent-window GDI strip painted inside the surface rect would be
@@ -1610,6 +1706,178 @@ pub fn closeSplitPane(self: *Window, pane: *Pane) void {
     }
 }
 
+/// Break the focused pane out of its split into a new tab in the same
+/// workspace. The pane's HWND/surface is NOT destroyed — it is detached
+/// from the source tree and becomes the sole root of a fresh tab. If the
+/// pane is the only pane in its tab (not split), this is a no-op.
+pub fn breakPane(self: *Window, pane: *Pane) void {
+    const alloc = self.app.core_app.alloc;
+    const loc = self.findLoc(pane) orelse return;
+    const ws = loc.ws;
+    const src_tab = loc.tab;
+    const tree = &ws.tab_trees[src_tab];
+
+    if (!tree.isSplit()) return;
+    if (ws.tab_count >= MAX_TABS) return;
+
+    const handle = ws.findHandle(src_tab, pane) orelse return;
+
+    const next_handle = (tree.goto(alloc, handle, .next) catch null) orelse
+        (tree.goto(alloc, handle, .previous) catch null);
+    const next_pane: ?*Pane = if (next_handle) |nh| switch (tree.nodes[nh.idx()]) {
+        .leaf => |v| v,
+        .split => null,
+    } else null;
+
+    // Bump the pane's ref count: tree.remove will unref all surviving
+    // nodes (they get re-reffed into the new tree), and the removed node
+    // gets unreffed too. We need the pane to survive the remove+deinit
+    // cycle, so add an extra ref that balances the unref the old tree's
+    // deinit will perform on the removed node.
+    _ = pane.ref(alloc) catch return;
+
+    const new_tree = tree.remove(alloc, handle) catch {
+        pane.unref(alloc);
+        return;
+    };
+
+    var old_tree = ws.tab_trees[src_tab];
+    ws.tab_trees[src_tab] = new_tree;
+    if (next_pane) |np| ws.tab_active_pane[src_tab] = np;
+    old_tree.deinit();
+
+    // Build a single-node tree for the detached pane. SplitTree.init
+    // calls ref(), giving the pane a fresh ownership ref in the new tree.
+    var pane_tree = SplitTree(Pane).init(alloc, pane) catch {
+        pane.unref(alloc);
+        return;
+    };
+    // The extra ref we took above is no longer needed — the new tree's
+    // init ref now owns the pane. Drop the spare.
+    pane.unref(alloc);
+
+    const pos: usize = src_tab + 1;
+    tabArraysInsertGap(ws.tabArrays(), ws.tab_count, pos);
+    ws.tab_trees[pos] = pane_tree;
+    ws.tab_active_pane[pos] = pane;
+    ws.tab_status[pos] = .normal;
+    ws.tab_attention[pos] = false;
+    ws.tab_status_text_len[pos] = 0;
+    ws.tab_progress[pos] = null;
+    ws.tab_log[pos].clear();
+    ws.tab_count += 1;
+
+    // Copy the source tab's title to the new tab.
+    @memcpy(
+        ws.tab_titles[pos][0..ws.tab_title_lens[src_tab]],
+        ws.tab_titles[src_tab][0..ws.tab_title_lens[src_tab]],
+    );
+    ws.tab_title_lens[pos] = ws.tab_title_lens[src_tab];
+
+    const ws_idx = self.workspaceIndex(ws);
+    if (ws_idx == self.active_workspace) {
+        // Re-layout the source tab (it lost a pane).
+        self.layoutSplits();
+        // Switch to the new tab.
+        self.selectTabIndex(pos);
+        self.updateTabBarVisibility();
+    } else {
+        ws.active_tab = pos;
+        self.invalidateSidebar();
+    }
+}
+
+/// Move the focused pane to an adjacent tab as a split. The pane is
+/// detached from its current tree without destroying its surface and
+/// joined into the target tab's tree. If it was the only pane in the
+/// source tab, that tab is closed.
+pub fn movePaneToTab(self: *Window, pane: *Pane, target_enum: apprt.action.MovePaneTarget) void {
+    const alloc = self.app.core_app.alloc;
+    const loc = self.findLoc(pane) orelse return;
+    const ws = loc.ws;
+    const src_tab = loc.tab;
+
+    const target_tab: ?usize = switch (target_enum) {
+        .next_tab => if (src_tab + 1 < ws.tab_count) src_tab + 1 else null,
+        .prev_tab => if (src_tab > 0) src_tab - 1 else null,
+        .new_tab => blk: {
+            self.breakPane(pane);
+            return;
+        },
+    };
+    const dst_tab = target_tab orelse return;
+
+    const is_split = ws.tab_trees[src_tab].isSplit();
+
+    // Bump ref to keep the pane alive through the tree rebuild.
+    _ = pane.ref(alloc) catch return;
+
+    if (is_split) {
+        const handle = ws.findHandle(src_tab, pane) orelse {
+            pane.unref(alloc);
+            return;
+        };
+        const next_handle = (ws.tab_trees[src_tab].goto(alloc, handle, .next) catch null) orelse
+            (ws.tab_trees[src_tab].goto(alloc, handle, .previous) catch null);
+        const next_pane: ?*Pane = if (next_handle) |nh| switch (ws.tab_trees[src_tab].nodes[nh.idx()]) {
+            .leaf => |v| v,
+            .split => null,
+        } else null;
+
+        const new_src = ws.tab_trees[src_tab].remove(alloc, handle) catch {
+            pane.unref(alloc);
+            return;
+        };
+        var old_src = ws.tab_trees[src_tab];
+        ws.tab_trees[src_tab] = new_src;
+        if (next_pane) |np| ws.tab_active_pane[src_tab] = np;
+        old_src.deinit();
+    }
+
+    // Build a single-node insert tree for the pane.
+    var insert_tree = SplitTree(Pane).init(alloc, pane) catch {
+        pane.unref(alloc);
+        return;
+    };
+    defer insert_tree.deinit();
+    // Drop the spare ref; the insert tree now owns one.
+    pane.unref(alloc);
+
+    // If the source tab was the only pane, close it BEFORE inserting
+    // into the destination so that tab indices remain consistent. The
+    // pane survives because SplitTree.init took a ref above.
+    var actual_dst = dst_tab;
+    if (!is_split) {
+        const ws_idx = self.workspaceIndex(ws);
+        self.closeTabInWorkspace(ws_idx, src_tab);
+        if (src_tab < dst_tab) actual_dst = dst_tab - 1;
+    }
+
+    // Insert into the destination tab's tree at its root.
+    const dst_tree = &ws.tab_trees[actual_dst];
+    const new_dst = dst_tree.split(
+        alloc,
+        .root,
+        .right,
+        @as(f16, 0.5),
+        &insert_tree,
+    ) catch return;
+
+    var old_dst = ws.tab_trees[actual_dst];
+    ws.tab_trees[actual_dst] = new_dst;
+    ws.tab_active_pane[actual_dst] = pane;
+    old_dst.deinit();
+
+    const ws_idx = self.workspaceIndex(ws);
+    if (ws_idx == self.active_workspace) {
+        self.selectTabIndex(actual_dst);
+        self.updateTabBarVisibility();
+    } else {
+        ws.active_tab = actual_dst;
+        self.invalidateSidebar();
+    }
+}
+
 /// Switch to the tab at the given index in the active workspace.
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     const ws = self.activeWorkspace();
@@ -1743,7 +2011,7 @@ fn canCreateWorkspace(is_quick_terminal: bool, count: usize) bool {
 /// workspace has at least one tab" invariant holds. Shared by
 /// newWorkspace (default tab) and showBackendMenu's .new_workspace
 /// target (picked-backend tab).
-fn createAndSelectWorkspace(self: *Window) ?usize {
+pub fn createAndSelectWorkspace(self: *Window) ?usize {
     if (!canCreateWorkspace(self.is_quick_terminal, self.workspace_count)) return null;
     self.cancelTabRename();
 
@@ -1832,7 +2100,7 @@ fn createWorkspaceSlot(self: *Window) ?usize {
 /// background-workspace discipline used by closeTabInWorkspace /
 /// closeSplitPane. The new tab becomes the workspace's own active_tab
 /// (index 0) so a later switch lands on it.
-fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
+fn addFirstTabBackground(self: *Window, ws_idx: usize, command: ?[]const []const u8) !void {
     if (self.closing) return error.WindowClosing;
     if (ws_idx >= self.workspace_count) return error.NoWindow;
     const ws = &self.workspaces[ws_idx];
@@ -1840,7 +2108,7 @@ fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.init(self.app, self, .tab, null, ws.working_dir);
+    try surface.init(self.app, self, .tab, command, ws.working_dir);
     const pane = Pane.create(alloc, surface) catch |err| {
         surface.deinit();
         alloc.destroy(surface);
@@ -1880,10 +2148,13 @@ fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
 /// the non-focus default for programmatic creation. `working_dir` (an
 /// owned-by-caller path; copied here) binds the workspace to a git
 /// worktree like newWorkspaceWithDir; null keeps the configured cwd.
-/// Returns the new index, or null when the workspace could not be created
-/// (QuickTerminal, MAX_WORKSPACES) or its first tab failed to spawn (the
-/// slot is collapsed back).
-pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8) ?usize {
+/// `command` (an argv slice; borrowed, NOT owned) is passed to the first
+/// tab's surface.init so the tab runs that command instead of the default
+/// shell. Used by `+ssh --workspace` to create a workspace whose first
+/// tab runs `ssh user@host`. Returns the new index, or null when the
+/// workspace could not be created (QuickTerminal, MAX_WORKSPACES) or its
+/// first tab failed to spawn (the slot is collapsed back).
+pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8, command: ?[]const []const u8) ?usize {
     const idx = self.createWorkspaceSlot() orelse return null;
     if (working_dir) |dir| {
         self.workspaces[idx].setWorkingDir(self.app.core_app.alloc, dir) catch {
@@ -1891,7 +2162,7 @@ pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8) ?usize {
             return null;
         };
     }
-    self.addFirstTabBackground(idx) catch |err| {
+    self.addFirstTabBackground(idx, command) catch |err| {
         log.err("failed to create first tab for background workspace: {}", .{err});
         self.collapseEmptyWorkspaceSlot(idx);
         return null;
@@ -1931,6 +2202,21 @@ pub fn setWorkspaceName(self: *Window, idx: usize, name: []const u8) void {
         name[0..@min(name.len, wsp.name.len)],
     ) catch return;
     wsp.name_len = @intCast(@min(nlen, wsp.name.len));
+    self.invalidateSidebar();
+}
+
+/// Set workspace `idx`'s sidebar description from a UTF-8 string,
+/// mirroring setWorkspaceName (truncated to the description buffer;
+/// invalid UTF-8 leaves the description unchanged). Used by the IPC
+/// `workspace-set-description` command. No-op for an out-of-range index.
+pub fn setWorkspaceDescription(self: *Window, idx: usize, text: []const u8) void {
+    if (idx >= self.workspace_count) return;
+    const wsp = &self.workspaces[idx];
+    const dlen = std.unicode.utf8ToUtf16Le(
+        &wsp.description,
+        text[0..@min(text.len, wsp.description.len)],
+    ) catch return;
+    wsp.description_len = @intCast(@min(dlen, wsp.description.len));
     self.invalidateSidebar();
 }
 
@@ -2844,6 +3130,41 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     }
 }
 
+/// Swap the focused split with the split in the given direction.
+pub fn swapSplit(self: *Window, swap_target: apprt.action.GotoSplit) void {
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const alloc = self.app.core_app.alloc;
+    const tab = ws.active_tab;
+    const tree = &ws.tab_trees[tab];
+
+    const active_pane = ws.tab_active_pane[tab];
+    const src_handle = ws.findHandle(tab, active_pane) orelse return;
+
+    const target: SplitTree(Pane).Goto = switch (swap_target) {
+        .previous => .previous,
+        .next => .next,
+        .up => .{ .spatial = .up },
+        .down => .{ .spatial = .down },
+        .left => .{ .spatial = .left },
+        .right => .{ .spatial = .right },
+    };
+
+    const dst_handle = (tree.goto(alloc, src_handle, target) catch return) orelse return;
+
+    const new_tree = tree.swap(alloc, src_handle, dst_handle) catch return;
+    var old_tree = ws.tab_trees[tab];
+    old_tree.deinit();
+    ws.tab_trees[tab] = new_tree;
+    self.layoutSplits();
+
+    const new_handle = ws.findHandle(tab, active_pane) orelse return;
+    switch (ws.tab_trees[tab].nodes[new_handle.idx()]) {
+        .leaf => |pane| pane.focus(),
+        .split => {},
+    }
+}
+
 /// Resize the nearest split in the given direction by the given pixel amount.
 pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
     const ws = self.activeWorkspace();
@@ -2892,6 +3213,24 @@ pub fn equalizeSplits(self: *Window) void {
     self.layoutSplits();
 }
 
+/// Rearrange all splits in the active tab into a predefined layout.
+pub fn selectLayout(self: *Window, layout: apprt.action.SelectLayout) void {
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const alloc = self.app.core_app.alloc;
+    const tab = ws.active_tab;
+
+    const Tree = SplitTree(Pane);
+    const tree_layout: Tree.PredefinedLayout = switch (layout) {
+        inline else => |tag| @field(Tree.PredefinedLayout, @tagName(tag)),
+    };
+    const new_tree = ws.tab_trees[tab].selectLayout(alloc, tree_layout) catch return;
+    var old_tree = ws.tab_trees[tab];
+    old_tree.deinit();
+    ws.tab_trees[tab] = new_tree;
+    self.layoutSplits();
+}
+
 /// Toggle zoom on the active split surface.
 pub fn toggleSplitZoom(self: *Window) void {
     const ws = self.activeWorkspace();
@@ -2914,6 +3253,14 @@ pub fn toggleSplitZoom(self: *Window) void {
         tree.zoom(handle);
     }
     self.layoutSplits();
+}
+
+pub fn toggleSynchronizedInput(self: *Window) void {
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const tab = ws.active_tab;
+    ws.tab_synchronized[tab] = !ws.tab_synchronized[tab];
+    self.invalidateTabBar();
 }
 
 /// Navigate to a tab by GotoTab target (previous, next, last, or index).
@@ -3074,6 +3421,42 @@ fn clearTabAttention(self: *Window, ws: *Workspace, tab: usize) void {
     ws.tab_attention[tab] = false;
 }
 
+/// Flash the currently focused pane with a brief semi-transparent
+/// border highlight. The flash auto-dismisses after ~200ms via a
+/// WM_TIMER on the overlay's own HWND. Creates the overlay lazily
+/// on first use. Safe to call repeatedly (re-triggers reset the timer).
+pub fn flashFocusedPane(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const pane = self.getActivePane() orelse return;
+    const pane_hwnd = pane.hwnd() orelse return;
+
+    // Get the focused pane's client rect in screen coordinates.
+    var client_rect: w32.RECT = undefined;
+    if (w32.GetClientRect(pane_hwnd, &client_rect) == 0) return;
+    var tl = w32.POINT{ .x = client_rect.left, .y = client_rect.top };
+    var br = w32.POINT{ .x = client_rect.right, .y = client_rect.bottom };
+    _ = w32.ClientToScreen(pane_hwnd, &tl);
+    _ = w32.ClientToScreen(pane_hwnd, &br);
+    const screen_rect = w32.RECT{
+        .left = tl.x,
+        .top = tl.y,
+        .right = br.x,
+        .bottom = br.y,
+    };
+
+    // Lazily create the flash overlay.
+    if (self.flash_overlay == null) {
+        self.flash_overlay = FlashOverlay.create(
+            self.app.core_app.alloc,
+            self.app.hinstance,
+            hwnd,
+        ) catch return;
+    }
+    const fo = self.flash_overlay.?;
+    fo.setScale(self.scale);
+    fo.flash(screen_rect);
+}
+
 /// Update tab bar visibility based on config and tab count.
 fn updateTabBarVisibility(self: *Window) void {
     if (self.is_quick_terminal) {
@@ -3133,6 +3516,7 @@ fn paintChrome(self: *Window) void {
     self.paintTabBar(hdc_screen);
     if (self.sidebarWidth() > 0) Sidebar.paint(self, hdc_screen);
     if (self.sidebarReshowStripVisible()) self.paintReshowStrip(hdc_screen);
+    if (self.rightSidebarWidth() > 0) RightSidebar.paint(self, hdc_screen);
 }
 
 /// Paint the thin re-show strip at the window's left edge while the
@@ -3372,12 +3756,34 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             );
         }
 
+        // Sync indicator: a small orange glyph when synchronized input
+        // is active on this tab, drawn between the attention dot and the
+        // title so the user has a persistent visual cue.
+        const sync_indicator_w: i32 = if (ws.tab_synchronized[i]) @intFromFloat(@round(14.0 * self.scale)) else 0;
+        if (sync_indicator_w > 0) {
+            _ = w32.SetTextColor(mem_dc, w32.RGB(0xE8, 0x9C, 0x20));
+            const sync_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{21C4}");
+            var sync_rect = w32.RECT{
+                .left = x + text_pad + attn_dot_w,
+                .top = 0,
+                .right = x + text_pad + attn_dot_w + sync_indicator_w,
+                .bottom = bar_h,
+            };
+            _ = w32.DrawTextW(
+                mem_dc,
+                sync_char,
+                1,
+                &sync_rect,
+                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+            );
+        }
+
         // Draw tab title text.
         const title_len = ws.tab_title_lens[i];
         if (title_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
             var text_rect = w32.RECT{
-                .left = x + text_pad + attn_dot_w,
+                .left = x + text_pad + attn_dot_w + sync_indicator_w,
                 .top = 0,
                 .right = x + this_tab_w - close_btn_w - text_pad,
                 .bottom = bar_h,
@@ -4005,6 +4411,7 @@ fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
 const WS_CTX_RENAME: usize = 9501;
 const WS_CTX_CLOSE: usize = 9502;
 const WS_CTX_NEW: usize = 9503;
+const WS_CTX_DESCRIPTION: usize = 9504;
 
 /// Show the workspace context menu for the workspace at `ws_idx` at
 /// client coordinates (x, y): Rename / Close workspace / New workspace.
@@ -4014,6 +4421,7 @@ fn showWorkspaceContextMenu(self: *Window, ws_idx: usize, x: i32, y: i32) void {
     defer _ = w32.DestroyMenu(menu);
 
     _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_RENAME, std.unicode.utf8ToUtf16LeStringLiteral("Rename Workspace"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_DESCRIPTION, std.unicode.utf8ToUtf16LeStringLiteral("Edit Description"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_CLOSE, std.unicode.utf8ToUtf16LeStringLiteral("Close Workspace"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_NEW, std.unicode.utf8ToUtf16LeStringLiteral("New Workspace"));
@@ -4035,6 +4443,7 @@ fn showWorkspaceContextMenu(self: *Window, ws_idx: usize, x: i32, y: i32) void {
     if (self.closing or ws_idx >= self.workspace_count) return;
     switch (@as(usize, @intCast(cmd))) {
         WS_CTX_RENAME => self.renameWorkspace(ws_idx),
+        WS_CTX_DESCRIPTION => self.editWorkspaceDescription(ws_idx),
         WS_CTX_CLOSE => self.closeWorkspace(ws_idx),
         WS_CTX_NEW => self.newWorkspace(),
         else => {},
@@ -4437,6 +4846,18 @@ pub fn renameWorkspace(self: *Window, ws_idx: usize) void {
     self.startRename(rect, wsp.name[0..wsp.name_len], .{ .workspace = ws_idx });
 }
 
+/// Start inline editing of a workspace description. Overlays the Edit
+/// control on the workspace's sidebar row (same as renameWorkspace but
+/// targeting the description field and pre-filled with the current
+/// description text, which is empty when no description has been set).
+pub fn editWorkspaceDescription(self: *Window, ws_idx: usize) void {
+    if (self.is_quick_terminal) return;
+    if (ws_idx >= self.workspace_count) return;
+    const wsp = &self.workspaces[ws_idx];
+    const rect = Sidebar.itemRect(ws_idx, self.sidebarWidth(), self.sidebarItemHeight());
+    self.startRename(rect, wsp.description[0..wsp.description_len], .{ .description = ws_idx });
+}
+
 /// Create the inline rename Edit overlay at `rect`, pre-filled with
 /// `initial` (a UTF-16 slice), targeting `target`. Shared by tab and
 /// workspace rename; finishRename routes the committed text per target.
@@ -4543,6 +4964,25 @@ pub fn finishTabRename(self: *Window) void {
                     wsp.name_len = nlen;
                 }
             },
+            .description => |ws_idx| {
+                if (ws_idx < self.workspace_count) {
+                    const wsp = &self.workspaces[ws_idx];
+                    const dlen: u16 = @intCast(@min(wlen, wsp.description.len));
+                    @memcpy(wsp.description[0..dlen], wbuf[0..dlen]);
+                    wsp.description_len = dlen;
+                }
+            },
+        }
+    } else {
+        // Empty text: for description edits, clear the description
+        // (allows the user to remove a description by blanking it).
+        switch (target) {
+            .description => |ws_idx| {
+                if (ws_idx < self.workspace_count) {
+                    self.workspaces[ws_idx].description_len = 0;
+                }
+            },
+            else => {},
         }
     }
 
@@ -4664,6 +5104,10 @@ fn onDestroy(self: *Window) void {
     // agent workflow that repeatedly opens and closes windows.
     for (self.attention_rings.items) |ring| ring.destroy();
     self.attention_rings.deinit(app.core_app.alloc);
+    if (self.flash_overlay) |fo| {
+        fo.destroy();
+        self.flash_overlay = null;
+    }
     for (self.pane_buttons.items) |pb| pb.destroy();
     self.pane_buttons.deinit(app.core_app.alloc);
 
@@ -4800,6 +5244,9 @@ pub fn windowWndProc(
             // closing flag and destroys the HWND, after which the rect is
             // unrecoverable.
             window.savePlacement();
+            // Persist the session layout (workspaces/tabs/cwds) alongside
+            // the window geometry so it can be restored on next launch.
+            SessionState.save(window.app.core_app.alloc, window) catch {};
             window.close();
             return 0;
         },

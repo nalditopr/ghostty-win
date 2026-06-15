@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const cli_args = @import("args.zig");
@@ -18,6 +19,13 @@ const usage =
     \\  --terminfo[=bool]     Install Ghostty terminfo on first connect. Default: true.
     \\  --cache[=bool]        Use the terminfo install cache. Default: true.
     \\  --ssh=<path>          Path to the ssh binary. Default: first `ssh` on PATH.
+    \\  --workspace[=bool]    Create an SSH workspace (via IPC) instead of running
+    \\                        ssh inline. The workspace is named after the remote
+    \\                        host, and its first tab runs the ssh command. New tabs
+    \\                        opened in the workspace inherit the ssh connection.
+    \\                        Default: false. Windows only.
+    \\  --focus[=bool]        When creating a workspace, switch to it immediately.
+    \\                        Only meaningful with --workspace. Default: true.
     \\  --verbose             Print +ssh status lines to stderr.
     \\  --help                Show full help.
     \\
@@ -41,6 +49,16 @@ pub const Options = struct {
     /// The wrapped `ssh` binary.
     /// `/`-containing values are treated as paths; otherwise resolved via PATH.
     ssh: []const u8 = "ssh",
+
+    /// When true, create a dedicated workspace for the SSH connection
+    /// (via IPC to a running Ghostty instance) instead of running ssh
+    /// inline. The workspace is named after the remote host and its
+    /// first tab runs the ssh command. Windows only.
+    workspace: bool = false,
+
+    /// When creating a workspace (--workspace), switch to it immediately.
+    /// Only meaningful with --workspace. Default: true.
+    focus: bool = true,
 
     /// When true, print verbose output to stderr.
     verbose: bool = false,
@@ -155,6 +173,16 @@ pub const Options = struct {
 ///   * `--ssh=<path>`: Path to the `ssh` binary to execute. Default: the
 ///     first `ssh` found on `PATH`.
 ///
+///   * `--workspace=<bool>`: Instead of running ssh inline, create a
+///     dedicated workspace in a running Ghostty instance via IPC. The
+///     workspace is named after the resolved hostname, and its first tab
+///     runs the ssh command. New tabs opened in the workspace inherit the
+///     ssh connection. Default: `false`. Windows only.
+///
+///   * `--focus=<bool>`: When creating a workspace (`--workspace`), switch
+///     to the new workspace immediately. Default: `true`. Ignored without
+///     `--workspace`.
+///
 ///   * `--verbose`: Print +ssh status lines to stderr, and surface
 ///     remote stderr during the terminfo install.
 ///
@@ -171,6 +199,12 @@ pub const Options = struct {
 ///
 ///   # Use `--` explicitly if your ssh args might collide with our flags:
 ///   ghostty +ssh -- --some-rare-ssh-arg user@example.com
+///
+///   # Create a dedicated workspace for the SSH connection (Windows):
+///   ghostty +ssh --workspace user@example.com
+///
+///   # Create a workspace without switching to it:
+///   ghostty +ssh --workspace --focus=false user@example.com
 ///
 /// Pass `--verbose` to see what `+ssh` is doing. For cache inspection
 /// and management, see `ghostty +ssh-cache`.
@@ -208,6 +242,14 @@ pub fn run(alloc_gpa: Allocator) !u8 {
         stderr.print("\n{s}", .{usage}) catch {};
         stderr.flush() catch {};
         return 2;
+    }
+
+    // --workspace mode: create a workspace via IPC instead of running
+    // ssh inline. Windows only.
+    if (opts.workspace) {
+        const result = runWorkspace(alloc_gpa, &opts, stderr);
+        stderr.flush() catch {};
+        return result;
     }
 
     const result = runInner(alloc_gpa, &opts, stderr);
@@ -310,6 +352,123 @@ fn runInner(
     };
 
     return exit_code;
+}
+
+/// Workspace mode: instead of running ssh inline, send IPC to a running
+/// Ghostty instance to create a dedicated workspace whose first tab runs
+/// the ssh command. The workspace is named after the remote host.
+/// Subsequent tabs opened in the workspace inherit the ssh command from
+/// the first tab (standard tab-inherit behavior). Windows only.
+fn runWorkspace(
+    gpa: Allocator,
+    opts: *const Options,
+    stderr: *std.Io.Writer,
+) !u8 {
+    if (comptime builtin.os.tag != .windows) {
+        try stderr.print("Error: --workspace is only supported on Windows.\n", .{});
+        return 1;
+    }
+
+    return windows_workspace.run(gpa, opts, stderr);
+}
+
+/// Windows-only workspace creation via IPC, kept in a struct so it is
+/// only semantically analyzed on Windows.
+const windows_workspace = if (builtin.os.tag == .windows) struct {
+    const agent_ipc = @import("agent_ipc.zig").impl;
+
+    fn run(
+        gpa: Allocator,
+        opts: *const Options,
+        stderr: *std.Io.Writer,
+    ) !u8 {
+        var arena = ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        if (opts._ssh_args.items.len == 0) {
+            try stderr.print("Error: no ssh arguments provided.\n\n{s}", .{usage});
+            return 2;
+        }
+
+        // Resolve the destination for the workspace name.
+        const dest = resolveDestination(alloc, opts.ssh, opts._ssh_args.items);
+        // Extract just the hostname for the workspace name (strip user@).
+        const ws_name: []const u8 = if (dest) |d| blk: {
+            if (std.mem.indexOfScalar(u8, d, '@')) |at| {
+                break :blk d[at + 1 ..];
+            }
+            break :blk d;
+        } else blk: {
+            // Fall back to whatever the user typed as the last positional arg.
+            break :blk opts._ssh_args.items[opts._ssh_args.items.len - 1];
+        };
+
+        // Build the ssh command string for the workspace's first tab.
+        // This is the full command line: "ssh <args...>"
+        const ssh_command = try buildSshCommand(alloc, opts);
+
+        // Build the workspace-new IPC request with name, command, and focus.
+        var req_buf: std.ArrayList(u8) = .empty;
+        defer req_buf.deinit(alloc);
+        try req_buf.writer(alloc).print(
+            "{{\"id\":1,\"cmd\":\"workspace-new\",\"args\":{{\"name\":{f},\"command\":{f}",
+            .{ std.json.fmt(ws_name, .{}), std.json.fmt(ssh_command, .{}) },
+        );
+        if (opts.focus) {
+            try req_buf.writer(alloc).print(",\"focus\":true", .{});
+        }
+        try req_buf.writer(alloc).print("}}}}\n", .{});
+
+        verbosePrint(opts, stderr, "ipc: workspace-new name={s} command={s} focus={}", .{
+            ws_name,
+            ssh_command,
+            opts.focus,
+        });
+
+        var out_buf: [4096]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&out_buf);
+        const stdout = &stdout_writer.interface;
+
+        const code = agent_ipc.sendRequest(alloc, req_buf.items, stdout, stderr);
+        stdout.flush() catch {};
+        return code;
+    }
+} else struct {
+    fn run(_: Allocator, _: *const Options, _: *std.Io.Writer) !u8 {
+        return 1;
+    }
+};
+
+/// Build a single command string from the ssh binary and passthrough
+/// args: `ssh <arg1> <arg2> ...`. Args containing whitespace or double
+/// quotes are wrapped in double quotes (with internal `"` escaped).
+/// Used by --workspace mode to construct the `command` IPC field.
+fn buildSshCommand(alloc: Allocator, opts: *const Options) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(alloc);
+    try parts.append(alloc, opts.ssh);
+    for (opts._ssh_args.items) |arg| {
+        try parts.append(alloc, arg);
+    }
+    // Join with spaces. The IPC handler splits on whitespace, so args
+    // without embedded whitespace pass through cleanly.
+    var total: usize = 0;
+    for (parts.items, 0..) |p, i| {
+        if (i > 0) total += 1;
+        total += p.len;
+    }
+    const buf = try alloc.alloc(u8, total);
+    var pos: usize = 0;
+    for (parts.items, 0..) |p, i| {
+        if (i > 0) {
+            buf[pos] = ' ';
+            pos += 1;
+        }
+        @memcpy(buf[pos..][0..p.len], p);
+        pos += p.len;
+    }
+    return buf;
 }
 
 /// Log to `.ssh` and, if `--verbose`, also print to stderr.

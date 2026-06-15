@@ -148,6 +148,9 @@ pub const Action = union(Key) {
     /// Equalize all the splits in the target window.
     equalize_splits,
 
+    /// Rearrange all splits in the target window into a predefined layout.
+    select_layout: SelectLayout,
+
     /// Toggle whether a split is zoomed or not. A zoomed split is resized
     /// to take up the entire window.
     toggle_split_zoom,
@@ -353,6 +356,55 @@ pub const Action = union(Key) {
     /// matches the Key enum (CValue is built positionally from both).
     toggle_sidebar,
 
+    /// Swap the focused split with the split in the given direction.
+    swap_split: GotoSplit,
+    /// Toggle synchronized input for the current tab (Windows apprt
+    /// only). When active, keyboard input to the focused pane is
+    /// broadcast to all terminal panes in the same tab.
+    toggle_synchronized_input,
+    /// Break the focused pane out of its split into a new tab.
+    break_pane,
+
+    /// Move the focused pane to an adjacent tab.
+    move_pane: MovePaneTarget,
+    /// Save the current session layout (workspaces, tabs, split trees,
+    /// working directories) to disk so it can be restored later.
+    /// Windows apprt only; a no-op elsewhere.
+    save_session,
+
+    /// Restore a previously saved session layout from disk. Creates
+    /// workspaces and tabs to match the saved state.
+    /// Windows apprt only; a no-op elsewhere.
+    restore_session,
+    /// Flash the currently focused pane with a brief visual highlight
+    /// so the user can quickly see which pane has focus. One-shot
+    /// effect that auto-dismisses after ~200ms.
+    flash_pane,
+    /// Toggle the read/unread state of a notification entry. If the
+    /// notifications panel is open and an entry is selected, toggle that
+    /// entry; otherwise toggle the most recent notification. Windows
+    /// apprt only; a no-op elsewhere.
+    toggle_notification_unread,
+
+    /// Find the oldest unread notification, mark it as read, and jump to
+    /// the next unread one. If there are no more unreads, this is a
+    /// no-op. Windows apprt only; a no-op elsewhere. Equivalent to
+    /// cmux's Ctrl+Cmd+U.
+    mark_oldest_unread_jump,
+    /// Start inline editing of the active workspace's description
+    /// (Windows apprt only; a no-op elsewhere). The description appears
+    /// below the workspace name in the sidebar.
+    edit_workspace_description,
+    /// Toggle the right sidebar panel's visibility (Windows apprt only;
+    /// a no-op elsewhere). Session-only runtime override of
+    /// `window-show-right-sidebar`.
+    toggle_right_sidebar,
+
+    /// Toggle focus between the right sidebar and the terminal (Windows
+    /// apprt only; a no-op elsewhere). When the right sidebar is focused,
+    /// keyboard input could scroll the log or navigate entries.
+    focus_right_sidebar,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -424,6 +476,19 @@ pub const Action = union(Key) {
         // Appended at the end to keep the C ABI integer values of every
         // preceding action stable (the ghostty.h test pins each value).
         toggle_sidebar,
+        swap_split,
+        select_layout,
+        toggle_synchronized_input,
+        break_pane,
+        move_pane,
+        save_session,
+        restore_session,
+        flash_pane,
+        toggle_notification_unread,
+        mark_oldest_unread_jump,
+        edit_workspace_description,
+        toggle_right_sidebar,
+        focus_right_sidebar,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -953,6 +1018,16 @@ pub const CloseTabMode = enum(c_int) {
     }
 };
 
+pub const MovePaneTarget = enum(c_int) {
+    next_tab,
+    prev_tab,
+    new_tab,
+
+    test "ghostty.h MovePaneTarget" {
+        try lib.checkGhosttyHEnum(MovePaneTarget, "GHOSTTY_ACTION_MOVE_PANE_TARGET_");
+    }
+};
+
 pub const CommandFinished = struct {
     exit_code: ?u8,
     duration: configpkg.Config.Duration,
@@ -1013,6 +1088,18 @@ pub const SearchSelected = struct {
         return .{
             .selected = if (self.selected) |s| @intCast(s) else -1,
         };
+    }
+};
+
+pub const SelectLayout = enum(c_int) {
+    even_horizontal,
+    even_vertical,
+    main_horizontal,
+    main_vertical,
+    tiled,
+
+    test "ghostty.h SelectLayout" {
+        try lib.checkGhosttyHEnum(SelectLayout, "GHOSTTY_ACTION_SELECT_LAYOUT_");
     }
 };
 

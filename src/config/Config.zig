@@ -2302,6 +2302,27 @@ keybind: Keybinds = .{},
 /// Currently only supported on Windows (win32).
 @"sidebar-metadata": bool = true,
 
+/// Show the right sidebar panel. The right sidebar displays per-tab
+/// contextual information: the tab's title, agent-pushed status text
+/// (from `set-status`), progress bars (from `set-progress`), and
+/// log entries (from `log`). Hidden by default.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"window-show-right-sidebar": bool = false,
+
+/// The width of the right sidebar panel in pixels. This is the unscaled
+/// width; the actual width is scaled by the display's DPI. The value
+/// is clamped to the range 120 to 500.
+///
+/// This only takes effect if `window-show-right-sidebar` is enabled.
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Currently only supported on Windows (win32).
+@"window-right-sidebar-width": u32 = 300,
+
 /// Background color for the window titlebar. This only takes effect if
 /// window-theme is set to ghostty. Currently only supported in the GTK app
 /// runtime.
@@ -6730,6 +6751,11 @@ pub const Keybinds = struct {
                 .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_split = .down },
             );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = '!' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .break_pane = {} },
+            );
             // Sidebar toggle + smart Ctrl+C / Ctrl+V: ALL win32 apprt only.
             // On Linux/GTK there is no sidebar and ctrl+c must stay SIGINT
             // (copy is ctrl+shift+c there), so none of these may be
@@ -6753,6 +6779,20 @@ pub const Keybinds = struct {
                     .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true } },
                     .{ .toggle_sidebar = {} },
                 );
+                // Toggle the right sidebar: alt+ctrl+b (mirrors cmux's
+                // ⌥⌘B for the right panel).
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true, .alt = true } },
+                    .{ .toggle_right_sidebar = {} },
+                );
+                // Focus the right sidebar: ctrl+shift+e (mirrors cmux's
+                // ⌘⇧E for right-sidebar focus).
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
+                    .{ .focus_right_sidebar = {} },
+                );
                 try self.set.putFlags(
                     alloc,
                     .{ .key = .{ .unicode = 'c' }, .mods = .{ .ctrl = true } },
@@ -6764,6 +6804,13 @@ pub const Keybinds = struct {
                     .{ .key = .{ .unicode = 'v' }, .mods = .{ .ctrl = true } },
                     .{ .paste_from_clipboard = {} },
                     .{ .performable = true },
+                );
+                // Flash the focused pane. ctrl+shift+h mirrors cmux's
+                // Cmd+Shift+H "highlight focused pane" shortcut.
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'h' }, .mods = .{ .ctrl = true, .shift = true } },
+                    .{ .flash_pane = {} },
                 );
             }
             try self.set.putFlags(

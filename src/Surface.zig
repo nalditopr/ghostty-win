@@ -5391,6 +5391,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             },
         ),
 
+        .swap_split => |direction| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .swap_split,
+            switch (direction) {
+                inline else => |tag| @field(
+                    apprt.action.GotoSplit,
+                    @tagName(tag),
+                ),
+            },
+        ),
+
         .resize_split => |value| return try self.rt_app.performAction(
             .{ .surface = self },
             .resize_split,
@@ -5411,9 +5422,30 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .select_layout => |layout| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .select_layout,
+            @as(apprt.action.SelectLayout, switch (layout) {
+                inline else => |tag| @field(apprt.action.SelectLayout, @tagName(tag)),
+            }),
+        .flash_pane => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .flash_pane,
+            {},
+        ),
+
         .toggle_split_zoom => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_split_zoom,
+            {},
+        ),
+
+        .toggle_synchronized_input => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_synchronized_input,
+        .break_pane => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .break_pane,
             {},
         ),
 
@@ -5465,6 +5497,39 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .toggle_sidebar => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_sidebar,
+            {},
+        ),
+
+        .save_session => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .save_session,
+            {},
+        ),
+
+        .restore_session => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .restore_session,
+        .toggle_notification_unread => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_notification_unread,
+            {},
+        ),
+
+        .mark_oldest_unread_jump => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .mark_oldest_unread_jump,
+        .edit_workspace_description => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .edit_workspace_description,
+        .toggle_right_sidebar => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_right_sidebar,
+            {},
+        ),
+
+        .focus_right_sidebar => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .focus_right_sidebar,
             {},
         ),
 

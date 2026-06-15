@@ -32,6 +32,7 @@ const split = @import("split.zig");
 const status = @import("status.zig");
 const logcmd = @import("log.zig");
 const read_screen = @import("read_screen.zig");
+const capture_pane = @import("capture_pane.zig");
 const session = @import("session.zig");
 const hooks = @import("hooks.zig");
 
@@ -122,6 +123,9 @@ pub const Action = enum {
 
     // Use IPC to read a pane's terminal screen text (agent-reads-agent).
     @"read-screen",
+
+    // Use IPC to capture a pane's screen + scrollback (tmux capture-pane).
+    @"capture-pane",
 
     // Use IPC to capture/resume an agent's native session id for a pane.
     session,
@@ -220,6 +224,7 @@ pub const Action = enum {
             .status => try status.run(alloc),
             .log => try logcmd.run(alloc),
             .@"read-screen" => try read_screen.run(alloc),
+            .@"capture-pane" => try capture_pane.run(alloc),
             .session => try session.run(alloc),
             .hooks => try hooks.run(alloc),
         };
@@ -274,6 +279,7 @@ pub const Action = enum {
                 .status => status.Options,
                 .log => logcmd.Options,
                 .@"read-screen" => read_screen.Options,
+                .@"capture-pane" => capture_pane.Options,
                 .session => session.Options,
                 .hooks => hooks.Options,
             };

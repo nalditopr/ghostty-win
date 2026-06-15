@@ -102,10 +102,17 @@ pub const Command = enum {
     @"surface-list",
     @"surface-focus",
     @"new-split",
+    @"swap-split",
     @"set-status",
     @"set-progress",
     log,
     @"read-screen",
+
+    // capture-pane {[workspace],[tab],[scrollback:bool],[file:path]} ->
+    //   dump the addressed pane's screen text (visible or full scrollback)
+    //   and either return it as the IPC response or write it to a file. The
+    //   tmux `capture-pane` equivalent for session restore.
+    @"capture-pane",
 
     // Session capture/resume: record (per surface) which agent runs in a
     // pane and its native session id, and replay the agent's resume argv.
@@ -116,6 +123,26 @@ pub const Command = enum {
     @"session-capture",
     @"session-resume",
     @"session-list",
+
+    @"select-layout",
+    // Toggle synchronized input for a tab. Args: {action:"toggle"|"on"|
+    // "off", [workspace], [tab]}. Defaults to the active workspace/tab.
+    @"sync-input",
+    // Pane movement: break a pane out of its split into a new tab, or
+    // move it to an adjacent/specific tab.
+    @"break-pane",
+    @"move-pane",
+    // Full session save/restore (tmux-resurrect style).
+    @"session-save",
+    @"session-restore",
+    // Flash the focused pane (brief visual highlight).
+    @"flash-pane",
+    // Workspace description: set/clear the user-facing description text
+    // shown below the workspace name in the sidebar.
+    // workspace-set-description {workspace, text} -> ok.
+    @"workspace-set-description",
+    // Right sidebar toggle (mirrors toggle_sidebar for the right panel).
+    @"toggle-right-sidebar",
 };
 
 /// Protocol-level failures that map to error responses.

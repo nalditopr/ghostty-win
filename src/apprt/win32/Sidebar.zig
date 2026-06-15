@@ -636,16 +636,16 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             );
         }
 
-        // --- Metadata second line (Stage 2) ---
-        // A dim line below the name: "⎇ branch · :port,port · status".
-        // Only drawn when the row is tall enough (metadata mode) and the
-        // workspace has something to show. Truncated with an ellipsis.
+        // --- Second line: description or metadata (Stage 2) ---
+        // When a user-set description exists, show it (dimmer than the
+        // name) in the metadata band below the workspace name; otherwise
+        // fall back to the auto-populated metadata line (git branch,
+        // ports, status).
         if (show_meta) {
-            var meta_buf: [256]u16 = undefined;
-            const meta_len = buildMetaLine(wsp, &meta_buf);
-            if (meta_len > 0) {
+            const desc = wsp.descriptionSlice();
+            if (desc.len > 0) {
                 _ = w32.SetTextColor(mem_dc, meta_text_color);
-                var meta_rect = w32.RECT{
+                var desc_rect = w32.RECT{
                     .left = accent_w + pad + dot_w,
                     .top = line1_bottom,
                     .right = sidebar_w - pad,
@@ -653,11 +653,30 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
                 };
                 _ = w32.DrawTextW(
                     mem_dc,
-                    @ptrCast(&meta_buf),
-                    @intCast(meta_len),
-                    &meta_rect,
+                    @ptrCast(desc.ptr),
+                    @intCast(desc.len),
+                    &desc_rect,
                     w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
                 );
+            } else {
+                var meta_buf: [256]u16 = undefined;
+                const meta_len = buildMetaLine(wsp, &meta_buf);
+                if (meta_len > 0) {
+                    _ = w32.SetTextColor(mem_dc, meta_text_color);
+                    var meta_rect = w32.RECT{
+                        .left = accent_w + pad + dot_w,
+                        .top = line1_bottom,
+                        .right = sidebar_w - pad,
+                        .bottom = row.bottom,
+                    };
+                    _ = w32.DrawTextW(
+                        mem_dc,
+                        @ptrCast(&meta_buf),
+                        @intCast(meta_len),
+                        &meta_rect,
+                        w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+                    );
+                }
             }
         }
     }

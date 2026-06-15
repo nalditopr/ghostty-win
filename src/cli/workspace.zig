@@ -29,15 +29,20 @@ pub const Options = struct {
 ///   * `list`: Print a JSON array of the target window's workspaces, one
 ///     object per workspace: `{index, name, active, tab_count}`.
 ///
-///   * `new [--name X] [--worktree <branch>] [--repo <path>] [--focus]`:
+///   * `new [--name X] [--worktree <branch>] [--repo <path>] [--command "..."] [--focus]`:
 ///     Create a new workspace (a sidebar row with one tab) and print its
 ///     index as `{index: N}`. By DEFAULT the workspace is created in the
 ///     BACKGROUND: the active workspace does not change and the window is
 ///     not raised, so an agent orchestrator spawning workspaces never
 ///     yanks you out of your current app (matching cmux's "workspace
 ///     creation is not a focus-intent operation"). Pass `--focus` to
-///     switch the active workspace to the new one. With `--worktree
-///     <branch>` the workspace is bound to
+///     switch the active workspace to the new one. With `--command "..."`,
+///     the workspace's first tab runs that command (split on whitespace
+///     into an argv) instead of the default shell; used by `+ssh
+///     --workspace` to open a workspace whose initial tab runs `ssh
+///     user@host`. Subsequent tabs opened in the workspace inherit the
+///     command from the active tab (the standard tab-inherit behavior).
+///     With `--worktree <branch>` the workspace is bound to
 ///     a git worktree at `<repo>/.worktrees/<branch>`: Ghostty runs `git
 ///     worktree add` (creating the branch, or attaching it if it already
 ///     exists), the workspace is named after the branch (unless `--name`
@@ -125,6 +130,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         var name: ?[]const u8 = null;
         var worktree: ?[]const u8 = null;
         var repo: ?[]const u8 = null;
+        var command: ?[]const u8 = null;
         var focus = false;
         while (iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--focus")) {
@@ -153,6 +159,14 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
                     return 1;
                 };
                 repo = try alloc.dupe(u8, v);
+            } else if (std.mem.startsWith(u8, arg, "--command=")) {
+                command = try alloc.dupe(u8, arg["--command=".len..]);
+            } else if (std.mem.eql(u8, arg, "--command")) {
+                const v = iter.next() orelse {
+                    try stderr.print("--command requires a value\n", .{});
+                    return 1;
+                };
+                command = try alloc.dupe(u8, v);
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 return Action.help_error;
             } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -166,15 +180,15 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             }
         }
 
-        // --repo/--worktree/--focus are only meaningful to `new`.
-        if (sub != .new and (worktree != null or repo != null or focus)) {
-            try stderr.print("--worktree/--repo/--focus are only valid for 'new'\n", .{});
+        // --repo/--worktree/--focus/--command are only meaningful to `new`.
+        if (sub != .new and (worktree != null or repo != null or focus or command != null)) {
+            try stderr.print("--worktree/--repo/--focus/--command are only valid for 'new'\n", .{});
             return 1;
         }
 
         const request = switch (sub) {
             .list => try alloc.dupe(u8, "{\"id\":1,\"cmd\":\"workspace-list\"}\n"),
-            .new => try buildNewRequest(alloc, name, worktree, repo, focus, stderr) orelse return 1,
+            .new => try buildNewRequest(alloc, name, worktree, repo, command, focus, stderr) orelse return 1,
             .select => req: {
                 const idx = try parseIndex(positional, stderr) orelse return 1;
                 break :req try std.fmt.allocPrint(
@@ -208,6 +222,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         name: ?[]const u8,
         worktree: ?[]const u8,
         repo: ?[]const u8,
+        command: ?[]const u8,
         focus: bool,
         stderr: *std.Io.Writer,
     ) !?[]u8 {
@@ -246,6 +261,11 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
                 try sep(w, &first);
                 try w.print("\"repo\":{f}", .{std.json.fmt(r, .{})});
             }
+        }
+
+        if (command) |c| {
+            try sep(w, &first);
+            try w.print("\"command\":{f}", .{std.json.fmt(c, .{})});
         }
 
         // Non-focus is the default; only emit focus when opted in so a

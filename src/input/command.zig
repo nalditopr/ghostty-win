@@ -444,6 +444,32 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show or hide the workspace sidebar.",
         }},
 
+        .toggle_notification_unread => comptime &.{.{
+            .action = .toggle_notification_unread,
+            .title = "Toggle Notification Read/Unread",
+            .description = "Toggle the read/unread state of the most recent notification.",
+        }},
+
+        .mark_oldest_unread_jump => comptime &.{.{
+            .action = .mark_oldest_unread_jump,
+            .title = "Mark Oldest Unread and Jump to Next",
+            .description = "Mark the oldest unread notification as read and jump to the next unread one.",
+        .edit_workspace_description => comptime &.{.{
+            .action = .edit_workspace_description,
+            .title = "Edit Workspace Description",
+            .description = "Edit the description shown below the workspace name in the sidebar.",
+        .toggle_right_sidebar => comptime &.{.{
+            .action = .toggle_right_sidebar,
+            .title = "Toggle Right Sidebar",
+            .description = "Show or hide the right sidebar panel.",
+        }},
+
+        .focus_right_sidebar => comptime &.{.{
+            .action = .focus_right_sidebar,
+            .title = "Focus Right Sidebar",
+            .description = "Toggle focus between the right sidebar and the terminal.",
+        }},
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = "Change Terminal Title…",
@@ -537,10 +563,49 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Toggle read-only mode for the current surface.",
         }},
 
+        .swap_split => comptime &.{
+            .{
+                .action = .{ .swap_split = .previous },
+                .title = "Swap Split: Previous",
+                .description = "Swap the focused split with the previous split.",
+            },
+            .{
+                .action = .{ .swap_split = .next },
+                .title = "Swap Split: Next",
+                .description = "Swap the focused split with the next split.",
+            },
+            .{
+                .action = .{ .swap_split = .left },
+                .title = "Swap Split: Left",
+                .description = "Swap the focused split with the split to the left.",
+            },
+            .{
+                .action = .{ .swap_split = .right },
+                .title = "Swap Split: Right",
+                .description = "Swap the focused split with the split to the right.",
+            },
+            .{
+                .action = .{ .swap_split = .up },
+                .title = "Swap Split: Up",
+                .description = "Swap the focused split with the split above.",
+            },
+            .{
+                .action = .{ .swap_split = .down },
+                .title = "Swap Split: Down",
+                .description = "Swap the focused split with the split below.",
+            },
+        },
+
         .equalize_splits => comptime &.{.{
             .action = .equalize_splits,
             .title = "Equalize Splits",
             .description = "Equalize the size of all splits.",
+        }},
+
+        .flash_pane => comptime &.{.{
+            .action = .flash_pane,
+            .title = "Flash Focused Pane",
+            .description = "Briefly highlight the focused pane.",
         }},
 
         .reset_window_size => comptime &.{.{

@@ -16,6 +16,7 @@ const BrowserPane = @import("BrowserPane.zig");
 const ipc = @import("ipc.zig");
 const Pane = @import("Pane.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
+const SessionState = @import("SessionState.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
@@ -490,7 +491,7 @@ pub fn run(self: *App) !void {
                     break :blk null;
                 };
                 if (target_surface) |s| {
-                    s.handleKeyEvent(msg.wParam, msg.lParam, .press);
+                    _ = s.handleKeyEvent(msg.wParam, msg.lParam, .press);
                     continue :loop;
                 }
             }
@@ -978,6 +979,44 @@ pub fn performAction(
             return true;
         },
 
+        .save_session => {
+            const alloc = self.core_app.alloc;
+            // Save from the first window (the primary one).
+            if (self.windows.items.len > 0) {
+                SessionState.save(alloc, self.windows.items[0]) catch |err| {
+                    log.err("session save failed: {}", .{err});
+                };
+        .edit_workspace_description => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const pw = core_surface.rt_surface.parent_window;
+                    pw.editWorkspaceDescription(pw.active_workspace);
+        .toggle_right_sidebar => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.toggleRightSidebar();
+                },
+            }
+            return true;
+        },
+
+        .restore_session => {
+            const alloc = self.core_app.alloc;
+            SessionState.restore(alloc, self) catch |err| {
+                log.err("session restore failed: {}", .{err});
+            };
+        .focus_right_sidebar => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.focusRightSidebar();
+                },
+            }
+            return true;
+        },
+
         .initial_size => {
             switch (target) {
                 .app => {},
@@ -1416,6 +1455,16 @@ pub fn performAction(
             return true;
         },
 
+        .swap_split => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.swapSplit(value);
+                },
+            }
+            return true;
+        },
+
         .resize_split => {
             switch (target) {
                 .app => {},
@@ -1436,11 +1485,48 @@ pub fn performAction(
             return true;
         },
 
+        .select_layout => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.selectLayout(value);
+                },
+            }
+            return true;
+        },
+
         .toggle_split_zoom => {
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
                     core_surface.rt_surface.parent_window.toggleSplitZoom();
+                },
+            }
+            return true;
+        },
+
+        .toggle_synchronized_input => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.toggleSynchronizedInput();
+        .break_pane => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const pane = core_surface.rt_surface.pane orelse return true;
+                    core_surface.rt_surface.parent_window.breakPane(pane);
+                },
+            }
+            return true;
+        },
+
+        .move_pane => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const pane = core_surface.rt_surface.pane orelse return true;
+                    core_surface.rt_surface.parent_window.movePaneToTab(pane, value);
                 },
             }
             return true;
@@ -1490,7 +1576,33 @@ pub fn performAction(
             return true;
         },
 
-        // All 66 apprt actions are now handled above.
+        // All 67 apprt actions are now handled above.
+        // All 68 apprt actions are now handled above.
+        .flash_pane => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.flashFocusedPane();
+                },
+            }
+            return true;
+        },
+
+        // All 67 apprt actions are now handled above.
+        .toggle_notification_unread => {
+            // Toggle the most recent notification's read state. Display
+            // index 0 is the newest entry.
+            _ = self.toggleNotifRead(0);
+            return true;
+        },
+
+        .mark_oldest_unread_jump => {
+            _ = self.markOldestUnreadAndJumpNext();
+            return true;
+        },
+
+        // All apprt actions are now handled above.
+        // All 68 apprt actions are now handled above.
     }
 }
 
@@ -2006,6 +2118,22 @@ pub fn NotifRing(comptime Entry: type, comptime cap: usize) type {
                 }
             }
             return null;
+        }
+
+        /// Display index (0 = newest) of the **oldest** live entry whose
+        /// `read` field is false, or null when every live entry is read.
+        /// Walks newest-first, tracking the last seen unread.
+        pub fn lastUnread(self: *const Self) ?usize {
+            var display_idx: usize = 0;
+            var result: ?usize = null;
+            for (0..cap) |offset| {
+                const idx = (self.next + cap - 1 - offset) % cap;
+                if (self.slots[idx]) |entry| {
+                    if (!entry.read) result = display_idx;
+                    display_idx += 1;
+                }
+            }
+            return result;
         }
 
         /// The display_idx-th newest live entry (0 = newest), or null
@@ -2999,6 +3127,9 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         .@"read-screen" => self.ipcReadScreen(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
+        .@"capture-pane" => self.ipcCapturePaneCmd(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
         .@"session-capture" => self.ipcSessionCapture(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
@@ -3007,6 +3138,49 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         },
         .@"session-list" => self.ipcSessionList(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"select-layout" => self.ipcSelectLayout(req) catch |err| {
+        .@"sync-input" => self.ipcSyncInput(req) catch |err| {
+        .@"break-pane" => self.ipcBreakPane(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"move-pane" => self.ipcMovePaneToTab(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        .@"session-save" => {
+            const alloc = self.core_app.alloc;
+            if (self.windows.items.len > 0) {
+                SessionState.save(alloc, self.windows.items[0]) catch |err| {
+                    server.sendError(req.id, @errorName(err)) catch {};
+                    return;
+                };
+            }
+            server.sendOk(req.id, null) catch {};
+        },
+        .@"session-restore" => {
+            const alloc = self.core_app.alloc;
+            SessionState.restore(alloc, self) catch |err| {
+                server.sendError(req.id, @errorName(err)) catch {};
+                return;
+            };
+            server.sendOk(req.id, null) catch {};
+        },
+        .@"flash-pane" => {
+            // Flash the focused pane of the target window.
+            if (self.ipcTargetWindow()) |win| {
+                win.flashFocusedPane();
+            }
+            server.sendOk(req.id, null) catch {};
+        },
+        .@"workspace-set-description" => self.ipcWorkspaceSetDescription(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
+        .@"toggle-right-sidebar" => {
+            // Toggle the right sidebar on the first window (or the window
+            // owning the active surface). A simple toggle: no args needed.
+            if (self.windows.items.len > 0) {
+                self.windows.items[0].toggleRightSidebar();
+            }
+            server.sendOk(req.id, null) catch {};
         },
     }
 }
@@ -3023,6 +3197,7 @@ fn commandIsReadOnly(cmd: ipc.Command) bool {
         .snapshot,
         .@"surface-list",
         .@"read-screen",
+        .@"capture-pane",
         .@"session-list",
         => true,
         else => false,
@@ -3299,6 +3474,17 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
     const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
     if (window.is_quick_terminal) return IpcError.QuickTerminal;
 
+    // Parse an optional explicit command (split on whitespace) once; an
+    // empty/whitespace-only command falls through to the default shell.
+    // Used by `+ssh --workspace` to run `ssh user@host` in the first tab.
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(self.core_app.alloc);
+    if (ipcArgString(req, "command")) |command_str| {
+        var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
+        while (it.next()) |tok| try argv.append(self.core_app.alloc, tok);
+    }
+    const command: ?[]const []const u8 = if (argv.items.len > 0) argv.items else null;
+
     // Programmatic creation defaults to NON-FOCUS: the workspace is created
     // in the background and the user stays in whatever workspace (and
     // whatever app) they were in. `--focus` (focus:true over IPC) opts in
@@ -3314,6 +3500,17 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
         if (req.worktree_path) |path| {
             break :blk window.newWorkspaceWithDir(path) orelse return IpcError.NoWindow;
         }
+        if (command) |c| {
+            // Command-bearing workspace: create-and-select, add the
+            // first tab with the explicit command.
+            const ws_idx = window.createAndSelectWorkspace() orelse return IpcError.NoWindow;
+            _ = window.addTabWithCommand(c, null) catch |err| {
+                log.err("failed to create first tab with command for new workspace: {}", .{err});
+                window.closeWorkspace(ws_idx);
+                return IpcError.NoWindow;
+            };
+            break :blk ws_idx;
+        }
         const before = window.workspace_count;
         window.newWorkspace();
         // newWorkspace collapses the slot if its first tab fails to spawn,
@@ -3323,7 +3520,7 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
     } else blk: {
         // Background path (default): create without changing the active
         // workspace. newWorkspaceBackground collapses the slot on failure.
-        break :blk window.newWorkspaceBackground(req.worktree_path) orelse
+        break :blk window.newWorkspaceBackground(req.worktree_path, command) orelse
             return IpcError.NoWindow;
     };
 
@@ -3360,6 +3557,19 @@ fn ipcWorkspaceClose(self: *App, req: *ipc.Request) anyerror!void {
     const idx = ipcArgU32(req, "index") orelse return IpcError.MissingIndex;
     if (idx >= window.workspace_count) return IpcError.UnknownWorkspace;
     window.closeWorkspace(idx);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// workspace-set-description {workspace, text} → set (or clear) the
+/// user-facing description text for workspace `workspace` in the target
+/// window. An empty or absent `text` clears the description.
+fn ipcWorkspaceSetDescription(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    const idx = ipcArgU32(req, "workspace") orelse return IpcError.MissingIndex;
+    if (idx >= window.workspace_count) return IpcError.UnknownWorkspace;
+    const text = ipc.argString(req, "text") orelse "";
+    window.setWorkspaceDescription(idx, text);
     server.sendOk(req.id, null) catch {};
 }
 
@@ -3521,6 +3731,16 @@ fn ipcNotify(self: *App, req: *ipc.Request) anyerror!void {
         return;
     }
 
+    if (std.mem.eql(u8, action, "toggle-read")) {
+        try self.ipcNotifyToggleRead(req);
+        return;
+    }
+
+    if (std.mem.eql(u8, action, "mark-oldest-next")) {
+        try self.ipcNotifyMarkOldestNext(req);
+        return;
+    }
+
     const on = if (std.mem.eql(u8, action, "ring"))
         true
     else if (std.mem.eql(u8, action, "clear"))
@@ -3587,6 +3807,83 @@ fn ipcNotifyNext(self: *App, req: *ipc.Request) anyerror!void {
 
     const jumped = self.jumpToSurface(window, surface);
     if (jumped) _ = self.markNotifEntryRead(display_idx);
+
+    var buf: [64]u8 = undefined;
+    const reply = std.fmt.bufPrint(
+        &buf,
+        "{{\"jumped\":{s},\"surface\":{d}}}",
+        .{ if (jumped) "true" else "false", surface_id },
+    ) catch "{\"jumped\":false}";
+    server.sendOk(req.id, reply) catch {};
+}
+
+/// `+notify toggle-read`: toggle the most recent notification's read state.
+/// Replies {toggled:true, read:<new_state>} or {toggled:false}.
+fn ipcNotifyToggleRead(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const toggled = self.toggleNotifRead(0);
+    if (toggled) {
+        const entry = self.notifAt(0);
+        const is_read = if (entry) |e| e.read else true;
+        var buf: [48]u8 = undefined;
+        const reply = std.fmt.bufPrint(
+            &buf,
+            "{{\"toggled\":true,\"read\":{s}}}",
+            .{if (is_read) "true" else "false"},
+        ) catch "{\"toggled\":false}";
+        server.sendOk(req.id, reply) catch {};
+    } else {
+        server.sendOk(req.id, "{\"toggled\":false}") catch {};
+    }
+}
+
+/// `+notify mark-oldest-next`: mark the oldest unread notification as read
+/// and jump to the next unread entry's source pane. Replies
+/// {jumped:true, surface:<id>} or {jumped:false}.
+fn ipcNotifyMarkOldestNext(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+
+    // Find the oldest unread entry and mark it read.
+    const oldest_idx = self.notif_log.lastUnread() orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    _ = self.markNotifEntryRead(oldest_idx);
+
+    // Now find the next unread (newest first, like ipcNotifyNext).
+    const next_idx = self.firstUnreadNotif() orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    const entry = self.notifAt(next_idx) orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    const window = entry.window;
+    const surface = entry.surface;
+
+    // Validate liveness (mirrors ipcNotifyNext).
+    const live = blk: {
+        for (self.windows.items) |w| {
+            if (w == window) {
+                if (w.closing) break :blk false;
+                break :blk w.findLocOfSurface(surface) != null;
+            }
+        }
+        break :blk false;
+    };
+    if (!live) {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    }
+
+    const surface_id: u64 = if (surface.core_surface_initialized)
+        surface.core_surface.id
+    else
+        0;
+
+    const jumped = self.jumpToSurface(window, surface);
+    if (jumped) _ = self.markNotifEntryRead(next_idx);
 
     var buf: [64]u8 = undefined;
     const reply = std.fmt.bufPrint(
@@ -3941,6 +4238,161 @@ fn ipcReadScreen(self: *App, req: *ipc.Request) anyerror!void {
     server.sendOk(req.id, aw.written()) catch {};
 }
 
+/// capture-pane {[workspace],[tab],[scrollback:bool],[file:path]} — the
+/// tmux `capture-pane` equivalent. Dumps the addressed (or active) pane's
+/// screen text, optionally including the scrollback buffer. When `file` is
+/// given the dump is written there instead of returned as the IPC response.
+/// The dump is plain UTF-8 text (no ANSI escapes) — matching read-screen's
+/// format — so it can be piped back into a terminal for session restore.
+fn ipcCapturePaneCmd(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    const surface = pane.surface() orelse return IpcError.NotATerminal;
+    if (!surface.core_surface_ready) return IpcError.CoreNotReady;
+
+    const alloc = self.core_app.alloc;
+    const scrollback = ipcArgBool(req, "scrollback") orelse false;
+
+    // Dump under the renderer mutex: the screen is shared with the
+    // renderer/IO threads.
+    const dump: []const u8 = dump: {
+        const cs = &surface.core_surface;
+        cs.renderer_state.mutex.lock();
+        defer cs.renderer_state.mutex.unlock();
+        const screen = cs.io.terminal.screens.active;
+        const point: @import("../../terminal/main.zig").point.Point =
+            if (scrollback) .{ .screen = .{ .x = 0, .y = 0 } } else .{ .active = .{ .x = 0, .y = 0 } };
+        break :dump try screen.dumpStringAlloc(alloc, point);
+    };
+    defer alloc.free(dump);
+
+    // If a file path was given, write the dump there and reply with the
+    // path; otherwise return the text as the IPC data (JSON-escaped, same
+    // as read-screen).
+    if (ipcArgString(req, "file")) |file_path| {
+        // Ensure parent directory exists.
+        if (std.fs.path.dirname(file_path)) |parent| {
+            std.fs.cwd().makePath(parent) catch {};
+        }
+        const file = std.fs.cwd().createFile(file_path, .{ .truncate = true }) catch
+            return error.CreateFileFailed;
+        defer file.close();
+        file.writeAll(dump) catch return error.WriteFileFailed;
+
+        // Reply with the path we wrote.
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        try std.json.Stringify.value(file_path, .{}, &aw.writer);
+        server.sendOk(req.id, aw.written()) catch {};
+    } else {
+        const max_payload: usize = 768 * 1024;
+        const clipped = if (dump.len > max_payload) dump[dump.len - max_payload ..] else dump;
+
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        try std.json.Stringify.value(clipped, .{}, &aw.writer);
+        server.sendOk(req.id, aw.written()) catch {};
+    }
+}
+
+/// Capture the scrollback + visible screen of every terminal pane and save
+/// each to `%LOCALAPPDATA%\ghostty\scrollback\<surface_id>.txt`. Called
+/// during session save so that session restore can repopulate the panes.
+/// Best-effort: errors on individual panes are swallowed.
+pub fn saveAllScrollback(self: *App) void {
+    const alloc = self.core_app.alloc;
+    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return;
+    defer alloc.free(dir);
+    const scrollback_dir = std.fs.path.join(alloc, &.{ dir, "ghostty", "scrollback" }) catch return;
+    defer alloc.free(scrollback_dir);
+
+    std.fs.cwd().makePath(scrollback_dir) catch return;
+
+    for (self.windows.items) |w| {
+        if (w.closing) continue;
+        for (w.workspaces[0..w.workspace_count]) |*ws| {
+            for (0..ws.tab_count) |t| {
+                var it = ws.tab_trees[t].iterator();
+                while (it.next()) |entry| {
+                    const surface = switch (entry.view.content) {
+                        .terminal => |s| s,
+                        .browser => continue,
+                    };
+                    if (!surface.core_surface_ready) continue;
+                    self.saveOnePaneScrollback(alloc, scrollback_dir, surface) catch continue;
+                }
+            }
+        }
+    }
+}
+
+/// Save one pane's screen (scrollback + visible) to a file.
+fn saveOnePaneScrollback(
+    self: *App,
+    alloc: Allocator,
+    scrollback_dir: []const u8,
+    surface: *Surface,
+) !void {
+    _ = self;
+    const cs = &surface.core_surface;
+    const sid = cs.id;
+
+    // Dump the full screen (scrollback + visible) under the renderer mutex.
+    const dump: []const u8 = dump: {
+        cs.renderer_state.mutex.lock();
+        defer cs.renderer_state.mutex.unlock();
+        const screen = cs.io.terminal.screens.active;
+        break :dump try screen.dumpStringAlloc(alloc, .{ .screen = .{ .x = 0, .y = 0 } });
+    };
+    defer alloc.free(dump);
+
+    // Build filename: <scrollback_dir>/<surface_id>.txt
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}.txt", .{sid}) catch return;
+    const path = try std.fs.path.join(alloc, &.{ scrollback_dir, name });
+    defer alloc.free(path);
+
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(dump);
+}
+
+/// Restore saved scrollback into a pane by writing the text to the
+/// terminal's PTY as if it were program output, which naturally populates
+/// the scrollback buffer. The file is
+/// `%LOCALAPPDATA%\ghostty\scrollback\<surface_id>.txt`.
+pub fn restoreScrollback(self: *App, surface: *Surface) void {
+    const alloc = self.core_app.alloc;
+    if (!surface.core_surface_ready) return;
+
+    const sid = surface.core_surface.id;
+
+    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return;
+    defer alloc.free(dir);
+
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}.txt", .{sid}) catch return;
+    const path = std.fs.path.join(alloc, &.{ dir, "ghostty", "scrollback", name }) catch return;
+    defer alloc.free(path);
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+
+    // Read the saved scrollback (cap at 1 MiB to avoid unbounded allocs).
+    const max_restore: usize = 1024 * 1024;
+    const content = file.readToEndAlloc(alloc, max_restore) catch return;
+    defer alloc.free(content);
+
+    if (content.len == 0) return;
+
+    // Write the content to the terminal's PTY input as if it were program
+    // output. This populates the scrollback naturally.
+    const termio_mod = @import("../../termio.zig");
+    const msg = termio_mod.Message.writeReq(alloc, content) catch return;
+    surface.core_surface.io.queueMessage(msg, .unlocked);
+}
+
 /// Resolve the surface a session verb targets: an explicit `surface` id, or
 /// the addressed (or active) tab's active terminal pane. Returns the surface
 /// id and a pointer to the surface (for relaunch). The id is the core
@@ -4020,6 +4472,72 @@ fn ipcSessionList(self: *App, req: *ipc.Request) anyerror!void {
     const json = try self.session_store.serialize(alloc);
     defer alloc.free(json);
     server.sendOk(req.id, json) catch {};
+}
+
+/// select-layout {layout} → rearrange splits into a predefined layout.
+fn ipcSelectLayout(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const name = ipc.argString(req, "layout") orelse
+        return server.sendError(req.id, "missing \"layout\" argument") catch {};
+    const layout = std.meta.stringToEnum(apprt.action.SelectLayout, name) orelse
+        return server.sendError(req.id, "unknown layout") catch {};
+    const window = self.ipcTargetWindow() orelse return;
+    window.selectLayout(layout);
+/// sync-input {action:"toggle"|"on"|"off", [workspace], [tab]} → toggle or
+/// set synchronized input for the addressed tab. Defaults to active
+/// workspace/tab.
+fn ipcSyncInput(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const action_str = ipcArgString(req, "action") orelse "toggle";
+    const target = try self.ipcResolveWorkspace(req);
+    const ws = target.ws;
+    const tab_idx: usize = if (ipcArgU32(req, "tab")) |t| t else ws.active_tab;
+    if (tab_idx >= ws.tab_count) return IpcError.UnknownTab;
+
+    if (std.mem.eql(u8, action_str, "toggle")) {
+        ws.tab_synchronized[tab_idx] = !ws.tab_synchronized[tab_idx];
+    } else if (std.mem.eql(u8, action_str, "on")) {
+        ws.tab_synchronized[tab_idx] = true;
+    } else if (std.mem.eql(u8, action_str, "off")) {
+        ws.tab_synchronized[tab_idx] = false;
+    } else {
+        return IpcError.BadAction;
+    }
+    target.window.invalidateTabBar();
+/// break-pane: break the active pane of the addressed (or active) tab
+/// out of its split into a new tab.
+fn ipcBreakPane(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    target.window.breakPane(pane);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// move-pane: move the active pane of the addressed (or active) tab to
+/// an adjacent tab. Args: {direction:"next"|"prev"|"new", [workspace],
+/// [tab]}.
+fn ipcMovePaneToTab(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+
+    const dir_str: ?[]const u8 = if (req.args == .object)
+        if (req.args.object.get("direction")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null
+    else
+        null;
+    const move_target: apprt.action.MovePaneTarget = if (dir_str) |d| blk: {
+        if (std.mem.eql(u8, d, "next")) break :blk .next_tab;
+        if (std.mem.eql(u8, d, "prev")) break :blk .prev_tab;
+        if (std.mem.eql(u8, d, "new")) break :blk .new_tab;
+        return IpcError.BadDirection;
+    } else .next_tab;
+
+    target.window.movePaneToTab(pane, move_target);
+    server.sendOk(req.id, null) catch {};
 }
 
 /// Append an entry to the sidebar notification log, bump the unread
@@ -4134,6 +4652,71 @@ pub fn markNotifEntryRead(self: *App, display_idx: usize) bool {
         }
     }
     return false;
+}
+
+/// Toggle the read/unread state of a single entry (by display index).
+/// If the entry is Unread, mark it Read (decrement badge); if Read,
+/// mark it Unread (increment badge). Repaints the sidebar and taskbar
+/// badge. Returns true when the entry existed and was toggled.
+pub fn toggleNotifRead(self: *App, display_idx: usize) bool {
+    var seen: usize = 0;
+    const cap = NOTIF_LOG_CAP;
+    var offset: usize = 0;
+    while (offset < cap) : (offset += 1) {
+        const idx = (self.notif_log.next + cap - 1 - offset) % cap;
+        if (self.notif_log.slots[idx]) |*entry| {
+            if (seen == display_idx) {
+                if (entry.read) {
+                    // Read → Unread: re-flag as unread.
+                    entry.read = false;
+                    self.notif_log.unread += 1;
+                } else {
+                    // Unread → Read.
+                    entry.read = true;
+                    if (self.notif_log.unread > 0) self.notif_log.unread -= 1;
+                }
+                for (self.windows.items) |w| w.invalidateSidebar();
+                self.refreshTaskbarBadges();
+                return true;
+            }
+            seen += 1;
+        }
+    }
+    return false;
+}
+
+/// Find the oldest unread notification, mark it as read, and jump to the
+/// NEXT unread entry's source pane. If there are no unread entries, this
+/// is a no-op. Returns true when a jump was performed.
+pub fn markOldestUnreadAndJumpNext(self: *App) bool {
+    // Find the oldest unread entry.
+    const oldest_idx = self.notif_log.lastUnread() orelse return false;
+
+    // Mark it read.
+    _ = self.markNotifEntryRead(oldest_idx);
+
+    // Now find the new first (newest) unread — this is the "next" unread
+    // to jump to. We use firstUnread for consistency with ipcNotifyNext.
+    const next_idx = self.firstUnreadNotif() orelse return false;
+    const entry = self.notifAt(next_idx) orelse return false;
+    const window = entry.window;
+    const surface = entry.surface;
+
+    // Validate the entry's pointers are still live (mirrors ipcNotifyNext).
+    const live = blk: {
+        for (self.windows.items) |w| {
+            if (w == window) {
+                if (w.closing) break :blk false;
+                break :blk w.findLocOfSurface(surface) != null;
+            }
+        }
+        break :blk false;
+    };
+    if (!live) return false;
+
+    const jumped = self.jumpToSurface(window, surface);
+    if (jumped) _ = self.markNotifEntryRead(next_idx);
+    return jumped;
 }
 
 /// Drop every notification log entry and the unread badge.
@@ -4357,6 +4940,45 @@ fn tick(self: *App) void {
     };
 }
 
+/// Broadcast a key event (WM_KEYDOWN/WM_KEYUP) from the focused surface
+/// to all other terminal panes in the same tab when synchronized input is
+/// active. Skipped when the surface is already receiving a broadcast (the
+/// sync_broadcast guard prevents infinite loops).
+fn broadcastKeyEvent(source: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
+    const pw = source.parent_window;
+    const ws = pw.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const tab = ws.active_tab;
+    if (!ws.tab_synchronized[tab]) return;
+
+    var it = ws.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        const sibling = entry.view.surface() orelse continue;
+        if (sibling == source) continue;
+        sibling.sync_broadcast = true;
+        _ = sibling.handleKeyEvent(wparam, lparam, action);
+        sibling.sync_broadcast = false;
+    }
+}
+
+/// Broadcast a WM_CHAR event to synchronized sibling panes.
+fn broadcastCharEvent(source: *Surface, wparam: usize) void {
+    const pw = source.parent_window;
+    const ws = pw.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const tab = ws.active_tab;
+    if (!ws.tab_synchronized[tab]) return;
+
+    var it = ws.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        const sibling = entry.view.surface() orelse continue;
+        if (sibling == source) continue;
+        sibling.sync_broadcast = true;
+        sibling.handleCharEvent(wparam);
+        sibling.sync_broadcast = false;
+    }
+}
+
 /// Window procedure for terminal surface child HWNDs (GhosttyTerminal class).
 /// GWLP_USERDATA stores a *Surface pointer.
 fn surfaceWndProc(
@@ -4472,12 +5094,16 @@ fn surfaceWndProc(
         },
 
         w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => {
-            surface.handleKeyEvent(wparam, lparam, .press);
+            const consumed = surface.handleKeyEvent(wparam, lparam, .press);
+            if (!consumed and !surface.sync_broadcast)
+                broadcastKeyEvent(surface, wparam, lparam, .press);
             return 0;
         },
 
         w32.WM_KEYUP, w32.WM_SYSKEYUP => {
-            surface.handleKeyEvent(wparam, lparam, .release);
+            const consumed = surface.handleKeyEvent(wparam, lparam, .release);
+            if (!consumed and !surface.sync_broadcast)
+                broadcastKeyEvent(surface, wparam, lparam, .release);
             return 0;
         },
 
@@ -4517,6 +5143,8 @@ fn surfaceWndProc(
                 return 0;
             }
             surface.handleCharEvent(wparam);
+            if (!surface.sync_broadcast)
+                broadcastCharEvent(surface, wparam);
             return 0;
         },
 
