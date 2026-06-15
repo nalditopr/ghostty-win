@@ -161,6 +161,8 @@ palette_filtered: [palette_entries.len]u16 = undefined,
 /// in that gap must not dereference it.
 pane: ?*Pane = null,
 
+title: ?[:0]const u8 = null,
+
 /// "Needs attention" flag (the notification ring). Set by an explicit
 /// signal — the attention OSC (see App.handleAttentionOsc) or the
 /// `+notify ring` IPC verb — when an agent in this pane wants the user's
@@ -367,6 +369,11 @@ pub fn deinit(self: *Surface) void {
         self.spawn_command = null;
     }
 
+    if (self.title) |t| {
+        self.app.core_app.alloc.free(t);
+        self.title = null;
+    }
+
     if (self.core_surface_initialized) {
         log.debug("surface deinit: core_surface.deinit start", .{});
         self.core_surface.deinit();
@@ -520,9 +527,7 @@ pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
 }
 
 pub fn getTitle(self: *const Surface) ?[:0]const u8 {
-    _ = self;
-    // TODO: Store and return the title set via setTitle.
-    return null;
+    return self.title;
 }
 
 pub fn close(self: *Surface, process_active: bool) void {
@@ -706,6 +711,9 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
 
 /// Set the window title. Called from performAction(.set_title).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
+    const alloc = self.app.core_app.alloc;
+    if (self.title) |old| alloc.free(old);
+    self.title = alloc.dupeZ(u8, title) catch null;
     self.parent_window.onTabTitleChanged(self, title);
 }
 
