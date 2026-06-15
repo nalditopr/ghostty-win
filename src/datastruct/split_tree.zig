@@ -753,6 +753,38 @@ pub fn SplitTree(comptime V: type) type {
             assert(reffed == nodes.len - 1);
         }
 
+        /// Swap two leaf nodes in the tree. This exchanges their positions,
+        /// so each leaf ends up where the other was. Both handles must refer
+        /// to leaf nodes. Returns a new tree with the swap applied.
+        pub fn swap(
+            self: *const Self,
+            gpa: Allocator,
+            a: Node.Handle,
+            b: Node.Handle,
+        ) Allocator.Error!Self {
+            if (self.isEmpty()) return .empty;
+            if (a == b) return try self.clone(gpa);
+
+            assert(self.nodes[a.idx()] == .leaf);
+            assert(self.nodes[b.idx()] == .leaf);
+
+            var arena = ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            const nodes = try alloc.dupe(Node, self.nodes);
+            nodes[a.idx()] = self.nodes[b.idx()];
+            nodes[b.idx()] = self.nodes[a.idx()];
+
+            try refNodes(gpa, nodes);
+
+            return .{
+                .arena = arena,
+                .nodes = nodes,
+                .zoomed = self.zoomed,
+            };
+        }
+
         /// Equalize this node and all its children, returning a new node with splits
         /// adjusted so that each split's ratio is based on the relative weight
         /// (number of leaves) of its children.
@@ -2514,4 +2546,143 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+test "SplitTree: swap siblings" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
+    var split = try t1.split(
+        alloc,
+        .root,
+        .right,
+        0.5,
+        &t2,
+    );
+    defer split.deinit();
+
+    var it = split.iterator();
+    const handle_a = while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+    } else return error.NotFound;
+    it = split.iterator();
+    const handle_b = while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+    } else return error.NotFound;
+
+    var swapped = try split.swap(alloc, handle_a, handle_b);
+    defer swapped.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{swapped});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\+---++---+
+        \\| B || A |
+        \\+---++---+
+        \\split (layout: horizontal, ratio: 0.50)
+        \\  leaf: B
+        \\  leaf: A
+        \\
+    );
+}
+
+test "SplitTree: swap cross-parent" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    // A | B horizontal
+    var splitAB = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer splitAB.deinit();
+
+    // Insert C below the whole thing
+    var splitABC = try splitAB.split(alloc, .root, .down, 0.5, &t3);
+    defer splitABC.deinit();
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(splitABC, .formatDiagram)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---++---+
+            \\| A || B |
+            \\+---++---+
+            \\+--------+
+            \\|    C   |
+            \\+--------+
+            \\
+        );
+    }
+
+    // Swap A and C
+    var it = splitABC.iterator();
+    const handle_a = while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+    } else return error.NotFound;
+    it = splitABC.iterator();
+    const handle_c = while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, "C")) break entry.handle;
+    } else return error.NotFound;
+
+    var swapped = try splitABC.swap(alloc, handle_a, handle_c);
+    defer swapped.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(swapped, .formatDiagram)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\+---++---+
+        \\| C || B |
+        \\+---++---+
+        \\+--------+
+        \\|    A   |
+        \\+--------+
+        \\
+    );
+}
+
+test "SplitTree: swap same node" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
+    var split = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer split.deinit();
+
+    var it = split.iterator();
+    const handle_a = while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+    } else return error.NotFound;
+
+    var swapped = try split.swap(alloc, handle_a, handle_a);
+    defer swapped.deinit();
+
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(swapped, .formatText)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(str,
+        \\split (layout: horizontal, ratio: 0.50)
+        \\  leaf: A
+        \\  leaf: B
+        \\
+    );
 }

@@ -667,6 +667,9 @@ pub const Action = union(enum) {
     /// like in `resize_split:up,10`.
     resize_split: SplitResizeParameter,
 
+    /// Swap the focused split with the split in the given direction.
+    swap_split: SplitFocusDirection,
+
     /// Equalize the size of all splits in the current window.
     equalize_splits,
 
@@ -1435,6 +1438,7 @@ pub const Action = union(enum) {
             .toggle_split_zoom,
             .toggle_readonly,
             .resize_split,
+            .swap_split,
             .equalize_splits,
             .inspector,
             => .surface,

@@ -1416,6 +1416,16 @@ pub fn performAction(
             return true;
         },
 
+        .swap_split => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.swapSplit(value);
+                },
+            }
+            return true;
+        },
+
         .resize_split => {
             switch (target) {
                 .app => {},
@@ -1490,7 +1500,7 @@ pub fn performAction(
             return true;
         },
 
-        // All 66 apprt actions are now handled above.
+        // All 67 apprt actions are now handled above.
     }
 }
 

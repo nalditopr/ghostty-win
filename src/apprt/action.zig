@@ -353,6 +353,9 @@ pub const Action = union(Key) {
     /// matches the Key enum (CValue is built positionally from both).
     toggle_sidebar,
 
+    /// Swap the focused split with the split in the given direction.
+    swap_split: GotoSplit,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -424,6 +427,7 @@ pub const Action = union(Key) {
         // Appended at the end to keep the C ABI integer values of every
         // preceding action stable (the ghostty.h test pins each value).
         toggle_sidebar,
+        swap_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

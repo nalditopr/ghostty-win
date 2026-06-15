@@ -537,6 +537,39 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Toggle read-only mode for the current surface.",
         }},
 
+        .swap_split => comptime &.{
+            .{
+                .action = .{ .swap_split = .previous },
+                .title = "Swap Split: Previous",
+                .description = "Swap the focused split with the previous split.",
+            },
+            .{
+                .action = .{ .swap_split = .next },
+                .title = "Swap Split: Next",
+                .description = "Swap the focused split with the next split.",
+            },
+            .{
+                .action = .{ .swap_split = .left },
+                .title = "Swap Split: Left",
+                .description = "Swap the focused split with the split to the left.",
+            },
+            .{
+                .action = .{ .swap_split = .right },
+                .title = "Swap Split: Right",
+                .description = "Swap the focused split with the split to the right.",
+            },
+            .{
+                .action = .{ .swap_split = .up },
+                .title = "Swap Split: Up",
+                .description = "Swap the focused split with the split above.",
+            },
+            .{
+                .action = .{ .swap_split = .down },
+                .title = "Swap Split: Down",
+                .description = "Swap the focused split with the split below.",
+            },
+        },
+
         .equalize_splits => comptime &.{.{
             .action = .equalize_splits,
             .title = "Equalize Splits",

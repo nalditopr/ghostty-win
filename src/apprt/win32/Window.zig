@@ -2844,6 +2844,41 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     }
 }
 
+/// Swap the focused split with the split in the given direction.
+pub fn swapSplit(self: *Window, swap_target: apprt.action.GotoSplit) void {
+    const ws = self.activeWorkspace();
+    if (ws.tab_count == 0) return;
+    const alloc = self.app.core_app.alloc;
+    const tab = ws.active_tab;
+    const tree = &ws.tab_trees[tab];
+
+    const active_pane = ws.tab_active_pane[tab];
+    const src_handle = ws.findHandle(tab, active_pane) orelse return;
+
+    const target: SplitTree(Pane).Goto = switch (swap_target) {
+        .previous => .previous,
+        .next => .next,
+        .up => .{ .spatial = .up },
+        .down => .{ .spatial = .down },
+        .left => .{ .spatial = .left },
+        .right => .{ .spatial = .right },
+    };
+
+    const dst_handle = (tree.goto(alloc, src_handle, target) catch return) orelse return;
+
+    const new_tree = tree.swap(alloc, src_handle, dst_handle) catch return;
+    var old_tree = ws.tab_trees[tab];
+    old_tree.deinit();
+    ws.tab_trees[tab] = new_tree;
+    self.layoutSplits();
+
+    const new_handle = ws.findHandle(tab, active_pane) orelse return;
+    switch (ws.tab_trees[tab].nodes[new_handle.idx()]) {
+        .leaf => |pane| pane.focus(),
+        .split => {},
+    }
+}
+
 /// Resize the nearest split in the given direction by the given pixel amount.
 pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
     const ws = self.activeWorkspace();

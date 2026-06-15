@@ -102,6 +102,7 @@ pub const Command = enum {
     @"surface-list",
     @"surface-focus",
     @"new-split",
+    @"swap-split",
     @"set-status",
     @"set-progress",
     log,
