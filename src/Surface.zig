@@ -5428,6 +5428,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             @as(apprt.action.SelectLayout, switch (layout) {
                 inline else => |tag| @field(apprt.action.SelectLayout, @tagName(tag)),
             }),
+        .flash_pane => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .flash_pane,
+            {},
         ),
 
         .toggle_split_zoom => return try self.rt_app.performAction(

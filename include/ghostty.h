@@ -972,6 +972,7 @@ typedef enum {
   GHOSTTY_ACTION_MOVE_PANE,
   GHOSTTY_ACTION_SAVE_SESSION,
   GHOSTTY_ACTION_RESTORE_SESSION,
+  GHOSTTY_ACTION_FLASH_PANE,
 } ghostty_action_tag_e;
 
 typedef union {

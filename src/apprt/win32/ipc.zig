@@ -129,6 +129,8 @@ pub const Command = enum {
     // Full session save/restore (tmux-resurrect style).
     @"session-save",
     @"session-restore",
+    // Flash the focused pane (brief visual highlight).
+    @"flash-pane",
 };
 
 /// Protocol-level failures that map to error responses.

@@ -6770,6 +6770,13 @@ pub const Keybinds = struct {
                     .{ .paste_from_clipboard = {} },
                     .{ .performable = true },
                 );
+                // Flash the focused pane. ctrl+shift+h mirrors cmux's
+                // Cmd+Shift+H "highlight focused pane" shortcut.
+                try self.set.put(
+                    alloc,
+                    .{ .key = .{ .unicode = 'h' }, .mods = .{ .ctrl = true, .shift = true } },
+                    .{ .flash_pane = {} },
+                );
             }
             try self.set.putFlags(
                 alloc,

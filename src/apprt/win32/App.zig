@@ -1559,6 +1559,17 @@ pub fn performAction(
 
         // All 67 apprt actions are now handled above.
         // All 68 apprt actions are now handled above.
+        .flash_pane => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.flashFocusedPane();
+                },
+            }
+            return true;
+        },
+
+        // All 67 apprt actions are now handled above.
     }
 }
 
@@ -3099,6 +3110,13 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
                 server.sendError(req.id, @errorName(err)) catch {};
                 return;
             };
+            server.sendOk(req.id, null) catch {};
+        },
+        .@"flash-pane" => {
+            // Flash the focused pane of the target window.
+            if (self.ipcTargetWindow()) |win| {
+                win.flashFocusedPane();
+            }
             server.sendOk(req.id, null) catch {};
         },
     }

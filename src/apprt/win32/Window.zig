@@ -10,6 +10,7 @@ const internal_os = @import("../../os/main.zig");
 
 const App = @import("App.zig");
 const AttentionRing = @import("AttentionRing.zig").AttentionRing;
+const FlashOverlay = @import("FlashOverlay.zig").FlashOverlay;
 const BrowserPane = @import("BrowserPane.zig");
 const PaneButtonsMod = @import("PaneButtons.zig");
 const PaneButtons = PaneButtonsMod.PaneButtons;
@@ -500,6 +501,11 @@ max_track_h: i32 = 0,
 /// never see an attention signal pay nothing. Freed in deinit().
 attention_rings: std.ArrayList(*AttentionRing) = .empty,
 
+/// Flash overlay (layered popup) for the "flash focused pane" action.
+/// Created lazily on first use; destroyed in deinit()/onDestroy(). At
+/// most one per window — the flash always targets the focused pane.
+flash_overlay: ?*FlashOverlay = null,
+
 /// Pool of per-pane corner-button overlays (clickable layered popups),
 /// grown on demand by updatePaneButtons and reused across layouts. v1
 /// policy: one overlay on the active workspace/tab's FOCUSED pane only
@@ -824,6 +830,12 @@ pub fn deinit(self: *Window) void {
     // owner window so they never outlive it.
     for (self.attention_rings.items) |ring| ring.destroy();
     self.attention_rings.deinit(self.app.core_app.alloc);
+
+    // Destroy the flash overlay (owned popup) before the owner window.
+    if (self.flash_overlay) |fo| {
+        fo.destroy();
+        self.flash_overlay = null;
+    }
 
     // Destroy the per-pane corner-button overlays (owned popups) before
     // the owner window so they never outlive it.
@@ -3313,6 +3325,42 @@ fn clearTabAttention(self: *Window, ws: *Workspace, tab: usize) void {
     ws.tab_attention[tab] = false;
 }
 
+/// Flash the currently focused pane with a brief semi-transparent
+/// border highlight. The flash auto-dismisses after ~200ms via a
+/// WM_TIMER on the overlay's own HWND. Creates the overlay lazily
+/// on first use. Safe to call repeatedly (re-triggers reset the timer).
+pub fn flashFocusedPane(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const pane = self.getActivePane() orelse return;
+    const pane_hwnd = pane.hwnd() orelse return;
+
+    // Get the focused pane's client rect in screen coordinates.
+    var client_rect: w32.RECT = undefined;
+    if (w32.GetClientRect(pane_hwnd, &client_rect) == 0) return;
+    var tl = w32.POINT{ .x = client_rect.left, .y = client_rect.top };
+    var br = w32.POINT{ .x = client_rect.right, .y = client_rect.bottom };
+    _ = w32.ClientToScreen(pane_hwnd, &tl);
+    _ = w32.ClientToScreen(pane_hwnd, &br);
+    const screen_rect = w32.RECT{
+        .left = tl.x,
+        .top = tl.y,
+        .right = br.x,
+        .bottom = br.y,
+    };
+
+    // Lazily create the flash overlay.
+    if (self.flash_overlay == null) {
+        self.flash_overlay = FlashOverlay.create(
+            self.app.core_app.alloc,
+            self.app.hinstance,
+            hwnd,
+        ) catch return;
+    }
+    const fo = self.flash_overlay.?;
+    fo.setScale(self.scale);
+    fo.flash(screen_rect);
+}
+
 /// Update tab bar visibility based on config and tab count.
 fn updateTabBarVisibility(self: *Window) void {
     if (self.is_quick_terminal) {
@@ -4925,6 +4973,10 @@ fn onDestroy(self: *Window) void {
     // agent workflow that repeatedly opens and closes windows.
     for (self.attention_rings.items) |ring| ring.destroy();
     self.attention_rings.deinit(app.core_app.alloc);
+    if (self.flash_overlay) |fo| {
+        fo.destroy();
+        self.flash_overlay = null;
+    }
     for (self.pane_buttons.items) |pb| pb.destroy();
     self.pane_buttons.deinit(app.core_app.alloc);
 

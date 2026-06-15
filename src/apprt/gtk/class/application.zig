@@ -786,6 +786,8 @@ pub const Application = extern struct {
             // Windows-only session save/restore.
             .save_session,
             .restore_session,
+            // Windows-only flash overlay.
+            .flash_pane,
             .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,

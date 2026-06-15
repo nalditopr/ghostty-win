@@ -376,6 +376,10 @@ pub const Action = union(Key) {
     /// workspaces and tabs to match the saved state.
     /// Windows apprt only; a no-op elsewhere.
     restore_session,
+    /// Flash the currently focused pane with a brief visual highlight
+    /// so the user can quickly see which pane has focus. One-shot
+    /// effect that auto-dismisses after ~200ms.
+    flash_pane,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -455,6 +459,7 @@ pub const Action = union(Key) {
         move_pane,
         save_session,
         restore_session,
+        flash_pane,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

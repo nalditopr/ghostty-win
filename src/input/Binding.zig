@@ -698,6 +698,10 @@ pub const Action = union(enum) {
     /// Valid arguments: `even_horizontal`, `even_vertical`,
     /// `main_horizontal`, `main_vertical`, `tiled`.
     select_layout: SelectLayout,
+    /// Flash the focused pane with a brief visual highlight so the
+    /// user can quickly see which pane has focus. The flash auto-
+    /// dismisses after ~200ms.
+    flash_pane,
 
     /// Reset the window to the default size. The "default size" is the
     /// size that a new window would be created with. This has no effect
@@ -1479,6 +1483,7 @@ pub const Action = union(enum) {
             .swap_split,
             .equalize_splits,
             .select_layout,
+            .flash_pane,
             .inspector,
             => .surface,
         };

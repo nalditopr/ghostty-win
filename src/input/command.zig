@@ -576,6 +576,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Equalize the size of all splits.",
         }},
 
+        .flash_pane => comptime &.{.{
+            .action = .flash_pane,
+            .title = "Flash Focused Pane",
+            .description = "Briefly highlight the focused pane.",
+        }},
+
         .reset_window_size => comptime &.{.{
             .action = .reset_window_size,
             .title = "Reset Window Size",
