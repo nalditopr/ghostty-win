@@ -3156,12 +3156,17 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
             server.sendError(req.id, @errorName(err)) catch {};
         },
         .@"select-layout" => self.ipcSelectLayout(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
         .@"sync-input" => self.ipcSyncInput(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
         .@"break-pane" => self.ipcBreakPane(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
         .@"move-pane" => self.ipcMovePaneToTab(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
+        },
         .@"session-save" => {
             const alloc = self.core_app.alloc;
             if (self.windows.items.len > 0) {

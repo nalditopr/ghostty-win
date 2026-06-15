@@ -5445,6 +5445,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .toggle_synchronized_input => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_synchronized_input,
+            {},
+        ),
+
         .break_pane => return try self.rt_app.performAction(
             .{ .surface = self },
             .break_pane,
@@ -5511,6 +5514,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .restore_session => return try self.rt_app.performAction(
             .{ .surface = self },
             .restore_session,
+            {},
+        ),
+
         .toggle_notification_unread => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_notification_unread,
@@ -5520,9 +5526,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .mark_oldest_unread_jump => return try self.rt_app.performAction(
             .{ .surface = self },
             .mark_oldest_unread_jump,
+            {},
+        ),
+
         .edit_workspace_description => return try self.rt_app.performAction(
             .{ .surface = self },
             .edit_workspace_description,
+            {},
+        ),
+
         .toggle_right_sidebar => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_right_sidebar,
