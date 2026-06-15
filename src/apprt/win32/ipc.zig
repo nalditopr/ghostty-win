@@ -108,6 +108,12 @@ pub const Command = enum {
     log,
     @"read-screen",
 
+    // capture-pane {[workspace],[tab],[scrollback:bool],[file:path]} ->
+    //   dump the addressed pane's screen text (visible or full scrollback)
+    //   and either return it as the IPC response or write it to a file. The
+    //   tmux `capture-pane` equivalent for session restore.
+    @"capture-pane",
+
     // Session capture/resume: record (per surface) which agent runs in a
     // pane and its native session id, and replay the agent's resume argv.
     // session-capture {agent, session, [surface]} -> Store.put.

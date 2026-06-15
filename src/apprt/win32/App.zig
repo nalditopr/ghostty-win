@@ -3127,6 +3127,9 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         .@"read-screen" => self.ipcReadScreen(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
+        .@"capture-pane" => self.ipcCapturePaneCmd(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
         .@"session-capture" => self.ipcSessionCapture(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
@@ -3194,6 +3197,7 @@ fn commandIsReadOnly(cmd: ipc.Command) bool {
         .snapshot,
         .@"surface-list",
         .@"read-screen",
+        .@"capture-pane",
         .@"session-list",
         => true,
         else => false,
@@ -4232,6 +4236,161 @@ fn ipcReadScreen(self: *App, req: *ipc.Request) anyerror!void {
     defer aw.deinit();
     try std.json.Stringify.value(clipped, .{}, &aw.writer);
     server.sendOk(req.id, aw.written()) catch {};
+}
+
+/// capture-pane {[workspace],[tab],[scrollback:bool],[file:path]} — the
+/// tmux `capture-pane` equivalent. Dumps the addressed (or active) pane's
+/// screen text, optionally including the scrollback buffer. When `file` is
+/// given the dump is written there instead of returned as the IPC response.
+/// The dump is plain UTF-8 text (no ANSI escapes) — matching read-screen's
+/// format — so it can be piped back into a terminal for session restore.
+fn ipcCapturePaneCmd(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const target = try self.ipcResolveTab(req);
+    const pane = target.ws.tab_active_pane[target.tab_idx];
+    const surface = pane.surface() orelse return IpcError.NotATerminal;
+    if (!surface.core_surface_ready) return IpcError.CoreNotReady;
+
+    const alloc = self.core_app.alloc;
+    const scrollback = ipcArgBool(req, "scrollback") orelse false;
+
+    // Dump under the renderer mutex: the screen is shared with the
+    // renderer/IO threads.
+    const dump: []const u8 = dump: {
+        const cs = &surface.core_surface;
+        cs.renderer_state.mutex.lock();
+        defer cs.renderer_state.mutex.unlock();
+        const screen = cs.io.terminal.screens.active;
+        const point: @import("../../terminal/main.zig").point.Point =
+            if (scrollback) .{ .screen = .{ .x = 0, .y = 0 } } else .{ .active = .{ .x = 0, .y = 0 } };
+        break :dump try screen.dumpStringAlloc(alloc, point);
+    };
+    defer alloc.free(dump);
+
+    // If a file path was given, write the dump there and reply with the
+    // path; otherwise return the text as the IPC data (JSON-escaped, same
+    // as read-screen).
+    if (ipcArgString(req, "file")) |file_path| {
+        // Ensure parent directory exists.
+        if (std.fs.path.dirname(file_path)) |parent| {
+            std.fs.cwd().makePath(parent) catch {};
+        }
+        const file = std.fs.cwd().createFile(file_path, .{ .truncate = true }) catch
+            return error.CreateFileFailed;
+        defer file.close();
+        file.writeAll(dump) catch return error.WriteFileFailed;
+
+        // Reply with the path we wrote.
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        try std.json.Stringify.value(file_path, .{}, &aw.writer);
+        server.sendOk(req.id, aw.written()) catch {};
+    } else {
+        const max_payload: usize = 768 * 1024;
+        const clipped = if (dump.len > max_payload) dump[dump.len - max_payload ..] else dump;
+
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        try std.json.Stringify.value(clipped, .{}, &aw.writer);
+        server.sendOk(req.id, aw.written()) catch {};
+    }
+}
+
+/// Capture the scrollback + visible screen of every terminal pane and save
+/// each to `%LOCALAPPDATA%\ghostty\scrollback\<surface_id>.txt`. Called
+/// during session save so that session restore can repopulate the panes.
+/// Best-effort: errors on individual panes are swallowed.
+pub fn saveAllScrollback(self: *App) void {
+    const alloc = self.core_app.alloc;
+    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return;
+    defer alloc.free(dir);
+    const scrollback_dir = std.fs.path.join(alloc, &.{ dir, "ghostty", "scrollback" }) catch return;
+    defer alloc.free(scrollback_dir);
+
+    std.fs.cwd().makePath(scrollback_dir) catch return;
+
+    for (self.windows.items) |w| {
+        if (w.closing) continue;
+        for (w.workspaces[0..w.workspace_count]) |*ws| {
+            for (0..ws.tab_count) |t| {
+                var it = ws.tab_trees[t].iterator();
+                while (it.next()) |entry| {
+                    const surface = switch (entry.view.content) {
+                        .terminal => |s| s,
+                        .browser => continue,
+                    };
+                    if (!surface.core_surface_ready) continue;
+                    self.saveOnePaneScrollback(alloc, scrollback_dir, surface) catch continue;
+                }
+            }
+        }
+    }
+}
+
+/// Save one pane's screen (scrollback + visible) to a file.
+fn saveOnePaneScrollback(
+    self: *App,
+    alloc: Allocator,
+    scrollback_dir: []const u8,
+    surface: *Surface,
+) !void {
+    _ = self;
+    const cs = &surface.core_surface;
+    const sid = cs.id;
+
+    // Dump the full screen (scrollback + visible) under the renderer mutex.
+    const dump: []const u8 = dump: {
+        cs.renderer_state.mutex.lock();
+        defer cs.renderer_state.mutex.unlock();
+        const screen = cs.io.terminal.screens.active;
+        break :dump try screen.dumpStringAlloc(alloc, .{ .screen = .{ .x = 0, .y = 0 } });
+    };
+    defer alloc.free(dump);
+
+    // Build filename: <scrollback_dir>/<surface_id>.txt
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}.txt", .{sid}) catch return;
+    const path = try std.fs.path.join(alloc, &.{ scrollback_dir, name });
+    defer alloc.free(path);
+
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(dump);
+}
+
+/// Restore saved scrollback into a pane by writing the text to the
+/// terminal's PTY as if it were program output, which naturally populates
+/// the scrollback buffer. The file is
+/// `%LOCALAPPDATA%\ghostty\scrollback\<surface_id>.txt`.
+pub fn restoreScrollback(self: *App, surface: *Surface) void {
+    const alloc = self.core_app.alloc;
+    if (!surface.core_surface_ready) return;
+
+    const sid = surface.core_surface.id;
+
+    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return;
+    defer alloc.free(dir);
+
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}.txt", .{sid}) catch return;
+    const path = std.fs.path.join(alloc, &.{ dir, "ghostty", "scrollback", name }) catch return;
+    defer alloc.free(path);
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+
+    // Read the saved scrollback (cap at 1 MiB to avoid unbounded allocs).
+    const max_restore: usize = 1024 * 1024;
+    const content = file.readToEndAlloc(alloc, max_restore) catch return;
+    defer alloc.free(content);
+
+    if (content.len == 0) return;
+
+    // Write the content to the terminal's PTY input as if it were program
+    // output. This populates the scrollback naturally.
+    const termio_mod = @import("../../termio.zig");
+    const msg = termio_mod.Message.writeReq(alloc, content) catch return;
+    surface.core_surface.io.queueMessage(msg, .unlocked);
 }
 
 /// Resolve the surface a session verb targets: an explicit `surface` id, or
