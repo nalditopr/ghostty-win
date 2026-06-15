@@ -391,6 +391,10 @@ pub const Action = union(Key) {
     /// no-op. Windows apprt only; a no-op elsewhere. Equivalent to
     /// cmux's Ctrl+Cmd+U.
     mark_oldest_unread_jump,
+    /// Start inline editing of the active workspace's description
+    /// (Windows apprt only; a no-op elsewhere). The description appears
+    /// below the workspace name in the sidebar.
+    edit_workspace_description,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -473,6 +477,7 @@ pub const Action = union(Key) {
         flash_pane,
         toggle_notification_unread,
         mark_oldest_unread_jump,
+        edit_workspace_description,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

@@ -986,6 +986,13 @@ pub fn performAction(
                 SessionState.save(alloc, self.windows.items[0]) catch |err| {
                     log.err("session save failed: {}", .{err});
                 };
+        .edit_workspace_description => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const pw = core_surface.rt_surface.parent_window;
+                    pw.editWorkspaceDescription(pw.active_workspace);
+                },
             }
             return true;
         },
@@ -3148,6 +3155,9 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
             }
             server.sendOk(req.id, null) catch {};
         },
+        .@"workspace-set-description" => self.ipcWorkspaceSetDescription(req) catch |err| {
+            server.sendError(req.id, @errorName(err)) catch {};
+        },
     }
 }
 
@@ -3500,6 +3510,19 @@ fn ipcWorkspaceClose(self: *App, req: *ipc.Request) anyerror!void {
     const idx = ipcArgU32(req, "index") orelse return IpcError.MissingIndex;
     if (idx >= window.workspace_count) return IpcError.UnknownWorkspace;
     window.closeWorkspace(idx);
+    server.sendOk(req.id, null) catch {};
+}
+
+/// workspace-set-description {workspace, text} → set (or clear) the
+/// user-facing description text for workspace `workspace` in the target
+/// window. An empty or absent `text` clears the description.
+fn ipcWorkspaceSetDescription(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
+    const idx = ipcArgU32(req, "workspace") orelse return IpcError.MissingIndex;
+    if (idx >= window.workspace_count) return IpcError.UnknownWorkspace;
+    const text = ipc.argString(req, "text") orelse "";
+    window.setWorkspaceDescription(idx, text);
     server.sendOk(req.id, null) catch {};
 }
 

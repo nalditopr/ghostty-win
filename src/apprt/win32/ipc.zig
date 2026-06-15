@@ -131,6 +131,10 @@ pub const Command = enum {
     @"session-restore",
     // Flash the focused pane (brief visual highlight).
     @"flash-pane",
+    // Workspace description: set/clear the user-facing description text
+    // shown below the workspace name in the sidebar.
+    // workspace-set-description {workspace, text} -> ok.
+    @"workspace-set-description",
 };
 
 /// Protocol-level failures that map to error responses.

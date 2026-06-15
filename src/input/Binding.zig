@@ -625,6 +625,10 @@ pub const Action = union(enum) {
     ///
     /// Only implemented on Windows.
     mark_oldest_unread_jump,
+    /// Start inline editing of the active workspace's description (the
+    /// line shown below the workspace name in the sidebar). Windows apprt
+    /// only; a no-op on other platforms.
+    edit_workspace_description,
 
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
@@ -1487,6 +1491,7 @@ pub const Action = union(enum) {
             .restore_session,
             .toggle_notification_unread,
             .mark_oldest_unread_jump,
+            .edit_workspace_description,
             .new_split,
             .goto_split,
             .goto_window,

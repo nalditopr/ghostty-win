@@ -5518,6 +5518,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .mark_oldest_unread_jump => return try self.rt_app.performAction(
             .{ .surface = self },
             .mark_oldest_unread_jump,
+        .edit_workspace_description => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .edit_workspace_description,
             {},
         ),
 

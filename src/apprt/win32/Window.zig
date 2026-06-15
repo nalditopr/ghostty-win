@@ -113,6 +113,13 @@ pub const Workspace = struct {
     name: [64]u16 = undefined,
     /// Length of the workspace name in UTF-16 code units.
     name_len: u16 = 0,
+    /// Optional workspace description shown below the name in the sidebar.
+    /// UTF-16, inline like name (no allocation). Edited via the
+    /// edit_workspace_description action or the IPC workspace-set-description
+    /// command.
+    description: [256]u16 = undefined,
+    /// Length of the workspace description in UTF-16 code units.
+    description_len: u16 = 0,
     /// Optional working directory this workspace's tabs spawn in (a git
     /// worktree bound via `+workspace new --worktree`). Owned heap copy,
     /// allocated by setWorkingDir and freed by freeWorkingDir. Null = the
@@ -230,6 +237,11 @@ pub const Workspace = struct {
         self.tab_log[tab_idx].push(text);
     }
 
+    /// The workspace description as a UTF-16 slice (empty when unset).
+    pub fn descriptionSlice(self: *const Workspace) []const u16 {
+        return self.description[0..self.description_len];
+    }
+
     /// The cached git branch (empty when unknown). Stage 2 metadata.
     pub fn gitBranch(self: *const Workspace) []const u8 {
         return self.git_branch[0..self.git_branch_len];
@@ -276,6 +288,7 @@ pub const Workspace = struct {
     /// line: a git branch, a listening port, a PR, or an agent status. Used
     /// to decide whether to render the taller two-line row.
     pub fn hasMetadata(self: *const Workspace) bool {
+        if (self.description_len > 0) return true;
         if (self.git_branch_len > 0) return true;
         if (self.port_count > 0) return true;
         if (self.pr_state != .none) return true;
@@ -336,10 +349,11 @@ pub const Loc = struct {
 
 /// What an in-progress inline rename writes back to. `.tab` is an index
 /// into the active workspace's tab arrays; `.workspace` is an index into
-/// the window's workspaces.
+/// the window's workspaces; `.description` edits a workspace's description.
 pub const RenameTarget = union(enum) {
     tab: usize,
     workspace: usize,
+    description: usize,
 };
 
 /// The parent App.
@@ -2121,6 +2135,21 @@ pub fn setWorkspaceName(self: *Window, idx: usize, name: []const u8) void {
         name[0..@min(name.len, wsp.name.len)],
     ) catch return;
     wsp.name_len = @intCast(@min(nlen, wsp.name.len));
+    self.invalidateSidebar();
+}
+
+/// Set workspace `idx`'s sidebar description from a UTF-8 string,
+/// mirroring setWorkspaceName (truncated to the description buffer;
+/// invalid UTF-8 leaves the description unchanged). Used by the IPC
+/// `workspace-set-description` command. No-op for an out-of-range index.
+pub fn setWorkspaceDescription(self: *Window, idx: usize, text: []const u8) void {
+    if (idx >= self.workspace_count) return;
+    const wsp = &self.workspaces[idx];
+    const dlen = std.unicode.utf8ToUtf16Le(
+        &wsp.description,
+        text[0..@min(text.len, wsp.description.len)],
+    ) catch return;
+    wsp.description_len = @intCast(@min(dlen, wsp.description.len));
     self.invalidateSidebar();
 }
 
@@ -4314,6 +4343,7 @@ fn handleSidebarRightClick(self: *Window, x: i32, y: i32) void {
 const WS_CTX_RENAME: usize = 9501;
 const WS_CTX_CLOSE: usize = 9502;
 const WS_CTX_NEW: usize = 9503;
+const WS_CTX_DESCRIPTION: usize = 9504;
 
 /// Show the workspace context menu for the workspace at `ws_idx` at
 /// client coordinates (x, y): Rename / Close workspace / New workspace.
@@ -4323,6 +4353,7 @@ fn showWorkspaceContextMenu(self: *Window, ws_idx: usize, x: i32, y: i32) void {
     defer _ = w32.DestroyMenu(menu);
 
     _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_RENAME, std.unicode.utf8ToUtf16LeStringLiteral("Rename Workspace"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_DESCRIPTION, std.unicode.utf8ToUtf16LeStringLiteral("Edit Description"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_CLOSE, std.unicode.utf8ToUtf16LeStringLiteral("Close Workspace"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, WS_CTX_NEW, std.unicode.utf8ToUtf16LeStringLiteral("New Workspace"));
@@ -4344,6 +4375,7 @@ fn showWorkspaceContextMenu(self: *Window, ws_idx: usize, x: i32, y: i32) void {
     if (self.closing or ws_idx >= self.workspace_count) return;
     switch (@as(usize, @intCast(cmd))) {
         WS_CTX_RENAME => self.renameWorkspace(ws_idx),
+        WS_CTX_DESCRIPTION => self.editWorkspaceDescription(ws_idx),
         WS_CTX_CLOSE => self.closeWorkspace(ws_idx),
         WS_CTX_NEW => self.newWorkspace(),
         else => {},
@@ -4746,6 +4778,18 @@ pub fn renameWorkspace(self: *Window, ws_idx: usize) void {
     self.startRename(rect, wsp.name[0..wsp.name_len], .{ .workspace = ws_idx });
 }
 
+/// Start inline editing of a workspace description. Overlays the Edit
+/// control on the workspace's sidebar row (same as renameWorkspace but
+/// targeting the description field and pre-filled with the current
+/// description text, which is empty when no description has been set).
+pub fn editWorkspaceDescription(self: *Window, ws_idx: usize) void {
+    if (self.is_quick_terminal) return;
+    if (ws_idx >= self.workspace_count) return;
+    const wsp = &self.workspaces[ws_idx];
+    const rect = Sidebar.itemRect(ws_idx, self.sidebarWidth(), self.sidebarItemHeight());
+    self.startRename(rect, wsp.description[0..wsp.description_len], .{ .description = ws_idx });
+}
+
 /// Create the inline rename Edit overlay at `rect`, pre-filled with
 /// `initial` (a UTF-16 slice), targeting `target`. Shared by tab and
 /// workspace rename; finishRename routes the committed text per target.
@@ -4852,6 +4896,25 @@ pub fn finishTabRename(self: *Window) void {
                     wsp.name_len = nlen;
                 }
             },
+            .description => |ws_idx| {
+                if (ws_idx < self.workspace_count) {
+                    const wsp = &self.workspaces[ws_idx];
+                    const dlen: u16 = @intCast(@min(wlen, wsp.description.len));
+                    @memcpy(wsp.description[0..dlen], wbuf[0..dlen]);
+                    wsp.description_len = dlen;
+                }
+            },
+        }
+    } else {
+        // Empty text: for description edits, clear the description
+        // (allows the user to remove a description by blanking it).
+        switch (target) {
+            .description => |ws_idx| {
+                if (ws_idx < self.workspace_count) {
+                    self.workspaces[ws_idx].description_len = 0;
+                }
+            },
+            else => {},
         }
     }
 

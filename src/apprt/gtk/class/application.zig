@@ -791,6 +791,7 @@ pub const Application = extern struct {
             // Windows-only notification read/unread toggle.
             .toggle_notification_unread,
             .mark_oldest_unread_jump,
+            .edit_workspace_description,
             .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,
