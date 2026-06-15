@@ -367,6 +367,15 @@ pub const Action = union(Key) {
 
     /// Move the focused pane to an adjacent tab.
     move_pane: MovePaneTarget,
+    /// Save the current session layout (workspaces, tabs, split trees,
+    /// working directories) to disk so it can be restored later.
+    /// Windows apprt only; a no-op elsewhere.
+    save_session,
+
+    /// Restore a previously saved session layout from disk. Creates
+    /// workspaces and tabs to match the saved state.
+    /// Windows apprt only; a no-op elsewhere.
+    restore_session,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -444,6 +453,8 @@ pub const Action = union(Key) {
         toggle_synchronized_input,
         break_pane,
         move_pane,
+        save_session,
+        restore_session,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

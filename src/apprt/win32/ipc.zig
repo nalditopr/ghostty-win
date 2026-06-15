@@ -126,6 +126,9 @@ pub const Command = enum {
     // move it to an adjacent/specific tab.
     @"break-pane",
     @"move-pane",
+    // Full session save/restore (tmux-resurrect style).
+    @"session-save",
+    @"session-restore",
 };
 
 /// Protocol-level failures that map to error responses.

@@ -5496,6 +5496,18 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .save_session => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .save_session,
+            {},
+        ),
+
+        .restore_session => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .restore_session,
+            {},
+        ),
+
         .toggle_window_float_on_top => return try self.rt_app.performAction(
             .{ .surface = self },
             .float_window,

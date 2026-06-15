@@ -603,6 +603,16 @@ pub const Action = union(enum) {
     /// a no-op. Bound to `ctrl+b` by default on Windows.
     toggle_sidebar,
 
+    /// Save the current session layout (workspaces, tabs, working
+    /// directories) to disk. The saved state can be restored later
+    /// with `restore_session`. Only implemented on Windows.
+    save_session,
+
+    /// Restore a previously saved session layout from disk. Creates
+    /// workspaces and tabs to match the saved state.
+    /// Only implemented on Windows.
+    restore_session,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1456,6 +1466,8 @@ pub const Action = union(enum) {
             .move_tab,
             .toggle_tab_overview,
             .toggle_sidebar,
+            .save_session,
+            .restore_session,
             .new_split,
             .goto_split,
             .goto_window,

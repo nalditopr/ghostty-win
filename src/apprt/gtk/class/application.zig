@@ -783,6 +783,9 @@ pub const Application = extern struct {
             // Windows-only pane movement.
             .break_pane,
             .move_pane,
+            // Windows-only session save/restore.
+            .save_session,
+            .restore_session,
             .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,

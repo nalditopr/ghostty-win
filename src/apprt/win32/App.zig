@@ -16,6 +16,7 @@ const BrowserPane = @import("BrowserPane.zig");
 const ipc = @import("ipc.zig");
 const Pane = @import("Pane.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
+const SessionState = @import("SessionState.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
@@ -975,6 +976,25 @@ pub fn performAction(
                     core_surface.rt_surface.parent_window.toggleSidebar();
                 },
             }
+            return true;
+        },
+
+        .save_session => {
+            const alloc = self.core_app.alloc;
+            // Save from the first window (the primary one).
+            if (self.windows.items.len > 0) {
+                SessionState.save(alloc, self.windows.items[0]) catch |err| {
+                    log.err("session save failed: {}", .{err});
+                };
+            }
+            return true;
+        },
+
+        .restore_session => {
+            const alloc = self.core_app.alloc;
+            SessionState.restore(alloc, self) catch |err| {
+                log.err("session restore failed: {}", .{err});
+            };
             return true;
         },
 
@@ -3063,6 +3083,23 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         },
         .@"move-pane" => self.ipcMovePaneToTab(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
+        .@"session-save" => {
+            const alloc = self.core_app.alloc;
+            if (self.windows.items.len > 0) {
+                SessionState.save(alloc, self.windows.items[0]) catch |err| {
+                    server.sendError(req.id, @errorName(err)) catch {};
+                    return;
+                };
+            }
+            server.sendOk(req.id, null) catch {};
+        },
+        .@"session-restore" => {
+            const alloc = self.core_app.alloc;
+            SessionState.restore(alloc, self) catch |err| {
+                server.sendError(req.id, @errorName(err)) catch {};
+                return;
+            };
+            server.sendOk(req.id, null) catch {};
         },
     }
 }

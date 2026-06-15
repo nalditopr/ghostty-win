@@ -16,6 +16,7 @@ const PaneButtons = PaneButtonsMod.PaneButtons;
 const Pane = @import("Pane.zig");
 const Sidebar = @import("Sidebar.zig");
 const Surface = @import("Surface.zig");
+const SessionState = @import("SessionState.zig");
 const WindowState = @import("WindowState.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const ipc = @import("ipc.zig");
@@ -5060,6 +5061,9 @@ pub fn windowWndProc(
             // closing flag and destroys the HWND, after which the rect is
             // unrecoverable.
             window.savePlacement();
+            // Persist the session layout (workspaces/tabs/cwds) alongside
+            // the window geometry so it can be restored on next launch.
+            SessionState.save(window.app.core_app.alloc, window) catch {};
             window.close();
             return 0;
         },
