@@ -474,6 +474,30 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Toggle focus between the right sidebar and the terminal.",
         }},
 
+        .break_pane => comptime &.{.{
+            .action = .break_pane,
+            .title = "Break Pane",
+            .description = "Break the focused pane out of its split into a new tab.",
+        }},
+
+        .toggle_synchronized_input => comptime &.{.{
+            .action = .toggle_synchronized_input,
+            .title = "Toggle Synchronized Input",
+            .description = "Toggle synchronized input for all panes in the current tab.",
+        }},
+
+        .save_session => comptime &.{.{
+            .action = .save_session,
+            .title = "Save Session",
+            .description = "Save the current session layout to disk.",
+        }},
+
+        .restore_session => comptime &.{.{
+            .action = .restore_session,
+            .title = "Restore Session",
+            .description = "Restore a previously saved session layout.",
+        }},
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = "Change Terminal Title…",
@@ -775,6 +799,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .write_scrollback_file,
         .goto_tab,
         .resize_split,
+        .select_layout,
         .activate_key_table,
         .activate_key_table_once,
         .deactivate_key_table,

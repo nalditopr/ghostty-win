@@ -148,9 +148,6 @@ pub const Action = union(Key) {
     /// Equalize all the splits in the target window.
     equalize_splits,
 
-    /// Rearrange all splits in the target window into a predefined layout.
-    select_layout: SelectLayout,
-
     /// Toggle whether a split is zoomed or not. A zoomed split is resized
     /// to take up the entire window.
     toggle_split_zoom,
@@ -358,6 +355,8 @@ pub const Action = union(Key) {
 
     /// Swap the focused split with the split in the given direction.
     swap_split: GotoSplit,
+    /// Rearrange all splits in the target window into a predefined layout.
+    select_layout: SelectLayout,
     /// Toggle synchronized input for the current tab (Windows apprt
     /// only). When active, keyboard input to the focused pane is
     /// broadcast to all terminal panes in the same tab.

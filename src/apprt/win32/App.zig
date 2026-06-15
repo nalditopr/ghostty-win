@@ -3155,6 +3155,12 @@ fn handleIpcRequest(self: *App, req: *ipc.Request) void {
         .@"session-list" => self.ipcSessionList(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
+        .@"swap-split" => {
+            if (self.ipcTargetWindow()) |win| {
+                win.swapSplit(.previous);
+            }
+            server.sendOk(req.id, null) catch {};
+        },
         .@"select-layout" => self.ipcSelectLayout(req) catch |err| {
             server.sendError(req.id, @errorName(err)) catch {};
         },
@@ -4504,6 +4510,9 @@ fn ipcSelectLayout(self: *App, req: *ipc.Request) anyerror!void {
         return server.sendError(req.id, "unknown layout") catch {};
     const window = self.ipcTargetWindow() orelse return;
     window.selectLayout(layout);
+    server.sendOk(req.id, null) catch {};
+}
+
 /// sync-input {action:"toggle"|"on"|"off", [workspace], [tab]} → toggle or
 /// set synchronized input for the addressed tab. Defaults to active
 /// workspace/tab.
@@ -4525,6 +4534,9 @@ fn ipcSyncInput(self: *App, req: *ipc.Request) anyerror!void {
         return IpcError.BadAction;
     }
     target.window.invalidateTabBar();
+    server.sendOk(req.id, null) catch {};
+}
+
 /// break-pane: break the active pane of the addressed (or active) tab
 /// out of its split into a new tab.
 fn ipcBreakPane(self: *App, req: *ipc.Request) anyerror!void {
