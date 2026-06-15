@@ -94,6 +94,41 @@ against the active workspace's tab count:
 window-show-tab-bar = auto
 ```
 
+## Per-Pane Corner Action Buttons
+
+Every pane shows a small, always-visible action cluster in its **top-right
+corner**, mirroring cmux's per-pane buttons. Left → right:
+
+| Icon | Glyph | Action |
+|---|---|---|
+| **New Terminal** | `>_` prompt | Open a **new tab** running your default backend |
+| **New Browser** | globe | Open a **new browser** tab |
+| **Split Right** | square with a vertical divider | Split the pane to the **right** |
+| **Split Down** | square with a horizontal divider | Split the pane **down** |
+
+The cluster appears on **all panes at once** (not only the focused one) and
+acts on the pane it sits on: clicking first brings that pane's workspace/tab
+to the foreground and focuses it, then performs the action. The glyphs are
+drawn to match cmux's SF Symbols (`terminal`, `globe`, `square.split.2x1`,
+`square.split.1x2`). There is no per-pane close button — in cmux, close is
+tab-level; close a pane from the terminal right-click menu (*Close Pane*) or,
+for a browser pane, the address-bar `×`.
+
+## Sidebar Toggle, Zoom & Smart Copy/Paste
+
+- **Toggle the sidebar** with **`ctrl+b`** (the `toggle_sidebar` action,
+  mirroring VS Code's *Toggle Side Bar*). It is a session-only override of
+  `window-show-sidebar`; a config reload re-applies the configured value.
+  `ctrl+b` is bound on **Windows only**, so it never shadows the tmux prefix
+  or readline `^B` on other platforms.
+- **Zoom the font** with **`ctrl`+mouse wheel** — each notch runs
+  `increase_font_size` / `decrease_font_size`.
+- **Copy / paste** with **`ctrl+c` / `ctrl+v`** (Windows Terminal
+  convention). `ctrl+c` copies **only when text is selected**; with no
+  selection it falls through and still sends `SIGINT` to interrupt the
+  running program. `ctrl+v` pastes. The classic `ctrl+shift+c` /
+  `ctrl+shift+v` bindings keep working too.
+
 ## Window Size & Position Persistence
 
 The main window remembers its size, position, and maximized state across
@@ -234,7 +269,7 @@ Open a web browser inside a split or a tab, next to your terminals:
   is loaded on demand); opening a browser pane then shows
   **"WebView2 runtime unavailable"** in the pane instead of failing.
 
-## Agent Scripting — `+browser`, `+workspace`, `+tab`, `+send`, `+notify`
+## Agent Scripting & Orchestration
 
 A running Ghostty instance exposes a scripting API over a per-process named
 pipe (`ghostty-ipc-<pid>`), so scripts and agents can drive it from any
@@ -293,6 +328,58 @@ ghostty +notify clear [--workspace I] [--tab J]   # clear the flag
 `+notify ring` flags the active pane of the target tab for attention (see
 **Notification Rings** below); `clear` removes it. Both default to the active
 workspace's active tab. The target pane must be a terminal.
+
+### `+split` / `+surface` — create and focus panes
+
+```text
+ghostty +split right|down [--workspace I] [--tab J] [--command "..."] [--focus]
+                                                # split the active pane; prints {id}
+ghostty +surface list                           # [{id, kind, title, workspace, tab, active}]
+ghostty +surface focus <id>                     # bring a pane to the foreground and focus it
+ghostty +surface focus --workspace I --tab J [--pane K]   # focus by position
+```
+
+`+split` splits the target tab's active pane (inheriting its backend, or
+running `--command`) and prints the new pane's id; `--focus` also focuses it.
+`+surface` enumerates every pane across all windows/workspaces and focuses
+one by id or by position.
+
+### `+read-screen` — read a pane's screen (agent-reads-agent)
+
+```text
+ghostty +read-screen [--workspace I] [--tab J] [--lines N] [--scrollback]
+```
+
+Prints the visible screen text of the target pane (`--scrollback` includes
+history, `--lines N` caps the output). This is the agent-reads-agent
+primitive: a supervising agent can read what another agent's terminal shows.
+
+### `+status` / `+log` — per-tab orchestration state
+
+```text
+ghostty +status set <text> [--workspace I] [--tab J]       # set the tab's status string
+ghostty +status progress <0-100> [--workspace I] [--tab J] # set the tab's progress
+ghostty +status clear [--workspace I] [--tab J]
+ghostty +log <text> [--workspace I] [--tab J]              # append to the tab's ring log
+```
+
+The status string, progress, and most recent log lines appear in the
+metadata sidebar, so a supervisor sees each agent tab's state at a glance.
+
+### `+session` / `+hooks` — capture & resume agent sessions
+
+```text
+ghostty +hooks claude|codex|all [--print] [--uninstall]    # install session-capture hooks
+ghostty +session capture --kind <agent> --id <session-id> [--workspace I] [--tab J]
+ghostty +session resume [--workspace I] [--tab J]          # relaunch the pane into its session
+ghostty +session show   [--workspace I] [--tab J]          # print the captured session id
+```
+
+`+hooks` writes SessionStart shim scripts (`.ps1` for native Windows, `.sh`
+for WSL/Git-Bash) that record each agent's native session id as it starts;
+`+session` then captures, shows, or replays that id so a pane can be
+relaunched into the same Claude Code / Codex conversation. `--print` shows
+what `+hooks` would write without installing; `--uninstall` removes the shims.
 
 ## Notification Rings
 
@@ -440,6 +527,11 @@ Apply with the gear menu's *Reload config* or the `reload_config` keybind.
 |---|---|---|
 | `Alt+1` … `Alt+8` | anywhere | Jump to tab 1–8 **within the active workspace** |
 | `Alt+9` | anywhere | Jump to the last tab of the active workspace |
+| `Ctrl+B` | anywhere | Toggle the workspace sidebar (session-only) |
+| `Ctrl`+scroll | terminal | Zoom font in / out |
+| `Ctrl+C` | terminal | Copy when text is selected; otherwise send `SIGINT` |
+| `Ctrl+V` | terminal | Paste |
+| Click corner icon | any pane (top-right) | New Terminal / New Browser / Split Right / Split Down |
 | Left-click row | sidebar | Switch to that workspace |
 | Drag row up/down | sidebar | Reorder workspaces |
 | Double-click row | sidebar | Rename the workspace inline |

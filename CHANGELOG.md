@@ -3,6 +3,69 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
+## Unreleased
+
+### Fixed
+- The agent CLI (`ghostty +...`) no longer double-frees the discovered pipe
+  name when multiple Ghostty instances are running and `GHOSTTY_PID` is
+  unset: the `MultipleInstances` error path freed a buffer already guarded
+  by an `errdefer`.
+
+## win-v0.5.1 — 2026-06-14
+
+### Changed
+- Per-pane corner action buttons now match cmux exactly — **New Terminal**,
+  **New Browser**, **Split Right**, **Split Down** — drawn after cmux's SF
+  Symbols `terminal`, `globe`, `square.split.2x1`, and `square.split.1x2`.
+  This replaces the earlier set (new-tab `+`, globe, generic split,
+  close `×`); there is no per-pane close button (in cmux, close is
+  tab-level). New Terminal opens a tab, New Browser opens a browser tab,
+  and the splits map to `newSplit(.right)` / `newSplit(.down)`.
+
+## win-v0.5.0 — 2026-06-14
+
+### Added
+- **Agent-orchestration layer** — new agent CLI verbs over the per-process
+  IPC pipe: `+read-screen` (return another pane's screen text — the
+  agent-reads-agent primitive), `+status` (set a tab's orchestration status
+  string + progress), `+log` (append a line to a tab's ring log), `+session`
+  (capture/replay an agent's native session id so a pane can be relaunched),
+  `+hooks` (install Claude Code / Codex session-capture hook scripts),
+  `+split` (split a pane and print the new pane's id), and `+surface`
+  (list and focus terminal/browser panes).
+- **Per-pane corner action buttons** — an always-visible action cluster in
+  every pane's top-right corner (restyled to the cmux set in v0.5.1).
+- **Sidebar toggle** — a `toggle_sidebar` binding action (default `ctrl+b`
+  on Windows) hides/shows the workspace sidebar for the session; a config
+  reload re-asserts the configured `window-show-sidebar`.
+- **Input gestures** — `ctrl`+scroll zooms the font in/out; `ctrl+c` /
+  `ctrl+v` copy/paste (Windows Terminal convention): `ctrl+c` copies only
+  when there is a selection and otherwise still sends `SIGINT`, `ctrl+v`
+  pastes.
+- **Taskbar attention badge** and deeper notifications (OSC 9 / 777, kitty
+  OSC 99) plus a metadata sidebar (git branch / ports).
+
+### Fixed
+- Programmatic workspace/tab/split creation no longer steals OS foreground
+  focus from another app; interactive creation still focuses, and a scripted
+  create can opt in with `--focus`.
+- Clicking a desktop notification no longer un-maximizes the window (it now
+  only restores when the window is minimized).
+- Per-window overlay pools (corner buttons, attention rings) are freed on
+  the interactive window-close path; previously each closed window leaked
+  them.
+- The default `ctrl+b` sidebar binding is registered on Windows only, so
+  Linux/GTK keeps `^B` (the tmux prefix / readline backward-char) intact.
+
+---
+
+> **Versioning note.** The `nalditopr/ghostty-win` release line restarted at
+> `v0.1.0` (June 2026) and is independent of the `win-v1.x` history below,
+> which was inherited from the upstream
+> [InsipidPoint/ghostty-windows](https://github.com/InsipidPoint/ghostty-windows)
+> fork this build derives from. The `win-v1.x` entries are retained for
+> provenance; current releases continue the `win-v0.x` line above.
+
 ## win-v1.1.0 — 2026-05-17
 
 Upstream sync (63 commits from `ghostty-org/ghostty` main, through

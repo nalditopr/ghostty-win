@@ -45,6 +45,19 @@ and extended with the features below.
 - **`ghostty +browser` CLI** — script the embedded browser panes of a
   running instance over a named pipe: `open` / `navigate` / `eval` /
   `snapshot` / `click` / `fill` / `list`.
+- **Agent orchestration CLI** — drive a running instance from a script or
+  another agent over the same pipe: `+workspace` / `+tab` / `+split` /
+  `+surface` (create and focus panes), `+send` (type into a pane),
+  `+read-screen` (read another pane's screen — the agent-reads-agent
+  primitive), `+status` / `+log` (per-tab status, progress, and a ring log
+  surfaced in the sidebar), `+notify` (attention rings), and `+session` /
+  `+hooks` (capture & resume Claude Code / Codex sessions).
+- **Per-pane corner buttons** — every pane shows an always-visible,
+  cmux-style action cluster in its top-right corner: **New Terminal**,
+  **New Browser**, **Split Right**, **Split Down**.
+- **Input gestures** — `ctrl+b` toggles the sidebar, `ctrl`+scroll zooms the
+  font, and smart `ctrl+c` / `ctrl+v` copy/paste (`ctrl+c` still sends
+  `SIGINT` when nothing is selected).
 - **Notifications** — clickable desktop notifications that jump to the
   originating tab (across workspaces), plus an in-app notifications panel
   in the sidebar.
