@@ -788,6 +788,9 @@ pub const Application = extern struct {
             .restore_session,
             // Windows-only flash overlay.
             .flash_pane,
+            // Windows-only notification read/unread toggle.
+            .toggle_notification_unread,
+            .mark_oldest_unread_jump,
             .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,

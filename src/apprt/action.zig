@@ -380,6 +380,17 @@ pub const Action = union(Key) {
     /// so the user can quickly see which pane has focus. One-shot
     /// effect that auto-dismisses after ~200ms.
     flash_pane,
+    /// Toggle the read/unread state of a notification entry. If the
+    /// notifications panel is open and an entry is selected, toggle that
+    /// entry; otherwise toggle the most recent notification. Windows
+    /// apprt only; a no-op elsewhere.
+    toggle_notification_unread,
+
+    /// Find the oldest unread notification, mark it as read, and jump to
+    /// the next unread one. If there are no more unreads, this is a
+    /// no-op. Windows apprt only; a no-op elsewhere. Equivalent to
+    /// cmux's Ctrl+Cmd+U.
+    mark_oldest_unread_jump,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -460,6 +471,8 @@ pub const Action = union(Key) {
         save_session,
         restore_session,
         flash_pane,
+        toggle_notification_unread,
+        mark_oldest_unread_jump,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

@@ -46,6 +46,16 @@ pub const Options = struct {
 ///     there are no unread notifications. Ignores `--workspace`/`--tab`
 ///     (the destination is wherever the notifying pane lives).
 ///
+///   * `toggle-read`: Toggle the read/unread state of the most recent
+///     notification entry. Replies `{toggled:true,read:<bool>}` on
+///     success or `{toggled:false}` when there are no notifications.
+///     Ignores `--workspace`/`--tab`.
+///
+///   * `mark-oldest-next`: Find the oldest unread notification, mark it
+///     as read, and jump to the next unread notification's source pane.
+///     Replies `{jumped:true,surface:<id>}` or `{jumped:false}` when
+///     there are no unread notifications. Ignores `--workspace`/`--tab`.
+///
 /// The target pane must be a terminal — a browser pane has no terminal
 /// surface and is rejected.
 ///
@@ -93,7 +103,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         return code;
     }
 
-    const Command = enum { ring, clear, next };
+    const Command = enum { ring, clear, next, @"toggle-read", @"mark-oldest-next" };
 
     fn runImpl(
         alloc: Allocator,
@@ -104,7 +114,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
         defer iter.deinit();
 
         const sub_str = iter.next() orelse {
-            try stderr.print("usage: ghostty +notify <ring|clear|next> [--workspace I] [--tab J]\n", .{});
+            try stderr.print("usage: ghostty +notify <ring|clear|next|toggle-read|mark-oldest-next> [--workspace I] [--tab J]\n", .{});
             return 1;
         };
         if (std.mem.eql(u8, sub_str, "--help") or std.mem.eql(u8, sub_str, "-h")) {

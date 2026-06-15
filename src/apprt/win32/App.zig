@@ -1570,6 +1570,19 @@ pub fn performAction(
         },
 
         // All 67 apprt actions are now handled above.
+        .toggle_notification_unread => {
+            // Toggle the most recent notification's read state. Display
+            // index 0 is the newest entry.
+            _ = self.toggleNotifRead(0);
+            return true;
+        },
+
+        .mark_oldest_unread_jump => {
+            _ = self.markOldestUnreadAndJumpNext();
+            return true;
+        },
+
+        // All apprt actions are now handled above.
     }
 }
 
@@ -2085,6 +2098,22 @@ pub fn NotifRing(comptime Entry: type, comptime cap: usize) type {
                 }
             }
             return null;
+        }
+
+        /// Display index (0 = newest) of the **oldest** live entry whose
+        /// `read` field is false, or null when every live entry is read.
+        /// Walks newest-first, tracking the last seen unread.
+        pub fn lastUnread(self: *const Self) ?usize {
+            var display_idx: usize = 0;
+            var result: ?usize = null;
+            for (0..cap) |offset| {
+                const idx = (self.next + cap - 1 - offset) % cap;
+                if (self.slots[idx]) |entry| {
+                    if (!entry.read) result = display_idx;
+                    display_idx += 1;
+                }
+            }
+            return result;
         }
 
         /// The display_idx-th newest live entry (0 = newest), or null
@@ -3632,6 +3661,16 @@ fn ipcNotify(self: *App, req: *ipc.Request) anyerror!void {
         return;
     }
 
+    if (std.mem.eql(u8, action, "toggle-read")) {
+        try self.ipcNotifyToggleRead(req);
+        return;
+    }
+
+    if (std.mem.eql(u8, action, "mark-oldest-next")) {
+        try self.ipcNotifyMarkOldestNext(req);
+        return;
+    }
+
     const on = if (std.mem.eql(u8, action, "ring"))
         true
     else if (std.mem.eql(u8, action, "clear"))
@@ -3698,6 +3737,83 @@ fn ipcNotifyNext(self: *App, req: *ipc.Request) anyerror!void {
 
     const jumped = self.jumpToSurface(window, surface);
     if (jumped) _ = self.markNotifEntryRead(display_idx);
+
+    var buf: [64]u8 = undefined;
+    const reply = std.fmt.bufPrint(
+        &buf,
+        "{{\"jumped\":{s},\"surface\":{d}}}",
+        .{ if (jumped) "true" else "false", surface_id },
+    ) catch "{\"jumped\":false}";
+    server.sendOk(req.id, reply) catch {};
+}
+
+/// `+notify toggle-read`: toggle the most recent notification's read state.
+/// Replies {toggled:true, read:<new_state>} or {toggled:false}.
+fn ipcNotifyToggleRead(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+    const toggled = self.toggleNotifRead(0);
+    if (toggled) {
+        const entry = self.notifAt(0);
+        const is_read = if (entry) |e| e.read else true;
+        var buf: [48]u8 = undefined;
+        const reply = std.fmt.bufPrint(
+            &buf,
+            "{{\"toggled\":true,\"read\":{s}}}",
+            .{if (is_read) "true" else "false"},
+        ) catch "{\"toggled\":false}";
+        server.sendOk(req.id, reply) catch {};
+    } else {
+        server.sendOk(req.id, "{\"toggled\":false}") catch {};
+    }
+}
+
+/// `+notify mark-oldest-next`: mark the oldest unread notification as read
+/// and jump to the next unread entry's source pane. Replies
+/// {jumped:true, surface:<id>} or {jumped:false}.
+fn ipcNotifyMarkOldestNext(self: *App, req: *ipc.Request) anyerror!void {
+    const server = self.ipc_server orelse return;
+
+    // Find the oldest unread entry and mark it read.
+    const oldest_idx = self.notif_log.lastUnread() orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    _ = self.markNotifEntryRead(oldest_idx);
+
+    // Now find the next unread (newest first, like ipcNotifyNext).
+    const next_idx = self.firstUnreadNotif() orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    const entry = self.notifAt(next_idx) orelse {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    };
+    const window = entry.window;
+    const surface = entry.surface;
+
+    // Validate liveness (mirrors ipcNotifyNext).
+    const live = blk: {
+        for (self.windows.items) |w| {
+            if (w == window) {
+                if (w.closing) break :blk false;
+                break :blk w.findLocOfSurface(surface) != null;
+            }
+        }
+        break :blk false;
+    };
+    if (!live) {
+        server.sendOk(req.id, "{\"jumped\":false}") catch {};
+        return;
+    }
+
+    const surface_id: u64 = if (surface.core_surface_initialized)
+        surface.core_surface.id
+    else
+        0;
+
+    const jumped = self.jumpToSurface(window, surface);
+    if (jumped) _ = self.markNotifEntryRead(next_idx);
 
     var buf: [64]u8 = undefined;
     const reply = std.fmt.bufPrint(
@@ -4311,6 +4427,71 @@ pub fn markNotifEntryRead(self: *App, display_idx: usize) bool {
         }
     }
     return false;
+}
+
+/// Toggle the read/unread state of a single entry (by display index).
+/// If the entry is Unread, mark it Read (decrement badge); if Read,
+/// mark it Unread (increment badge). Repaints the sidebar and taskbar
+/// badge. Returns true when the entry existed and was toggled.
+pub fn toggleNotifRead(self: *App, display_idx: usize) bool {
+    var seen: usize = 0;
+    const cap = NOTIF_LOG_CAP;
+    var offset: usize = 0;
+    while (offset < cap) : (offset += 1) {
+        const idx = (self.notif_log.next + cap - 1 - offset) % cap;
+        if (self.notif_log.slots[idx]) |*entry| {
+            if (seen == display_idx) {
+                if (entry.read) {
+                    // Read → Unread: re-flag as unread.
+                    entry.read = false;
+                    self.notif_log.unread += 1;
+                } else {
+                    // Unread → Read.
+                    entry.read = true;
+                    if (self.notif_log.unread > 0) self.notif_log.unread -= 1;
+                }
+                for (self.windows.items) |w| w.invalidateSidebar();
+                self.refreshTaskbarBadges();
+                return true;
+            }
+            seen += 1;
+        }
+    }
+    return false;
+}
+
+/// Find the oldest unread notification, mark it as read, and jump to the
+/// NEXT unread entry's source pane. If there are no unread entries, this
+/// is a no-op. Returns true when a jump was performed.
+pub fn markOldestUnreadAndJumpNext(self: *App) bool {
+    // Find the oldest unread entry.
+    const oldest_idx = self.notif_log.lastUnread() orelse return false;
+
+    // Mark it read.
+    _ = self.markNotifEntryRead(oldest_idx);
+
+    // Now find the new first (newest) unread — this is the "next" unread
+    // to jump to. We use firstUnread for consistency with ipcNotifyNext.
+    const next_idx = self.firstUnreadNotif() orelse return false;
+    const entry = self.notifAt(next_idx) orelse return false;
+    const window = entry.window;
+    const surface = entry.surface;
+
+    // Validate the entry's pointers are still live (mirrors ipcNotifyNext).
+    const live = blk: {
+        for (self.windows.items) |w| {
+            if (w == window) {
+                if (w.closing) break :blk false;
+                break :blk w.findLocOfSurface(surface) != null;
+            }
+        }
+        break :blk false;
+    };
+    if (!live) return false;
+
+    const jumped = self.jumpToSurface(window, surface);
+    if (jumped) _ = self.markNotifEntryRead(next_idx);
+    return jumped;
 }
 
 /// Drop every notification log entry and the unread badge.

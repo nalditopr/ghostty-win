@@ -612,6 +612,19 @@ pub const Action = union(enum) {
     /// workspaces and tabs to match the saved state.
     /// Only implemented on Windows.
     restore_session,
+    /// Toggle the read/unread state of a notification. If the
+    /// notifications panel is open with an entry selected, toggle that
+    /// entry; otherwise toggle the most recent notification.
+    ///
+    /// Only implemented on Windows.
+    toggle_notification_unread,
+
+    /// Find the oldest unread notification, mark it as read, and jump
+    /// to the next unread notification's source pane. If there are no
+    /// more unread notifications, this is a no-op.
+    ///
+    /// Only implemented on Windows.
+    mark_oldest_unread_jump,
 
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
@@ -1472,6 +1485,8 @@ pub const Action = union(enum) {
             .toggle_sidebar,
             .save_session,
             .restore_session,
+            .toggle_notification_unread,
+            .mark_oldest_unread_jump,
             .new_split,
             .goto_split,
             .goto_window,

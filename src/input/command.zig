@@ -444,6 +444,18 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show or hide the workspace sidebar.",
         }},
 
+        .toggle_notification_unread => comptime &.{.{
+            .action = .toggle_notification_unread,
+            .title = "Toggle Notification Read/Unread",
+            .description = "Toggle the read/unread state of the most recent notification.",
+        }},
+
+        .mark_oldest_unread_jump => comptime &.{.{
+            .action = .mark_oldest_unread_jump,
+            .title = "Mark Oldest Unread and Jump to Next",
+            .description = "Mark the oldest unread notification as read and jump to the next unread one.",
+        }},
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = "Change Terminal Title…",
