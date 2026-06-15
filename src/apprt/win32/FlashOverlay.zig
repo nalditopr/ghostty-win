@@ -267,7 +267,7 @@ test "unit: isBorderPixel marks the frame band only" {
 }
 
 test "unit: packBGRA premultiplies correctly" {
-    const opaque = packBGRA(0xFF, 0xD7, 0x00, 0xFF);
-    try testing.expectEqual(@as(u32, 0xFFFFD700), opaque);
+    const opaque_color = packBGRA(0xFF, 0xD7, 0x00, 0xFF);
+    try testing.expectEqual(@as(u32, 0xFFFFD700), opaque_color);
     try testing.expectEqual(@as(u32, 0), packBGRA(0xFF, 0xD7, 0x00, 0));
 }

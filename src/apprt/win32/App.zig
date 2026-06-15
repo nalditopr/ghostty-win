@@ -981,17 +981,25 @@ pub fn performAction(
 
         .save_session => {
             const alloc = self.core_app.alloc;
-            // Save from the first window (the primary one).
             if (self.windows.items.len > 0) {
                 SessionState.save(alloc, self.windows.items[0]) catch |err| {
                     log.err("session save failed: {}", .{err});
                 };
+            }
+            return true;
+        },
+
         .edit_workspace_description => {
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
                     const pw = core_surface.rt_surface.parent_window;
                     pw.editWorkspaceDescription(pw.active_workspace);
+                },
+            }
+            return true;
+        },
+
         .toggle_right_sidebar => {
             switch (target) {
                 .app => {},
@@ -1007,6 +1015,9 @@ pub fn performAction(
             SessionState.restore(alloc, self) catch |err| {
                 log.err("session restore failed: {}", .{err});
             };
+            return true;
+        },
+
         .focus_right_sidebar => {
             switch (target) {
                 .app => {},

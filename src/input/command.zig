@@ -454,10 +454,14 @@ fn actionCommands(action: Action.Key) []const Command {
             .action = .mark_oldest_unread_jump,
             .title = "Mark Oldest Unread and Jump to Next",
             .description = "Mark the oldest unread notification as read and jump to the next unread one.",
+        }},
+
         .edit_workspace_description => comptime &.{.{
             .action = .edit_workspace_description,
             .title = "Edit Workspace Description",
             .description = "Edit the description shown below the workspace name in the sidebar.",
+        }},
+
         .toggle_right_sidebar => comptime &.{.{
             .action = .toggle_right_sidebar,
             .title = "Toggle Right Sidebar",

@@ -2814,6 +2814,8 @@ test "SplitTree: swap siblings" {
 }
 
 test "SplitTree: swap cross-parent" {
+}
+
 test "SplitTree: selectLayout even_horizontal" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2895,6 +2897,8 @@ test "SplitTree: selectLayout even_horizontal" {
 }
 
 test "SplitTree: swap same node" {
+}
+
 test "SplitTree: selectLayout even_vertical" {
     const testing = std.testing;
     const alloc = testing.allocator;

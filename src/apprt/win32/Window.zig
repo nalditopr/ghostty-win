@@ -1748,7 +1748,7 @@ pub fn breakPane(self: *Window, pane: *Pane) void {
 
     // Build a single-node tree for the detached pane. SplitTree.init
     // calls ref(), giving the pane a fresh ownership ref in the new tree.
-    var pane_tree = SplitTree(Pane).init(alloc, pane) catch {
+    const pane_tree = SplitTree(Pane).init(alloc, pane) catch {
         pane.unref(alloc);
         return;
     };
@@ -1800,7 +1800,7 @@ pub fn movePaneToTab(self: *Window, pane: *Pane, target_enum: apprt.action.MoveP
     const target_tab: ?usize = switch (target_enum) {
         .next_tab => if (src_tab + 1 < ws.tab_count) src_tab + 1 else null,
         .prev_tab => if (src_tab > 0) src_tab - 1 else null,
-        .new_tab => blk: {
+        .new_tab => {
             self.breakPane(pane);
             return;
         },
