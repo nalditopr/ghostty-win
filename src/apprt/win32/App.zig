@@ -3470,6 +3470,17 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
     const window = self.ipcTargetWindow() orelse return IpcError.NoWindow;
     if (window.is_quick_terminal) return IpcError.QuickTerminal;
 
+    // Parse an optional explicit command (split on whitespace) once; an
+    // empty/whitespace-only command falls through to the default shell.
+    // Used by `+ssh --workspace` to run `ssh user@host` in the first tab.
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(self.core_app.alloc);
+    if (ipcArgString(req, "command")) |command_str| {
+        var it = std.mem.tokenizeAny(u8, command_str, &std.ascii.whitespace);
+        while (it.next()) |tok| try argv.append(self.core_app.alloc, tok);
+    }
+    const command: ?[]const []const u8 = if (argv.items.len > 0) argv.items else null;
+
     // Programmatic creation defaults to NON-FOCUS: the workspace is created
     // in the background and the user stays in whatever workspace (and
     // whatever app) they were in. `--focus` (focus:true over IPC) opts in
@@ -3485,6 +3496,17 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
         if (req.worktree_path) |path| {
             break :blk window.newWorkspaceWithDir(path) orelse return IpcError.NoWindow;
         }
+        if (command) |c| {
+            // Command-bearing workspace: create-and-select, add the
+            // first tab with the explicit command.
+            const ws_idx = window.createAndSelectWorkspace() orelse return IpcError.NoWindow;
+            _ = window.addTabWithCommand(c, null) catch |err| {
+                log.err("failed to create first tab with command for new workspace: {}", .{err});
+                window.closeWorkspace(ws_idx);
+                return IpcError.NoWindow;
+            };
+            break :blk ws_idx;
+        }
         const before = window.workspace_count;
         window.newWorkspace();
         // newWorkspace collapses the slot if its first tab fails to spawn,
@@ -3494,7 +3516,7 @@ fn ipcWorkspaceNew(self: *App, req: *ipc.Request) anyerror!void {
     } else blk: {
         // Background path (default): create without changing the active
         // workspace. newWorkspaceBackground collapses the slot on failure.
-        break :blk window.newWorkspaceBackground(req.worktree_path) orelse
+        break :blk window.newWorkspaceBackground(req.worktree_path, command) orelse
             return IpcError.NoWindow;
     };
 

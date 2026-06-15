@@ -2011,7 +2011,7 @@ fn canCreateWorkspace(is_quick_terminal: bool, count: usize) bool {
 /// workspace has at least one tab" invariant holds. Shared by
 /// newWorkspace (default tab) and showBackendMenu's .new_workspace
 /// target (picked-backend tab).
-fn createAndSelectWorkspace(self: *Window) ?usize {
+pub fn createAndSelectWorkspace(self: *Window) ?usize {
     if (!canCreateWorkspace(self.is_quick_terminal, self.workspace_count)) return null;
     self.cancelTabRename();
 
@@ -2100,7 +2100,7 @@ fn createWorkspaceSlot(self: *Window) ?usize {
 /// background-workspace discipline used by closeTabInWorkspace /
 /// closeSplitPane. The new tab becomes the workspace's own active_tab
 /// (index 0) so a later switch lands on it.
-fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
+fn addFirstTabBackground(self: *Window, ws_idx: usize, command: ?[]const []const u8) !void {
     if (self.closing) return error.WindowClosing;
     if (ws_idx >= self.workspace_count) return error.NoWindow;
     const ws = &self.workspaces[ws_idx];
@@ -2108,7 +2108,7 @@ fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.init(self.app, self, .tab, null, ws.working_dir);
+    try surface.init(self.app, self, .tab, command, ws.working_dir);
     const pane = Pane.create(alloc, surface) catch |err| {
         surface.deinit();
         alloc.destroy(surface);
@@ -2148,10 +2148,13 @@ fn addFirstTabBackground(self: *Window, ws_idx: usize) !void {
 /// the non-focus default for programmatic creation. `working_dir` (an
 /// owned-by-caller path; copied here) binds the workspace to a git
 /// worktree like newWorkspaceWithDir; null keeps the configured cwd.
-/// Returns the new index, or null when the workspace could not be created
-/// (QuickTerminal, MAX_WORKSPACES) or its first tab failed to spawn (the
-/// slot is collapsed back).
-pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8) ?usize {
+/// `command` (an argv slice; borrowed, NOT owned) is passed to the first
+/// tab's surface.init so the tab runs that command instead of the default
+/// shell. Used by `+ssh --workspace` to create a workspace whose first
+/// tab runs `ssh user@host`. Returns the new index, or null when the
+/// workspace could not be created (QuickTerminal, MAX_WORKSPACES) or its
+/// first tab failed to spawn (the slot is collapsed back).
+pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8, command: ?[]const []const u8) ?usize {
     const idx = self.createWorkspaceSlot() orelse return null;
     if (working_dir) |dir| {
         self.workspaces[idx].setWorkingDir(self.app.core_app.alloc, dir) catch {
@@ -2159,7 +2162,7 @@ pub fn newWorkspaceBackground(self: *Window, working_dir: ?[]const u8) ?usize {
             return null;
         };
     }
-    self.addFirstTabBackground(idx) catch |err| {
+    self.addFirstTabBackground(idx, command) catch |err| {
         log.err("failed to create first tab for background workspace: {}", .{err});
         self.collapseEmptyWorkspaceSlot(idx);
         return null;
